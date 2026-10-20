@@ -10,12 +10,14 @@
 //      переменные («имя=значение») — конфигурация транзитом из XML;
 //   3. печать всего через DEBUG_WRITE (по 40 байт за вызов).
 //
-// Демонстрация v0.7 (SMP + VT-d/AMD-Vi):
+// Демонстрация v0.8 (SMP + VT-d/AMD-Vi: IR + huge + мульти):
 //
 //   S1. SELF_INFO(5) — cpu_count; печать топологии пользователя.
-//   S2. IOMMU smoke: ENUM -> ATTACH(00:1f.2) -> MAP(2 стр) -> UNMAP ->
-//       DETACH — реальный проход через DMAR/DRHD/QI/SSPT (Intel) либо
-//       IVRS/IVHD/DTE/командный буфер/v1-таблицы (AMD-Vi) ядра.
+//   S2. IOMMU smoke: ENUM -> ATTACH(00:1f.2) -> MAP(2 стр) -> MAP
+//       huge (512 стр, 2 МиБ-выровнено) -> UNMAP -> IRQ_MAP/IRQ_UNMAP
+//       (IRTE, v0.8) -> UNMAP -> DETACH — реальный проход DMAR/DRHD/QI/
+//       SSPT+IRTA/IRTE (Intel) либо IVRS/IVHD/DTE/командный буфер/
+//       v1-таблицы+IRTE (AMD-Vi) ядра.
 //   S3. SMP-стресс: по потоку на CPU (THREAD_CREATE по TaskTCB-гранту
 //       из kinit): разделяемый счётчик (MEM_ALLOC-страница, volatile),
 //       каждый поток гоняет инкременты + THREAD_YIELD; гистограмма
@@ -76,6 +78,8 @@ const SYS_IOMMU_ATTACH: u64 = 0x81;
 const SYS_IOMMU_MAP: u64 = 0x82;
 const SYS_IOMMU_UNMAP: u64 = 0x83;
 const SYS_IOMMU_DETACH: u64 = 0x84;
+const SYS_IOMMU_IRQ_MAP: u64 = 0x85;
+const SYS_IOMMU_IRQ_UNMAP: u64 = 0x86;
 
 unsafe fn recv_any(flags: u64) -> i64 {
     syscall6(SYS_IPC_RECV_ANY, flags, 0, 0, 0, 0, 0)
@@ -183,10 +187,39 @@ unsafe fn iommu_smoke() {
 
         let u = syscall6(SYS_IOMMU_UNMAP, 0, dev as u64, 0x1_0000, 2, 0, 0);
         debug_word_line("init: iommu unmap  -> ", u as u64);
+
+        // v0.8: крупные страницы — 512 стр 2 МиБ-выровнено: один
+        // huge-лист (SS-PDE Intel / v1-лист уровня 2 AMD); ядро печатает
+        // «map huge 2MiB» на консоль отладки.
+        let packed_h = 512 | (prot_rw << 32);
+        let mh = syscall6(
+            SYS_IOMMU_MAP,
+            0,
+            dev as u64,
+            0x0400_0000,
+            0x0300_0000,
+            packed_h,
+            0,
+        );
+        debug_word_line("init: iommu map huge (512p) -> ", mh as u64);
+        let uh = syscall6(SYS_IOMMU_UNMAP, 0, dev as u64, 0x0400_0000, 512, 0, 0);
+        debug_word_line("init: iommu unmap huge      -> ", uh as u64);
+
+        // v0.8: IRQ-ремаппинг — IRTE (vector 0x41 -> APIC 0); возврат —
+        // handle: его драйвер устройства кладёт в MSI-адрес.
+        let h = syscall6(SYS_IOMMU_IRQ_MAP, 0, dev as u64, 0x41, 0, 0, 0);
+        debug_word_line("init: iommu irq_map handle  -> ", h as u64);
+        let iu = if h > 0 {
+            syscall6(SYS_IOMMU_IRQ_UNMAP, 0, dev as u64, h as u64, 0, 0, 0)
+        } else {
+            -1
+        };
+        debug_word_line("init: iommu irq_unmap       -> ", iu as u64);
+
         let d = syscall6(SYS_IOMMU_DETACH, 0, dev as u64, 0, 0, 0, 0);
         debug_word_line("init: iommu detach -> ", d as u64);
-        if r == 0 && u == 0 && d == 0 {
-            puts("init: iommu smoke OK (context+SSPT+QI exercised)");
+        if r == 0 && u == 0 && d == 0 && mh == 0 && uh == 0 && h > 0 && iu == 0 {
+            puts("init: iommu smoke OK (map+huge+irq+unmap+detach)");
         } else {
             puts("init: iommu smoke FAILED");
         }
@@ -418,7 +451,7 @@ fn main_loop() -> ! {
         // S1: топология CPU.
         let cpu_count = syscall6(SYS_SELF_INFO, 5, 0, 0, 0, 0, 0);
         if cpu_count > 0 {
-            puts("init: boot policy done; v0.6 feature demos follow");
+            puts("init: boot policy done; v0.8 feature demos follow");
             debug_word_line("init: cpu_count = ", cpu_count as u64);
 
             // S2: IOMMU (пропускается без контроллера).

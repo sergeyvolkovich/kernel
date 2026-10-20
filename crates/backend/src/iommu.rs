@@ -10,10 +10,10 @@
 // (см. pools.rs: free_range с fid_base 0 у доступного low-mem). Все
 // структуры IOMMU живут в физике < 4 GiB (physmap; QEMU-масштаб).
 //
-// `IommuAgg` — объектно-безопасный сервис сисколов IOMMU_* поверх одного
-// или двух готовых контроллеров: индекс 0 — Intel (если готов), следующий —
-// AMD. QEMU поднимает ровно один (intel-iommu ЛИБО amd-iommu); порядок
-// детерминирован и на гибридном железе не меняет ABI (ENUM выдаёт счётчик).
+// `IommuAgg` — объектно-безопасный сервис сисколов IOMMU_* поверх готовых
+// контроллеров: сперва ВСЕ единицы Intel (в порядке DMAR), затем ВСЕ
+// единицы AMD (в порядке IVRS; QEMU кладёт 10h/11h одной единицы —
+// дедуп по базе в драйверах). Индексация ENUM — сквозная и стабильна.
 
 use pkg_generic_interface::hal::traits::iommu::IommuError;
 use pkg_generic_interface::syscall::iommu::{IommuInfo, IommuService};
@@ -90,42 +90,45 @@ pub(crate) fn zero_huge() -> Option<u64> {
 
 // ───────────────────── Агрегатор сервисов ─────────────────────
 
-/// Готовые контроллеры: индекс 0 — Intel VT-d (если готов), следующий —
-/// AMD-Vi. `(vtd, amd)` → допустимые индексы.
-fn pick(idx: u32) -> Result<&'static dyn IommuService, IommuError> {
-    let vtd = VTD0.is_ready();
-    let amd = AMD0.is_ready();
-    match (idx, vtd, amd) {
-        (0, true, _) => Ok(&VTD0),
-        (0, false, true) => Ok(&AMD0),
-        (1, true, true) => Ok(&AMD0),
-        _ => {
-            if vtd || amd {
-                Err(IommuError::InvalidIndex)
-            } else {
-                Err(IommuError::IommuNotPresent)
-            }
-        }
+/// Готовые контроллеры: сперва все Intel (в порядке DMAR), затем все
+/// AMD (в порядке IVRS). Возвращает (драйвер, локальный индекс внутри
+/// драйвера) для сквозного индекса сискола.
+fn pick(idx: u32) -> Result<(&'static dyn IommuService, u32), IommuError> {
+    let nv = VTD0.controller_count() as u32;
+    let na = AMD0.controller_count() as u32;
+    if idx < nv {
+        return Ok((&VTD0, idx));
+    }
+    let amd_idx = idx - nv;
+    if amd_idx < na {
+        return Ok((&AMD0, amd_idx));
+    }
+    if nv + na == 0 {
+        Err(IommuError::IommuNotPresent)
+    } else {
+        Err(IommuError::InvalidIndex)
     }
 }
 
 /// Сервис-агрегатор: единственная установка в syscall::iommu::SERVICE.
-/// Форвардит индекс контроллера драйверу-получателю как его локальный 0.
+/// Сквозной индекс контроллера транслируется в (драйвер, локальный).
 pub struct IommuAgg;
 
 static AGG: IommuAgg = IommuAgg;
 
 impl IommuService for IommuAgg {
     fn controller_count(&self) -> usize {
-        (VTD0.is_ready() as usize) + (AMD0.is_ready() as usize)
+        VTD0.controller_count() + AMD0.controller_count()
     }
 
     fn controller_info(&self, idx: u32) -> Result<IommuInfo, IommuError> {
-        pick(idx)?.controller_info(0)
+        let (d, local) = pick(idx)?;
+        d.controller_info(local)
     }
 
     fn attach(&self, ctrl: u32, bus: u8, device: u8, function: u8) -> Result<u32, IommuError> {
-        pick(ctrl)?.attach(0, bus, device, function)
+        let (d, local) = pick(ctrl)?;
+        d.attach(local, bus, device, function)
     }
 
     fn map_pages(
@@ -137,7 +140,8 @@ impl IommuService for IommuAgg {
         pages: usize,
         prot: u8,
     ) -> Result<(), IommuError> {
-        pick(ctrl)?.map_pages(0, device, iova, phys, pages, prot)
+        let (d, local) = pick(ctrl)?;
+        d.map_pages(local, device, iova, phys, pages, prot)
     }
 
     fn unmap_pages(
@@ -147,11 +151,30 @@ impl IommuService for IommuAgg {
         iova: u64,
         pages: usize,
     ) -> Result<(), IommuError> {
-        pick(ctrl)?.unmap_pages(0, device, iova, pages)
+        let (d, local) = pick(ctrl)?;
+        d.unmap_pages(local, device, iova, pages)
     }
 
     fn detach(&self, ctrl: u32, device: u32) -> Result<(), IommuError> {
-        pick(ctrl)?.detach(0, device)
+        let (d, local) = pick(ctrl)?;
+        d.detach(local, device)
+    }
+
+    fn irq_map(
+        &self,
+        ctrl: u32,
+        device: u32,
+        vector: u8,
+        dest: u8,
+        flags: u8,
+    ) -> Result<u32, IommuError> {
+        let (d, local) = pick(ctrl)?;
+        d.irq_map(local, device, vector, dest, flags)
+    }
+
+    fn irq_unmap(&self, ctrl: u32, device: u32, handle: u32) -> Result<(), IommuError> {
+        let (d, local) = pick(ctrl)?;
+        d.irq_unmap(local, device, handle)
     }
 }
 

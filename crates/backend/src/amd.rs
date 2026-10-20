@@ -34,10 +34,13 @@
 //   * event log: включаем, дрейним при каждом sync (диагностика
 //     IO_PAGE_FAULT и illegal-command). QEMU-курьёз: эмулятор не двигает
 //     MMIO-хвост event log — на QEMU дрейн пуст; на реальном железе работает;
-//   * IRQ-ремаппинг (IRTE) — не реализован (как и VT-d v0.6): DTE.IV=0.
-//
-// AMD-Vi (зеркально VT-d): DeviceID = BDF; «IVMD-unity» — не обрабатываем
-// (v0.7: единственный контроллер QEMU, unity-диапазоны не требуются).
+//   * IRQ-ремаппинг (v0.8): per-device IRTE-таблица (v1, 128-бит)
+//     из DTE: IV=1 + IntTabLen=4 (16 записей) + IntTabPtr + IntCtl=10b
+//     (remap on). Инвалидация — INVALIDATE_DEVTAB_ENTRY (DTE) и
+//     INVALIDATE_INTERRUPT_TABLE (IRTE) командным буфером;
+//   * AMD-Vi (зеркально VT-d): DeviceID = BDF; мульти-IOMMU (v0.8) —
+//     ВСЕ IVHD с уникальными MMIO-базами (QEMU дублирует 10h/11h —
+//     это одна единица).
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -46,6 +49,7 @@ use spin::Mutex;
 use amd_iommu::cmd::{Command, CompletionWait, InvalidateDevTabEntry, InvalidateIommuPages};
 use amd_iommu::dte::{DeviceTableEntry, PagingMode};
 use amd_iommu::events::{Event, EventCode};
+use amd_iommu::irte::{IntType, Irte};
 use amd_iommu::ivrs::{DeviceEntry, DeviceType, EntryType, Ivhd, IvrsTable};
 use amd_iommu::pagetables;
 use amd_iommu::regs::{self, BufferBase, Control, DeviceTableBase, Status};
@@ -70,24 +74,35 @@ const IOVA_LIMIT: u64 = 1 << 48;
 /// «Все страницы домена» для INVALIDATE_IOMMU_PAGES: S=1, Address[51:12] из
 /// единиц — размер задаётся первым нулевым битом адреса (бит 52 → весь домен).
 const INV_ALL_ADDR: u64 = 0x000f_ffff_ffff_f000;
+/// Размер v1 huge-листа (лист уровня 2, NextLevel=0).
+const V1_HUGEP: u64 = 512 * 4096;
+/// Записей IRTE в per-device таблице (IntTabLen=4 → 2^4 = 16 × 16 байт).
+const IRTE_PER_DEV: usize = 16;
 
 // ───────────────────── v1-таблицы (4 уровня, NextLevel) ─────────────────────
 
-/// Слот листовой PTE для IOVA; create — выделять промежуточные каталоги.
+/// Слот листовой PTE (уровень 1) для IOVA; create — выделять каталоги.
 fn pt_slot(root: u64, iova: u64, create: bool) -> Option<*mut u64> {
+    pt_slot_level(root, iova, 1, create)
+}
+
+/// Слот записи на заданном уровне (2 = лист-кандидат для huge, 1 = PTE);
+/// create — выделять промежуточные каталоги. v0.8: huge-лист 2 МиБ —
+/// запись уровня 2 с NextLevel=0 (спека v1: размер листа задаётся уровнем).
+fn pt_slot_level(root: u64, iova: u64, level: u32, create: bool) -> Option<*mut u64> {
     let mut table = root;
     // SAFETY-контракт цикла: `table` — физика выровненной страницы из
     // zero_page (владение — домен), physmap покрывает.
-    for level in (1..=4u32).rev() {
-        let shift = 12 + 9 * (level - 1);
+    for lvl in (level..=4u32).rev() {
+        let shift = 12 + 9 * (lvl - 1);
         let idx = ((iova >> shift) & 0x1FF) as usize;
         // SAFETY: см. контракт цикла.
         let entry = unsafe { phys_ptr::<u64>(table).add(idx) };
-        // SAFETY: как выше.
-        let val = unsafe { entry.read_volatile() };
-        if level == 1 {
+        if lvl == level {
             return Some(entry);
         }
+        // SAFETY: как выше.
+        let val = unsafe { entry.read_volatile() };
         if val & 1 == 0 {
             if !create {
                 return None;
@@ -95,13 +110,13 @@ fn pt_slot(root: u64, iova: u64, create: bool) -> Option<*mut u64> {
             let child = zero_page()?;
             // v1-каталог: PR | NextLevel = уровень потомка | PA.
             // SAFETY: запись нового потомка в нашу таблицу.
-            unsafe { entry.write_volatile(pagetables::v1_table(child, (level - 1) as u8)) };
+            unsafe { entry.write_volatile(pagetables::v1_table(child, (lvl - 1) as u8)) };
             table = child;
         } else {
             table = val & 0x000f_ffff_ffff_f000;
         }
     }
-    unreachable!("4 уровня исчерпаны")
+    unreachable!("уровни исчерпаны")
 }
 
 /// Права листовой PTE из протекта: IR/IW (биты 61/62 v1-листа).
@@ -122,6 +137,11 @@ fn pt_free(root: u64) {
             if val & 1 == 0 {
                 continue;
             }
+            // v0.8: лист (NextLevel=0) — НЕ таблица, физика принадлежит
+            // отображению (huge-лист уровня 2 — тот же случай).
+            if level > 1 && (val >> 9) & 7 == 0 {
+                continue;
+            }
             let child = val & 0x000f_ffff_ffff_f000;
             if level > 2 {
                 walk(child, level - 1);
@@ -138,20 +158,24 @@ fn pt_free(root: u64) {
 /// Домен изоляции: корень v1-таблиц + карта IOVA-отображений.
 struct Domain {
     pt_root: u64,
-    /// iova -> (phys, pages, prot).
-    mappings: BTreeMap<u64, (u64, usize, IommuProt)>,
+    /// iova -> (phys, pages, prot, huge). v0.8: раскладка таблиц
+    /// детерминированно повторяет проход map (unmap/protect идентичны).
+    mappings: BTreeMap<u64, (u64, usize, IommuProt, bool)>,
 }
 
-/// Привязка DeviceId -> (DeviceID железа, домен).
+/// Привязка DeviceId -> (DeviceID железа, домен, IRTE-таблица).
 #[derive(Clone, Copy)]
 struct DevBind {
     devid: u16,
     domid: u16,
+    /// Физика per-device IRTE-таблицы (0 — IRQ-ремаппинг не поднят).
+    irq_phys: u64,
 }
 
 // ───────────────────── Драйвер ─────────────────────
 
-/// Состояние драйвера AMD-Vi (один IVHD; мульти-IOMMU — v0.8+).
+/// Состояние драйвера AMD-Vi — ОДИН контроллер (одна IVHD-единица);
+/// мульти-IOMMU — несколько AmdVi в [`AmdDriver`] (v0.8).
 pub struct AmdVi {
     mmio: Mmio,
     segment: u16,
@@ -176,6 +200,13 @@ pub struct AmdVi {
     devices: BTreeMap<u32, DevBind>,
     next_domid: u16,
     next_dev: u32,
+    /// v0.8: IRQ-ремаппинг — DTE attach'ей получают IV/IntTabLen/
+    /// IntTabPtr/IntCtl=10b (v1 IRTE — базовая архитектура, гейт только
+    /// успешность attach с такими DTE на данном железе/эмуляторе).
+    ir_enabled: bool,
+    /// v0.8: v1-листья уровня 2 (huge 2 МиБ) — спека v1: размер листа
+    /// задаётся уровнем (NextLevel=0 на уровне 2).
+    huge_ok: bool,
 }
 
 impl AmdVi {
@@ -464,14 +495,17 @@ impl AmdVi {
             devices: BTreeMap::new(),
             next_domid: 1,
             next_dev: 1,
+            ir_enabled: true,
+            huge_ok: true,
         };
         // Чистый старт кэшей (глобальная инвалидация) + первый sync.
         amd.cmd_submit(&Command::InvalidateIommuAll);
         amd.cmd_sync()?;
         crate::kprintln!(
-            "amdvi: translation enabled (devtab={} entries, cmd/evt={} entries)",
+            "amdvi: translation enabled (devtab={} entries, cmd/evt={} entries, huge=2MiB, irte/dev={})",
             DEVTAB_ENTRIES,
-            CMD_ENTRIES
+            CMD_ENTRIES,
+            IRTE_PER_DEV
         );
         Ok(amd)
     }
@@ -512,10 +546,15 @@ impl AmdVi {
         self.next_dev += 1;
         let root = zero_page().ok_or(IommuError::OutOfMemory)?;
 
-        // DTE: V|TV|Mode=Level4|HPT-root|DomainID + IR|IW (AND с правами
-        // листовых PTE → фактические права задают PTE). q3 = 0: reserved
-        // биты QEMU-валидации чисты, q2 (прерывания) не трогаем — IV=0.
-        let dte = DeviceTableEntry::new()
+        // v0.8: per-device IRTE-таблица (v1, 128-бит): IV=1 + IntTabLen=4
+        // (16 записей) + IntTabPtr + IntCtl=10b (remap on). Права IR/IW —
+        // AND с правами листовых PTE → оба в 1; q3 = 0 (reserved чисты).
+        let irq_phys = if self.ir_enabled {
+            zero_page().ok_or(IommuError::OutOfMemory)?
+        } else {
+            0
+        };
+        let mut dte = DeviceTableEntry::new()
             .with_valid(true)
             .with_translation_valid(true)
             .with_paging_mode(PagingMode::Level4)
@@ -523,6 +562,13 @@ impl AmdVi {
             .with_domain_id(domid)
             .with_ir(true)
             .with_iw(true);
+        if self.ir_enabled {
+            dte = dte
+                .with_interrupt_map_valid(true)
+                .with_interrupt_table_len(4)
+                .with_interrupt_table_ptr(irq_phys)
+                .with_int_ctl(2); // IntCtl=10b: remap on
+        }
         self.write_dte(devid, dte);
         // Видимость DTE до команды INVALIDATE_DEVTAB_ENTRY.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -534,7 +580,14 @@ impl AmdVi {
                 mappings: BTreeMap::new(),
             },
         );
-        self.devices.insert(dev, DevBind { devid, domid });
+        self.devices.insert(
+            dev,
+            DevBind {
+                devid,
+                domid,
+                irq_phys,
+            },
+        );
         self.invalidate_all(devid, domid)?;
         crate::kprintln!(
             "amdvi: attach {} -> dev {} devid={:#06x} domid {}",
@@ -577,7 +630,7 @@ impl AmdVi {
                 .get(&bind.domid)
                 .ok_or(IommuError::DeviceNotBound)?;
             let end = iova + (count as u64) * 4096;
-            for (&base, &(_, pages, _)) in &dom.mappings {
+            for (&base, &(_, pages, _, _)) in &dom.mappings {
                 let bend = base + (pages as u64) * 4096;
                 if base < end && iova < bend {
                     return Err(IommuError::IovaConflict);
@@ -585,17 +638,36 @@ impl AmdVi {
             }
         }
         let (r, w) = pte_prot(prot);
-        for i in 0..count as u64 {
-            let slot = pt_slot(root, iova + i * 4096, true).ok_or(IommuError::OutOfMemory)?;
-            // v1-лист: PR | IR | IW | PA.
-            // SAFETY: слот — листовая PTE домена (наш).
-            unsafe { slot.write_volatile(pagetables::v1_page(phys + i * 4096, r, w)) };
+        // v0.8: раскладка — детерминированный проход (как vtd): 2 МиБ-
+        // выровненный кусок >= 512 стр → v1-лист уровня 2 (NextLevel=0 —
+        // размер задаётся уровнем), остальное — 4К PTE уровня 1.
+        let mut used_huge = false;
+        let mut i = 0u64;
+        while i < count as u64 {
+            let a = iova + i * 4096;
+            let p = phys + i * 4096;
+            let left = count as u64 - i;
+            if self.huge_ok && left >= 512 && a % V1_HUGEP == 0 && p % V1_HUGEP == 0 {
+                let slot = pt_slot_level(root, a, 2, true).ok_or(IommuError::OutOfMemory)?;
+                // v1-лист уровня 2: PR | IR | IW | PA, NextLevel=0.
+                // SAFETY: слот — запись домена (наш).
+                unsafe { slot.write_volatile(pagetables::v1_page(p, r, w)) };
+                i += 512;
+                used_huge = true;
+                crate::kprintln!("amdvi: map huge 2MiB iova={:#x} -> phys={:#x}", a, p);
+            } else {
+                let slot = pt_slot(root, a, true).ok_or(IommuError::OutOfMemory)?;
+                // v1-лист: PR | IR | IW | PA.
+                // SAFETY: слот — листовая PTE домена (наш).
+                unsafe { slot.write_volatile(pagetables::v1_page(p, r, w)) };
+                i += 1;
+            }
         }
         let dom = self
             .domains
             .get_mut(&bind.domid)
             .ok_or(IommuError::DeviceNotBound)?;
-        dom.mappings.insert(iova, (phys, count, prot));
+        dom.mappings.insert(iova, (phys, count, prot, used_huge));
         self.invalidate_all(bind.devid, bind.domid)
     }
 
@@ -604,36 +676,45 @@ impl AmdVi {
             return Err(IommuError::InvalidConfig);
         }
         let (bind, root) = self.bind_of(dev)?;
-        let had = {
+        // v0.8: точное снятие — (iova, count) обязан совпадать с записью
+        // карты (частичное — v0.9; как vtd). Раскладка повторяет map.
+        let rec = {
             let dom = self
                 .domains
                 .get(&bind.domid)
                 .ok_or(IommuError::DeviceNotBound)?;
-            dom.mappings.contains_key(&iova)
+            dom.mappings.get(&iova).copied()
         };
-        if !had {
+        let Some((phys, pages, _prot, _huge)) = rec else {
             return Err(IommuError::MappingNotFound);
+        };
+        if pages != count {
+            return Err(IommuError::InvalidConfig);
         }
-        for i in 0..count as u64 {
-            if let Some(slot) = pt_slot(root, iova + i * 4096, false) {
-                // SAFETY: слот — листовая PTE домена (наш).
-                unsafe { slot.write_volatile(0) };
+        let mut i = 0u64;
+        while i < count as u64 {
+            let a = iova + i * 4096;
+            let p = phys + i * 4096;
+            let left = count as u64 - i;
+            if self.huge_ok && left >= 512 && a % V1_HUGEP == 0 && p % V1_HUGEP == 0 {
+                if let Some(slot) = pt_slot_level(root, a, 2, false) {
+                    // SAFETY: слот — запись домена (наш).
+                    unsafe { slot.write_volatile(0) };
+                }
+                i += 512;
+            } else {
+                if let Some(slot) = pt_slot(root, a, false) {
+                    // SAFETY: слот — листовая PTE домена (наш).
+                    unsafe { slot.write_volatile(0) };
+                }
+                i += 1;
             }
         }
-        let dom = self
-            .domains
+        self.domains
             .get_mut(&bind.domid)
-            .ok_or(IommuError::DeviceNotBound)?;
-        // Полное снятие диапазона (частичное — v0.8 с реестром под-страниц).
-        if let Some((_, pages, _)) = dom.mappings.remove(&iova) {
-            if pages < count {
-                // Снято больше, чем было: вернуть в карту хвост (не терять).
-                dom.mappings.insert(
-                    iova + (pages as u64) * 4096,
-                    (0, count - pages, IommuProt::READ),
-                );
-            }
-        }
+            .ok_or(IommuError::DeviceNotBound)?
+            .mappings
+            .remove(&iova);
         self.invalidate_all(bind.devid, bind.domid)
     }
 
@@ -646,15 +727,28 @@ impl AmdVi {
                 .ok_or(IommuError::DeviceNotBound)?;
             dom.mappings
                 .iter()
-                .map(|(&k, &(p, n, _))| (k, p, n))
+                .map(|(&k, &(p, n, _, _))| (k, p, n))
                 .collect()
         };
         let (r, w) = pte_prot(prot);
         for (iova, phys, pages) in ranges {
-            for i in 0..pages as u64 {
-                if let Some(slot) = pt_slot(root, iova + i * 4096, false) {
-                    // SAFETY: слот — листовая PTE домена (наш).
-                    unsafe { slot.write_volatile(pagetables::v1_page(phys + i * 4096, r, w)) };
+            let mut i = 0u64;
+            while i < pages as u64 {
+                let a = iova + i * 4096;
+                let p = phys + i * 4096;
+                let left = pages as u64 - i;
+                if self.huge_ok && left >= 512 && a % V1_HUGEP == 0 && p % V1_HUGEP == 0 {
+                    if let Some(slot) = pt_slot_level(root, a, 2, false) {
+                        // SAFETY: слот — запись домена (наш).
+                        unsafe { slot.write_volatile(pagetables::v1_page(p, r, w)) };
+                    }
+                    i += 512;
+                } else {
+                    if let Some(slot) = pt_slot(root, a, false) {
+                        // SAFETY: слот — листовая PTE домена (наш).
+                        unsafe { slot.write_volatile(pagetables::v1_page(p, r, w)) };
+                    }
+                    i += 1;
                 }
             }
         }
@@ -678,6 +772,13 @@ impl AmdVi {
         self.write_dte(bind.devid, DeviceTableEntry::new());
         // Видимость сброса DTE до INVALIDATE_DEVTAB_ENTRY.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        // v0.8: per-device IRTE-таблица — в пул (DTE уже погашен).
+        if bind.irq_phys != 0 {
+            self.cmd_submit(&Command::InvalidateInterruptTable(InvalidateDevTabEntry {
+                device_id: bind.devid,
+            }));
+            free_page(bind.irq_phys);
+        }
         // Таблицы домена — в пул (только если устройств домена не осталось).
         let still_used = self.devices.values().any(|b| b.domid == bind.domid);
         if !still_used {
@@ -686,6 +787,99 @@ impl AmdVi {
             }
         }
         self.invalidate_all(bind.devid, bind.domid)
+    }
+
+    // ==== IRQ-ремаппинг (v0.8) ====
+
+    /// Записать 128-битную v1-IRTE по индексу per-device таблицы.
+    fn write_irte(&self, irq_phys: u64, idx: usize, irte: Option<Irte>) {
+        let words = match irte {
+            Some(i) => i.words(),
+            None => [0u32; 4],
+        };
+        // SAFETY: IRTE-таблица — наша страница, 16 байт на запись.
+        unsafe {
+            let p = phys_ptr::<u32>(irq_phys).add(idx * 4);
+            p.write_volatile(words[0]);
+            p.add(1).write_volatile(words[1]);
+            p.add(2).write_volatile(words[2]);
+            p.add(3).write_volatile(words[3]);
+        }
+    }
+
+    /// Запрограммировать IRTE (v1): RemapEn|Valid|IntType|DM|dest|vector.
+    /// Индекс 0 — резерв (системный «нет handle»): выделяем из 1..=15.
+    fn irq_map(&mut self, dev: u32, vector: u8, dest: u8, flags: u8) -> Result<u32, IommuError> {
+        if !self.ir_enabled {
+            return Err(IommuError::RemappingDisabled);
+        }
+        if !(0x10..=0xFE).contains(&vector) {
+            return Err(IommuError::InvalidConfig);
+        }
+        let bind = self.bind_of(dev)?.0;
+        if bind.irq_phys == 0 {
+            return Err(IommuError::RemappingDisabled);
+        }
+        // Первый свободный слот (RemapEn=0), индекс 0 — резерв.
+        let mut idx = None;
+        for i in 1..IRTE_PER_DEV {
+            // SAFETY: IRTE-таблица — наша страница.
+            let used =
+                unsafe { phys_ptr::<u32>(bind.irq_phys).add(i * 4).read_volatile() & 1 != 0 };
+            if !used {
+                idx = Some(i);
+                break;
+            }
+        }
+        let idx = idx.ok_or(IommuError::OutOfMemory)?;
+        let irte = Irte::new()
+            .with_remap_enable(true)
+            .with_int_type(IntType::Fixed)
+            .with_destination_mode(flags & 2 != 0)
+            .with_destination(dest)
+            .with_vector(vector);
+        self.write_irte(bind.irq_phys, idx, Some(irte));
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        // IRCache — INVALIDATE_INTERRUPT_TABLE устройства + sync.
+        self.cmd_submit(&Command::InvalidateInterruptTable(InvalidateDevTabEntry {
+            device_id: bind.devid,
+        }));
+        self.cmd_sync()?;
+        crate::kprintln!(
+            "amdvi: irte dev={} idx={} vec={:#x} dst={:#x} lvl={} log={}",
+            dev,
+            idx,
+            vector,
+            dest,
+            flags & 1 != 0,
+            flags & 2 != 0
+        );
+        Ok(idx as u32)
+    }
+
+    /// Погасить IRTE по handle (проверяем занятость и валидность).
+    fn irq_unmap(&mut self, dev: u32, handle: u32) -> Result<(), IommuError> {
+        if !self.ir_enabled {
+            return Err(IommuError::RemappingDisabled);
+        }
+        let bind = self.bind_of(dev)?.0;
+        if bind.irq_phys == 0 {
+            return Err(IommuError::RemappingDisabled);
+        }
+        let idx = handle as usize;
+        if idx == 0 || idx >= IRTE_PER_DEV {
+            return Err(IommuError::InvalidConfig);
+        }
+        // SAFETY: IRTE-таблица — наша страница.
+        let used = unsafe { phys_ptr::<u32>(bind.irq_phys).add(idx * 4).read_volatile() & 1 != 0 };
+        if !used {
+            return Err(IommuError::InvalidConfig);
+        }
+        self.write_irte(bind.irq_phys, idx, None);
+        self.cmd_submit(&Command::InvalidateInterruptTable(InvalidateDevTabEntry {
+            device_id: bind.devid,
+        }));
+        self.cmd_sync()
     }
 }
 
@@ -725,10 +919,12 @@ fn event_code_name(code: EventCode) -> &'static str {
 
 // ───────────────────── КОНТРАКТ ЯДРА: IOMMU ─────────────────────
 
-/// Драйвер как единица LIOMMUInterface.
+/// Драйвер AMD-Vi — ВСЕ поднятые IVHD-единицы (мульти-IOMMU, v0.8).
+/// HAL-путь неймспейсит DeviceId парой (контроллер << 20 | локальный id)
+/// — как `crate::vtd`; сисколы передают контроллер отдельным аргументом.
 pub struct AmdDriver {
-    inner: Mutex<Option<AmdVi>>,
-    /// Порядковый номер контроллера (IommuId).
+    inner: Mutex<Vec<AmdVi>>,
+    /// Порядковый номер драйвера-вендора (IommuId).
     id: u32,
     /// Готовность (init прошёл; ставится один раз до старта AP).
     ready: AtomicBool,
@@ -737,21 +933,35 @@ pub struct AmdDriver {
 impl AmdDriver {
     const fn new(id: u32) -> Self {
         Self {
-            inner: Mutex::new(None),
+            inner: Mutex::new(Vec::new()),
             id,
             ready: AtomicBool::new(false),
         }
     }
 
-    /// Пометить готовым (try_init после успешного AmdVi::init).
+    /// Пометить готовым (try_init после успешных AmdVi::init).
     fn mark_ready(&self) {
         self.ready.store(true, AtomicOrdering::Release);
     }
 
-    /// Готовность контроллера (для агрегатора `crate::iommu`).
+    /// Готовность (для агрегатора `crate::iommu`).
     pub fn is_ready(&self) -> bool {
         self.ready.load(AtomicOrdering::Acquire)
     }
+
+    /// Число живых контроллеров (для агрегатора и IommuService).
+    pub fn controller_count(&self) -> usize {
+        if self.ready.load(AtomicOrdering::Acquire) {
+            self.inner.lock().len()
+        } else {
+            0
+        }
+    }
+}
+
+/// HAL-неймспейс DeviceId: (контроллер << 20) | (локальный id & 0xF_FFFF).
+fn hal_dev_id(ctrl: u32, local: u32) -> u32 {
+    (ctrl << 20) | (local & 0xF_FFFF)
 }
 
 /// Информация о контроллере для IOMMU_ENUM (сискол).
@@ -760,17 +970,20 @@ pub struct AmdInfo {
     /// Версия архитектуры из типа IVHD: 10h → 1.0, 11h/40h → 2.0.
     pub version: u16,
     pub include_all: bool,
+    /// v0.8: IRQ-ремаппинг (IntCtl=10b в DTE attach'ей).
+    pub irq_remap: bool,
 }
 
 impl AmdDriver {
-    fn info(&self) -> Option<AmdInfo> {
+    fn info(&self, ctrl: u32) -> Option<AmdInfo> {
         let g = self.inner.lock();
-        g.as_ref().map(|a| AmdInfo {
+        g.get(ctrl as usize).map(|a| AmdInfo {
             version: match a.ivhd_type {
                 EntryType::IvhdType11 | EntryType::IvhdType40 => 0x0200,
                 _ => 0x0100,
             },
             include_all: a.coverage_all,
+            irq_remap: a.ir_enabled,
         })
     }
 }
@@ -788,29 +1001,39 @@ impl ANIOMMUInterface for AmdDriver {
         count: usize,
         prot: IommuProt,
     ) -> Result<(), IommuError> {
+        let ctrl = dev.0 >> 20;
+        let local = dev.0 & 0xF_FFFF;
         let mut g = self.inner.lock();
-        g.as_mut()
-            .ok_or(IommuError::IommuNotPresent)?
-            .map(dev.0, iova, phys.0, count, prot)
+        g.get_mut(ctrl as usize)
+            .ok_or(IommuError::InvalidIndex)?
+            .map(local, iova, phys.0, count, prot)
     }
 
     fn unmap_pages(&mut self, dev: DeviceId, iova: u64, count: usize) -> Result<(), IommuError> {
+        let ctrl = dev.0 >> 20;
+        let local = dev.0 & 0xF_FFFF;
         let mut g = self.inner.lock();
-        g.as_mut()
-            .ok_or(IommuError::IommuNotPresent)?
-            .unmap(dev.0, iova, count)
+        g.get_mut(ctrl as usize)
+            .ok_or(IommuError::InvalidIndex)?
+            .unmap(local, iova, count)
     }
 
     fn set_protection(&mut self, dev: DeviceId, prot: IommuProt) -> Result<(), IommuError> {
+        let ctrl = dev.0 >> 20;
+        let local = dev.0 & 0xF_FFFF;
         let mut g = self.inner.lock();
-        g.as_mut()
-            .ok_or(IommuError::IommuNotPresent)?
-            .set_protection(dev.0, prot)
+        g.get_mut(ctrl as usize)
+            .ok_or(IommuError::InvalidIndex)?
+            .set_protection(local, prot)
     }
 
     fn detach_device(&mut self, dev: DeviceId) -> Result<(), IommuError> {
+        let ctrl = dev.0 >> 20;
+        let local = dev.0 & 0xF_FFFF;
         let mut g = self.inner.lock();
-        g.as_mut().ok_or(IommuError::IommuNotPresent)?.detach(dev.0)
+        g.get_mut(ctrl as usize)
+            .ok_or(IommuError::InvalidIndex)?
+            .detach(local)
     }
 }
 
@@ -839,32 +1062,35 @@ impl LIOMMUInterface for AmdDriver {
         if bdf.segment != processor.segment {
             return Err(IommuError::UnknownDevicePath);
         }
+        // v0.8: мульти-IOMMU — первый контроллер с подходящим coverage.
         let mut g = self.inner.lock();
-        g.as_mut()
-            .ok_or(IommuError::IommuNotPresent)?
-            .attach_bdf(bdf)
-            .map(DeviceId)
+        for (ctrl, unit) in g.iter_mut().enumerate() {
+            if let Ok(local) = unit.attach_bdf(bdf) {
+                return Ok(DeviceId(hal_dev_id(ctrl as u32, local)));
+            }
+        }
+        Err(IommuError::UnknownDevicePath)
     }
 }
 
 // ───────────────────── Сервис сисколов (для агрегатора) ─────────────────────
 
-/// Единственный контроллер v0.7 (IommuId(1)); 0 = «нет».
+/// Драйвер AMD-Vi (все IVHD-единицы); IommuId(1), 0 = «нет».
 pub static AMD0: AmdDriver = AmdDriver::new(1);
 
 impl IommuService for AmdDriver {
     fn controller_count(&self) -> usize {
-        if self.is_ready() { 1 } else { 0 }
+        AmdDriver::controller_count(self)
     }
 
     fn controller_info(
         &self,
         idx: u32,
     ) -> Result<pkg_generic_interface::syscall::iommu::IommuInfo, IommuError> {
-        if idx != 0 || !self.is_ready() {
+        if !self.is_ready() {
             return Err(IommuError::InvalidIndex);
         }
-        let i = self.info().ok_or(IommuError::IommuNotPresent)?;
+        let i = self.info(idx).ok_or(IommuError::InvalidIndex)?;
         Ok(pkg_generic_interface::syscall::iommu::IommuInfo {
             version: i.version,
             // 4 уровня v1-таблиц = 48-бит IOVA (зеркально AGAW48 VT-d).
@@ -875,16 +1101,16 @@ impl IommuService for AmdDriver {
             // DTE TV=0 = pass-through режим (не используем, информативно).
             pass_through: true,
             include_all: i.include_all,
+            irq_remap: i.irq_remap,
+            // v1-листья уровня 2 — спека v1 (NextLevel=0 задаёт размер).
+            large_pages: true,
         })
     }
 
     fn attach(&self, ctrl: u32, bus: u8, device: u8, function: u8) -> Result<u32, IommuError> {
-        if ctrl != 0 || !self.is_ready() {
-            return Err(IommuError::InvalidIndex);
-        }
         let mut g = self.inner.lock();
-        g.as_mut()
-            .ok_or(IommuError::IommuNotPresent)?
+        g.get_mut(ctrl as usize)
+            .ok_or(IommuError::InvalidIndex)?
             .attach_bdf(Bdf::new(0, bus, device, function))
     }
 
@@ -897,13 +1123,10 @@ impl IommuService for AmdDriver {
         pages: usize,
         prot: u8,
     ) -> Result<(), IommuError> {
-        if ctrl != 0 || !self.is_ready() {
-            return Err(IommuError::InvalidIndex);
-        }
         let prot = IommuProt::from_bits_truncate(prot);
         let mut g = self.inner.lock();
-        g.as_mut()
-            .ok_or(IommuError::IommuNotPresent)?
+        g.get_mut(ctrl as usize)
+            .ok_or(IommuError::InvalidIndex)?
             .map(device, iova, phys, pages, prot)
     }
 
@@ -914,31 +1137,48 @@ impl IommuService for AmdDriver {
         iova: u64,
         pages: usize,
     ) -> Result<(), IommuError> {
-        if ctrl != 0 || !self.is_ready() {
-            return Err(IommuError::InvalidIndex);
-        }
         let mut g = self.inner.lock();
-        g.as_mut()
-            .ok_or(IommuError::IommuNotPresent)?
+        g.get_mut(ctrl as usize)
+            .ok_or(IommuError::InvalidIndex)?
             .unmap(device, iova, pages)
     }
 
     fn detach(&self, ctrl: u32, device: u32) -> Result<(), IommuError> {
-        if ctrl != 0 || !self.is_ready() {
-            return Err(IommuError::InvalidIndex);
-        }
         let mut g = self.inner.lock();
-        g.as_mut()
-            .ok_or(IommuError::IommuNotPresent)?
+        g.get_mut(ctrl as usize)
+            .ok_or(IommuError::InvalidIndex)?
             .detach(device)
+    }
+
+    fn irq_map(
+        &self,
+        ctrl: u32,
+        device: u32,
+        vector: u8,
+        dest: u8,
+        flags: u8,
+    ) -> Result<u32, IommuError> {
+        let mut g = self.inner.lock();
+        g.get_mut(ctrl as usize)
+            .ok_or(IommuError::InvalidIndex)?
+            .irq_map(device, vector, dest, flags)
+    }
+
+    fn irq_unmap(&self, ctrl: u32, device: u32, handle: u32) -> Result<(), IommuError> {
+        let mut g = self.inner.lock();
+        g.get_mut(ctrl as usize)
+            .ok_or(IommuError::InvalidIndex)?
+            .irq_unmap(device, handle)
     }
 }
 
 // ───────────────────── Запуск (через iommu::init_and_install) ─────────────────────
 
-/// Поиск IVRS -> первый IVHD -> init драйвера -> пометка готовности.
-/// Вызывается ПОСЛЕ kinit (пулы/куча подняты), ДО release_aps. Возврат —
-/// готовность (сервис ставит агрегатор `crate::iommu`).
+/// Поиск IVRS -> ВСЕ IVHD с уникальными MMIO-базами -> init каждой ->
+/// пометка готовности. Мульти-IOMMU (v0.8): QEMU генерирует IVHD 10h и
+/// 11h ОДНОЙ единицы (одинаковая база) — дедуп по базе; на реальном
+/// железе с несколькими IOMMU каждый IVHD становится контроллером.
+/// Вызывается ПОСЛЕ kinit (пулы/куча подняты), ДО release_aps.
 pub fn try_init() -> bool {
     // Пул не поднят (ранний fatal-путь run()) — тихо уходим.
     if pkg_generic_interface::mem::gallocator::frames().is_none() {
@@ -972,10 +1212,33 @@ pub fn try_init() -> bool {
             return false;
         }
     };
-    // Первый IVHD (QEMU генерирует 10h и 11h с одинаковым покрытием).
-    let ivhd = match ivrs.ivhd_units().next() {
-        Some(h) => h,
-        None => {
+    // Все IVHD-единицы (мульти-IOMMU v0.8); дубликаты MMIO-базы (QEMU
+    // кладёт 10h+11h одной единицы) — одна физическая единица.
+    let mut made: Vec<AmdVi> = Vec::new();
+    let mut seen_bases: Vec<u64> = Vec::new();
+    let mut units = 0usize;
+    for ivhd in ivrs.ivhd_units() {
+        units += 1;
+        if seen_bases.contains(&ivhd.base_address()) {
+            crate::kprintln!(
+                "amdvi: duplicate IVHD base={:#x} — skipped",
+                ivhd.base_address()
+            );
+            continue;
+        }
+        seen_bases.push(ivhd.base_address());
+        match AmdVi::init(&ivhd) {
+            Ok(a) => {
+                crate::kprintln!("amdvi[{}]: unit up", made.len());
+                made.push(a);
+            }
+            Err(e) => {
+                crate::kprintln!("amdvi: unit init failed: {:?} (skipped)", e);
+            }
+        }
+    }
+    if made.is_empty() {
+        if units == 0 {
             // Диагностика: IVRS валиден (сигнатура/чексумма), но блоки
             // не распознаны. Известная причина — IVRS BLOCKS_OFFSET=44 в
             // старых ревизиях amd-iommu (спека/блоки с offset 48):
@@ -985,20 +1248,12 @@ pub fn try_init() -> bool {
                 "amdvi: IVRS without IVHD units (len={}; check amd-iommu crate: IVRS blocks at +48)",
                 len
             );
-            return false;
         }
-    };
-    match AmdVi::init(&ivhd) {
-        Ok(a) => {
-            *AMD0.inner.lock() = Some(a);
-            // Готовность: ставим ПОСЛЕ заполнения (release_aps ещё не
-            // было — конкурентов нет).
-            AMD0.mark_ready();
-            true
-        }
-        Err(e) => {
-            crate::kprintln!("amdvi: init failed: {:?} (AMD-Vi syscalls -> ENOSYS)", e);
-            false
-        }
+        return false;
     }
+    *AMD0.inner.lock() = made;
+    // Готовность: ставим ПОСЛЕ заполнения (release_aps ещё не было —
+    // конкурентов нет).
+    AMD0.mark_ready();
+    true
 }

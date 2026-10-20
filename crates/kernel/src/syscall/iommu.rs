@@ -36,6 +36,12 @@ pub struct IommuInfo {
     pub pass_through: bool,
     /// DRHD покрывает весь сегмент (INCLUDE_PCI_ALL).
     pub include_all: bool,
+    /// IRQ-ремаппинг включён (v0.8: IRTA/IRTE живут, контроллер
+    /// принимает IOMMU_IRQ_*).
+    pub irq_remap: bool,
+    /// Крупные страницы (2 МиБ) поддерживаются и используются драйвером
+    /// для выровненных отображений (v0.8).
+    pub large_pages: bool,
 }
 
 /// Объектно-безопасный сервис DMA-ремаппинга (реализация — платформа).
@@ -73,6 +79,23 @@ pub trait IommuService: Send + Sync {
     /// Отвязать устройство (контекстный вход гасится, таблицы домена
     /// освобождаются, если устройств домена не осталось).
     fn detach(&self, ctrl: u32, device: u32) -> Result<(), IommuError>;
+
+    /// Запрограммировать IRTE устройства (IRQ-ремаппинг, v0.8):
+    /// remapped-запись vector/dest. Возврат — handle (индекс IRTE,
+    /// ненулевой: 0 — сисьмный «нет handle»), драйвер устройства
+    /// кладёт его в MSI-адрес. Без включённого IR — RemappingDisabled.
+    /// `flags`: bit0 = level-triggered, bit1 = logical destination mode.
+    fn irq_map(
+        &self,
+        ctrl: u32,
+        device: u32,
+        vector: u8,
+        dest: u8,
+        flags: u8,
+    ) -> Result<u32, IommuError>;
+
+    /// Погасить IRTE по handle (IRR сбрасывается, кэш инвалидируется).
+    fn irq_unmap(&self, ctrl: u32, device: u32, handle: u32) -> Result<(), IommuError>;
 }
 
 struct ServiceAnchor(&'static dyn IommuService);
@@ -127,7 +150,8 @@ impl SyscallError {
 /// НЕ так: см. ABI ниже).
 ///
 /// Финальный ABI (слова результата по arg2):
-///   arg2=0 -> флаги (bit0..3, см. выше) | (mgaw << 8)
+///   arg2=0 -> флаги (bit0..5) | (mgaw << 8); v0.8: bit4 = irq_remap,
+///             bit5 = large_pages (2 МиБ)
 ///   arg2=1 -> version ((major<<8)|minor)
 ///   arg2=2 -> 1 (число доменов не экспортируем — v0.6)
 pub struct IommuEnumHandler;
@@ -155,6 +179,8 @@ impl SyscallHandler for IommuEnumHandler {
                     | (info.queued_inval as usize) << 1
                     | (info.pass_through as usize) << 2
                     | (info.include_all as usize) << 3
+                    | (info.irq_remap as usize) << 4
+                    | (info.large_pages as usize) << 5
             }
             1 => info.version as usize,
             _ => return Err(SyscallError::InvalidArgument),
@@ -262,6 +288,56 @@ impl SyscallHandler for IommuDetachHandler {
     }
 }
 
+/// IOMMU_IRQ_MAP (0x85): запрограммировать IRTE (v0.8).
+///
+/// ABI: arg1 = контроллер, arg2 = DeviceId, arg3 = vector,
+/// arg4 = APIC-destination, arg5 = флаги (bit0 level, bit1 logical).
+/// Возврат: handle (индекс IRTE).
+pub struct IommuIrqMapHandler;
+
+impl IommuIrqMapHandler {
+    pub const SYSCALL: SyscallNumber = crate::syscall::nums::IOMMU_IRQ_MAP;
+}
+
+impl SyscallHandler for IommuIrqMapHandler {
+    fn invoke(&self, _ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+        let Some(svc) = service() else {
+            return Err(SyscallError::NotSupported);
+        };
+        let ctrl = args.arg(1) as u32;
+        let dev = args.arg(2) as u32;
+        let vector = (args.arg(3) as u64) as u8;
+        let dest = (args.arg(4) as u64) as u8;
+        let flags = (args.arg(5) as u64) as u8;
+        svc.irq_map(ctrl, dev, vector, dest, flags)
+            .map(|h| h as usize)
+            .map_err(SyscallError::from_iommu)
+    }
+}
+
+/// IOMMU_IRQ_UNMAP (0x86): погасить IRTE по handle.
+///
+/// ABI: arg1 = контроллер, arg2 = DeviceId, arg3 = handle.
+pub struct IommuIrqUnmapHandler;
+
+impl IommuIrqUnmapHandler {
+    pub const SYSCALL: SyscallNumber = crate::syscall::nums::IOMMU_IRQ_UNMAP;
+}
+
+impl SyscallHandler for IommuIrqUnmapHandler {
+    fn invoke(&self, _ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+        let Some(svc) = service() else {
+            return Err(SyscallError::NotSupported);
+        };
+        let ctrl = args.arg(1) as u32;
+        let dev = args.arg(2) as u32;
+        let handle = args.arg(3) as u32;
+        svc.irq_unmap(ctrl, dev, handle)
+            .map(|_| 0)
+            .map_err(SyscallError::from_iommu)
+    }
+}
+
 // ───────────────────── Тесты (host) ─────────────────────
 
 #[cfg(test)]
@@ -283,6 +359,8 @@ mod tests {
         unmaps: AtomicU32,
         detached: AtomicU32,
         last_detached: AtomicU32,
+        irq_mapped: AtomicU32,
+        irq_unmapped: AtomicU32,
     }
 
     impl MockSvc {
@@ -306,6 +384,8 @@ mod tests {
                 queued_inval: true,
                 pass_through: false,
                 include_all: true,
+                irq_remap: true,
+                large_pages: true,
             })
         }
         fn attach(&self, _c: u32, bus: u8, dev: u8, _f: u8) -> Result<u32, IommuError> {
@@ -357,6 +437,33 @@ mod tests {
             self.detached.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
+        fn irq_map(
+            &self,
+            _c: u32,
+            d: u32,
+            vector: u8,
+            _dest: u8,
+            _flags: u8,
+        ) -> Result<u32, IommuError> {
+            if d == 0 {
+                return Err(IommuError::DeviceNotBound);
+            }
+            if !(0x10..=0xFE).contains(&vector) {
+                return Err(IommuError::InvalidConfig);
+            }
+            let n = self.irq_mapped.fetch_add(1, Ordering::Relaxed);
+            Ok(n + 1) // handle 1, 2, ... — 0 = «нет»
+        }
+        fn irq_unmap(&self, _c: u32, d: u32, handle: u32) -> Result<(), IommuError> {
+            if d == 0 || self.is_detached(d) {
+                return Err(IommuError::DeviceNotBound);
+            }
+            if handle == 0 {
+                return Err(IommuError::InvalidConfig);
+            }
+            self.irq_unmapped.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
     }
 
     // Глобальный Once не сбрасывается между тестами — мок ставится один
@@ -367,6 +474,8 @@ mod tests {
         unmaps: AtomicU32::new(0),
         detached: AtomicU32::new(0),
         last_detached: AtomicU32::new(0),
+        irq_mapped: AtomicU32::new(0),
+        irq_unmapped: AtomicU32::new(0),
     };
 
     fn ensure_svc() {
@@ -404,14 +513,15 @@ mod tests {
             ),
             Ok(1)
         );
-        // Флаги: agaw48(1) | qi(2) | include_all(8) | mgaw<<8 = 0x300B.
+        // Флаги: agaw48(1) | qi(2) | include_all(8) | irq_remap(0x10)
+        // | large_pages(0x20) | mgaw<<8 = 0x303B.
         assert_eq!(
             r.dispatch_number(
                 IommuEnumHandler::SYSCALL,
                 &mut ctx,
                 &SyscallArgs::new([0, 0, 0, 0, 0, 0])
             ),
-            Ok(0x300B)
+            Ok(0x303B)
         );
         assert_eq!(
             r.dispatch_number(
@@ -513,6 +623,67 @@ mod tests {
     }
 
     #[test]
+    fn irq_map_unmap_cycle() {
+        ensure_svc();
+        let r = registry_with_iommu();
+        let tasks = TcbManager::new().unwrap();
+        let caps = CapabilityManager::new().unwrap();
+        let id = TaskId::from_u128(0x9004);
+        let mut ctx = ctx_of(&tasks, &caps, id, id);
+        let dev = r
+            .dispatch_number(
+                IommuAttachHandler::SYSCALL,
+                &mut ctx,
+                &SyscallArgs::new([0, 0, 3, 0, 0, 0]),
+            )
+            .expect("attach");
+        // IRQ_MAP: vector 0x41 -> handle > 0 (0 = «нет»).
+        let handle = r
+            .dispatch_number(
+                IommuIrqMapHandler::SYSCALL,
+                &mut ctx,
+                &SyscallArgs::new([0, 0, dev, 0x41, 0, 0]),
+            )
+            .expect("irq_map");
+        assert!(handle > 0);
+        // Вектор вне 0x10..0xFE — InvalidConfig.
+        assert_eq!(
+            r.dispatch_number(
+                IommuIrqMapHandler::SYSCALL,
+                &mut ctx,
+                &SyscallArgs::new([0, 0, dev, 0x05, 0, 0])
+            ),
+            Err(SyscallError::InvalidArgument)
+        );
+        // Незакреплённое устройство — DeviceNotBound.
+        assert_eq!(
+            r.dispatch_number(
+                IommuIrqMapHandler::SYSCALL,
+                &mut ctx,
+                &SyscallArgs::new([0, 0, 0, 0x41, 0, 0])
+            ),
+            Err(SyscallError::NotFound)
+        );
+        assert_eq!(
+            r.dispatch_number(
+                IommuIrqUnmapHandler::SYSCALL,
+                &mut ctx,
+                &SyscallArgs::new([0, 0, dev, handle, 0, 0])
+            ),
+            Ok(0)
+        );
+        // handle = 0 — InvalidConfig.
+        assert_eq!(
+            r.dispatch_number(
+                IommuIrqUnmapHandler::SYSCALL,
+                &mut ctx,
+                &SyscallArgs::new([0, 0, dev, 0, 0, 0])
+            ),
+            Err(SyscallError::InvalidArgument)
+        );
+    }
+
+    #[test]
     fn default_table_contains_iommu() {
         ensure_svc();
         let r = registry_with_iommu();
@@ -529,11 +700,13 @@ mod tests {
             &SyscallArgs::new([0, 0xFFFF_FFFF, 0, 0, 0, 0]),
         );
         assert_eq!(ret, Ok(1));
-        // Номера — плотная группа 0x80..0x84.
+        // Номера — плотная группа 0x80..0x86.
         assert_eq!(IommuEnumHandler::SYSCALL, SyscallNumber(0x80));
         assert_eq!(IommuAttachHandler::SYSCALL, SyscallNumber(0x81));
         assert_eq!(IommuMapHandler::SYSCALL, SyscallNumber(0x82));
         assert_eq!(IommuUnmapHandler::SYSCALL, SyscallNumber(0x83));
         assert_eq!(IommuDetachHandler::SYSCALL, SyscallNumber(0x84));
+        assert_eq!(IommuIrqMapHandler::SYSCALL, SyscallNumber(0x85));
+        assert_eq!(IommuIrqUnmapHandler::SYSCALL, SyscallNumber(0x86));
     }
 }

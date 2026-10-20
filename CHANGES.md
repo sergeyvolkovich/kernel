@@ -1,5 +1,96 @@
 # rust-l4: изменения по версиям (workspace)
 
+## v0.8 — IOMMU: IRQ-ремаппинг + мульти-IOMMU + крупные страницы; userlib (C-ABI)
+
+### Сделано
+
+**IRQ-ремаппинг (`backend/vtd.rs` — Intel, `backend/amd.rs` — AMD-Vi):**
+- Intel: IRTA (256 IRTE = 4 КиБ, S=7, EIME=0 — ядро в xAPIC) → GCMD
+  SIRTP (одной записью с ENABLE|QIE — каждый бит GCMD ЗАПРОС, баг
+  v0.6.1 не воспроизводим) → IEC-флеш через QI (QiIec global) → GCMD
+  IRE; GSTS IRTPS/IRES обязательны. IRTE (remapped-формат): P|vector|
+  dest|SVT=11b VerifyFull+SQ=01b (сверка bus+dev источника); слоты
+  1..15, 26..255 (0 — сисьмный «нет handle»; 0x10..0x25 — диапазон
+  IOAPIC по спеке, резерв); погашение — выборочный QiIec + sync.
+- AMD-Vi: per-device IRTE-таблица (v1, 128-бит, IntTabLen=4 → 16
+  записей на страницу) из DTE: IV=1 + IntTabPtr + IntCtl=10b (remap
+  on); INVALIDATE_INTERRUPT_TABLE (05h) командным буфером после
+  записи/сброса IRTE; detach гасит таблицу в пул. Индексы 1..=15
+  (0 — резерв).
+- Сисколы: IOMMU_IRQ_MAP (0x85: ctrl/dev/vector/dest/flags → handle
+  — его драйвер устройства кладёт в MSI-адрес) и IOMMU_IRQ_UNMAP
+  (0x86); flags: bit0 level-triggered, bit1 logical DM. ENUM-флаги:
+  bit4 = irq_remap, bit5 = large_pages (ABI v0.6 не меняется —
+  расширение только новыми битами/номерами).
+- Честная граница: включение IR (IRTA/SIRTP/IEC/IRE, IntCtl/DTE)
+  валидировано эмулятором (QEMU intremap=on: attach с IR-DTE и
+  программирование IRTE проходят, event log чист); ДОСТАВКА
+  remapped-MSI требует драйвера устройства, поднимающего MSI —
+  за пределами v0.8 (в QEMU-прогоне MSI-трафика нет).
+
+**Мульти-IOMMU (vtd.rs/amd.rs/iommu.rs):**
+- Драйверы хранят ВСЕ единицы (Vec<инстанс>): vtd — каждый DRHD
+  DMAR, amd — каждый IVHD с уникальной MMIO-базой (дедуп: QEMU
+  кладёт 10h+11h ОДНОЙ единицы). IommuService маршрутизирует по
+  сквозному индексу: сперва все Intel, затем все AMD (агрегатор
+  pick() → (драйвер, локальный индекс)); ENUM счётчик — честный.
+- HAL-путь (ANIOMMUInterface) неймспейсит DeviceId: (контроллер <<
+  20) | локальный id — операции знают контроллер; сисколы ABI
+  v0.6 не меняют (ctrl передавался явно с v0.6).
+
+**Крупные страницы (2 МиБ):**
+- Intel: CAP.SSLPS bit0 → SS-PDE huge-лист (бит PS = 0x80, физика
+  51:21); раскладка map — детерминированный проход: 2 МиБ-выровненный
+  кусок ≥ 512 стр → один PDE, остальное — 4К PTE; unmap/protect
+  повторяют ту же геометрию (зеркало таблиц не храним). sspt_free
+  различает huge-лист (не таблица — физика не наша).
+- AMD-Vi: v1-лист уровня 2 (NextLevel=0 — размер задаётся уровнем,
+  спека v1); pt_free различает листы (NextLevel=0) на любом уровне.
+- UNMAP-политика v0.8: точное совпадение (iova, count) с MAP —
+  частичное снятие с расщеплением huge — v0.9 (v0.7-хак с фантомным
+  хвостом удалён; честный EINVAL).
+
+**userlib — C-интероп пользователей (`crates/userlib`, v0.8):**
+- Статическая C-библиотека (x86_64-unknown-none, staticlib): `_start`
+  (стартовый IPC L4 → разбор argv-блока → прикладной `main(argc,
+  argv)` → TASK_EXIT(код)) + `l4_*` обёртки ВСЕЙ таблицы сисколов
+  (группы 0x00..0x86: система, задачи/потоки, capability, IPC,
+  устройства/IRQ, память, SHM/io_uring, отладка, IOMMU) + хелперы
+  консоли (l4_debug_write_bytes/l4_puts/l4_puthex) + страховка
+  __stack_chk_fail. C-заголовок: crates/userlib/include/l4.h.
+- Пример C-сервера: examples/capp.c (сборка scripts/build.sh:
+  gcc -ffreestanding -fno-stack-protector -nostdlib + init.ld @
+  0x40000000) — идентификация, argv-конфигурация, MEM_ALLOC+паттерн,
+  полный IOMMU-проход v0.8 (map+huge+irq+unmap+detach) на C.
+- Конфигурация серверов: scripts/boot_cfg_c.xml (capp — первый
+  сервер, init — второй модуль); выбор через BOOT_CFG=... в
+  scripts/build.sh (по умолчанию — init).
+
+**Скрипты/QEMU:**
+- run_qemu.sh: QEMU_INTREMAP=0|1 (по умолчанию 1) — intremap=on в
+  -device intel-iommu/amd-iommu (v0.7 выключал: IR не было в драйверах).
+- build.sh: шаги userlib+capp; CC override; BOOT_CFG-выбор.
+
+### Исправленные баги
+1. **vtd: unmap ломал huge-таблицы** (найден при разработке v0.8):
+   v0.7-хак unmap (снятие больше отображения → фантомный хвост в
+   карте) конфликтует с детерминированной раскладкой v0.8 — удалён;
+   policy точного совпадения, EINVAL на частичное.
+2. **amd: pt_free/sspt_free freeing отображённой физики** — лист
+   уровня 2 неотличим от каталога при обходе: Intel — бит PS,
+   AMD — NextLevel=0; без фикса detach освобождал бы чужую физику
+   в пул (коррупция).
+
+### Верификация (QEMU, OVMF/UEFI, TCG SMP=2, intremap=on)
+- init (Rust): baseline / intel-iommu / amd-iommu — ENUM (флаги
+  0x3037: bit4 irq_remap, bit5 large_pages), ATTACH(00:1f.2), MAP,
+  remap→-17, UNMAP, MAP huge 512p (один SS-PDE/v1-лист), UNMAP huge,
+  IRQ_MAP→handle=1, IRQ_UNMAP, DETACH, SMP-стресс OK, boot chain OK.
+- capp (C, boot_cfg_c.xml): baseline / amd-iommu — argv-протокол,
+  MEM_ALLOC+паттерн 0xCAFEBABEDEADBEEF, полный IOMMU-проход на C,
+  TASK_EXIT(0), boot chain OK.
+- Host-тесты: 140 passed (v0.7: 139; +1 irq_map_unmap_cycle).
+
 ## v0.7 — IOMMU: AMD-Vi (IVRS) + агрегатор Intel|AMD
 
 ### Сделано

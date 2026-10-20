@@ -350,3 +350,17 @@ pub const IOMMU_UNMAP: SyscallNumber = SyscallNumber(0x83);
 /// Отвязать устройство (контекст гасится, таблицы домена — в пул).
 /// ABI: arg1 = контроллер, arg2 = DeviceId.
 pub const IOMMU_DETACH: SyscallNumber = SyscallNumber(0x84);
+
+/// Запрограммировать IRTE (IRQ-ремаппинг, v0.8): remapped-запись
+/// прерывания устройства (vector/dest) в таблице контроллера.
+/// ABI: arg1 = контроллер, arg2 = DeviceId, arg3 = vector (0x10..0xFE),
+/// arg4 = APIC-destination (u8; физический APIC ID), arg5 = флаги
+/// (bit0 = level-triggered, bit1 = logical destination mode).
+/// Возврат: handle (индекс IRTE) — драйвер устройства кладёт его в
+/// MSI-адрес (Intel: SHV=0 handle=индекс; AMD: индекс в per-device
+/// таблице). 0 — «нет handle» и не выдаётся.
+pub const IOMMU_IRQ_MAP: SyscallNumber = SyscallNumber(0x85);
+
+/// Погасить IRTE по handle (прерывание снова не ремапится).
+/// ABI: arg1 = контроллер, arg2 = DeviceId, arg3 = handle из IRQ_MAP.
+pub const IOMMU_IRQ_UNMAP: SyscallNumber = SyscallNumber(0x86);

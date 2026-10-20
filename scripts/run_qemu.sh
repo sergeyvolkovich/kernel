@@ -9,8 +9,11 @@
 #   RAM=512            — память, МиБ
 #   QEMU_SMP=2         — число vCPU
 #   QEMU_TIMEOUT=120    — таймаут прогона, с
-#   QEMU_IOMMU=0|1|amd  — IOMMU: 0 — нет; 1 — Intel VT-d (q35,
-#                        intremap=off); amd — AMD-Vi (q35, amd-iommu).
+#   QEMU_IOMMU=0|1|amd  — IOMMU: 0 — нет; 1 — Intel VT-d (q35);
+#                        amd — AMD-Vi (q35).
+#   QEMU_INTREMAP=0|1   — IRQ-ремаппинг в эмуляторе (v0.8, по умолчанию
+#                        1: драйверы поднимают IRTA/IRTE; 0 — старое
+#                        поведение для диагностики).
 set -euo pipefail
 
 # Корень workspace — от расположения скрипта (портируемость свежих клонов).
@@ -30,17 +33,26 @@ RAM=${RAM:-512}
 TIMEOUT=${QEMU_TIMEOUT:-120}
 # SMP: число CPU (v0.6: MADT/SIPI/IPI/BKL/shootdown).
 SMP=${QEMU_SMP:-2}
-# IOMMU: intel-iommu/amd-iommu на q35 (v0.6+: DMA-ремаппинг; IRQ-ремаппинг
-# выключен — не реализован в драйверах; без устройств это безопасно).
+# IOMMU: intel-iommu/amd-iommu на q35 (v0.8: DMA-ремаппинг;
+# IRQ-ремаппинг эмулятора включён — ядра поднимают IRTA/IRTE).
 IOMMU=${QEMU_IOMMU:-0}
+INTREMAP=${QEMU_INTREMAP:-1}
 
 EXTRA_ARGS=()
 case "$IOMMU" in
   0|"") ;;
   1|intel)
-    EXTRA_ARGS+=(-machine q35 -device intel-iommu,intremap=off) ;;
+    if [ "$INTREMAP" = 1 ]; then
+      EXTRA_ARGS+=(-machine q35 -device intel-iommu,intremap=on)
+    else
+      EXTRA_ARGS+=(-machine q35 -device intel-iommu,intremap=off)
+    fi ;;
   amd)
-    EXTRA_ARGS+=(-machine q35 -device amd-iommu) ;;
+    if [ "$INTREMAP" = 1 ]; then
+      EXTRA_ARGS+=(-machine q35 -device amd-iommu,intremap=on)
+    else
+      EXTRA_ARGS+=(-machine q35 -device amd-iommu,intremap=off)
+    fi ;;
   *)
     echo "QEMU_IOMMU: ожидалось 0 | 1(intel) | amd, получено: $IOMMU" >&2
     exit 2 ;;

@@ -1,0 +1,437 @@
+# rust-l4: приложения и серверы пользователя (v0.8)
+
+Руководство по написанию пользовательских программ для rust-l4: стартовый
+протокол L4, полный syscall-интерфейс, библиотека interop `userlib`
+(C-ABI: `_start` + `l4_*`), сборка и загрузка через `boot_cfg.xml`.
+Референсы: `crates/init` (Rust-сервер) и `examples/capp.c` (C-сервер).
+
+Оглавление:
+
+1. [Модель пользователя и загрузочная цепочка](#1-модель-пользователя-и-загрузочная-цепочка)
+2. [Стартовый протокол (L4)](#2-стартовый-протокол-l4)
+3. [Syscall-интерфейс (полная таблица)](#3-syscall-интерфейс-полная-таблица)
+4. [userlib: C-интероп (l4_* / _start)](#4-userlib-c-интероп-l4-__start)
+5. [Сервер на C: пример capp](#5-сервер-на-c-пример-capp)
+6. [Сервер на Rust: пример init](#6-сервер-на-rust-пример-init)
+7. [Сборка и загрузка (build.sh / boot_cfg.xml)](#7-сборка-и-загрузка-buildsh--boot_cfgxml)
+8. [IOMMU-группа: DMA- и IRQ-ремаппинг](#8-iommu-группа-dma--irq-ремаппинг)
+9. [Права, ограничения и следующие шаги](#9-права-ограничения-и-следующие-шаги)
+
+---
+
+## 1. Модель пользователя и загрузочная цепочка
+
+rust-l4 — микроядро L4-архитектуры: всё вне ядра — задачи пользователя
+(protection domains): cspace (capability-пространство), адресное
+пространство, потоки. Ядро не предоставляет libc, файлов и драйверов —
+это серверы пользователя, общающиеся IPC.
+
+Загрузочная цепочка (UEFI):
+
+```
+OVMF -> uefi_stub (BOOTX64.EFI, ядро встроено)
+     -> boot_cfg.xml (список серверов + boot_state + cmdline ядра)
+     -> модули серверов читаются с ESP в память (boot_info v2)
+     -> ExitBootServices -> kernel (head.S -> kmain -> startup::kinit)
+     -> elfload: модуль [0] парсится, ELF-сегменты копируются в
+        адресное пространство задачи, ставится стек и argv-блок
+     -> создаётся поток @ ELF entry, паркуется стартовое IPC
+     -> диспетчер: сервер [0] (= init) исполняется
+```
+
+Первый сервер из `<servers>` boot_cfg.xml — **init-сервер** по
+договорённости протокола (модуль [0]): его запускает ядро. Остальные
+серверы загружаются в память модулями — их порождает уже init (или
+менеджер, который init запустит): v0.8 не содержит exec-сискола,
+полная цепочка spawn-серверов — v0.9+ (см. раздел 9).
+
+Ключевые свойства среды (v0.8):
+
+- **Статические ELF по фиксированным адресам** (юзерский линк-базис
+  `0x40000000`, линк-скрипт `crates/init/init.ld`, entry `_start`).
+  BSS обнуляет ядро; никакой релокации/PIE.
+- **Без libc/рантайма**: сисколы — единственный API. Для Rust это
+  `#![no_std] + #[no_main]`, для C — `gcc -ffreestanding -nostdlib`.
+- **SSE разрешён** в ring3 (ядро не трогает FPU после загрузки);
+  float в пользовательском коде допустим, но между ПОТОКАМИ FPU-контекст
+  не сохраняется (v0.8) — не используйте FP в потоках.
+- Стек: `USER_STACK_TOP` (ABI платформы), страниц `USER_STACK_PAGES`
+  (см. `backend/boot.rs`); argv-блок — на 1 МиБ ниже вершины стека.
+
+## 2. Стартовый протокол (L4)
+
+Ядро (startup/elfload.rs) перед стартом потока паркует в его очередь
+**стартовое IPC** от `IPC_KERNEL_FROM` с словами:
+
+```
+word0 = argc        — число строк argv
+word1 = argv_ptr    — виртуальный адрес argv-блока в вашем пространстве
+word2 = argv_bytes  — длина блока, байт
+```
+
+Приём — обычный `IPC_RECV_ANY` (open receive): сообщение уже в очереди,
+вызов не блокируется. Слова 1..N — `IPC_MSG_WORD(1..=)`.
+
+argv-блок по `argv_ptr` (конвенция совместима с C `char **`):
+
+```
+[u64 argc] [u64 ptr[argc]] ... [u64 NULL] [u64 pad] [asciiz-строки]
+            ^-- argv = (char **)(argv_ptr + 8);  argv[argc] == NULL
+```
+
+Строки (в порядке): имя модуля (`name` из boot_cfg.xml — это argv[0]),
+затем `<arg>` сервера из XML, затем boot_state-переменные в виде
+`имя=значение`. Ядро их НЕ интерпретирует — конфигурация транзитом из
+XML в приложение (политика загрузки — у init).
+
+`_start` из userlib делает всё это за вас (раздел 4); на «голом» Rust
+(как init) — принимаете сообщение и читаете блок сами.
+
+Возврат/выход: `TASK_EXIT(код)` — домен умирает (каскад гасит потоки,
+локи и IRQ-привязки; exit-endpoint'у уходит ExitPayload). Ядро печатает
+`[kernel] all user threads gone — halting (boot chain OK)` и холдит
+машину (демо-режим; таймаут QEMU снимает процесс).
+
+## 3. Syscall-интерфейс (полная таблица)
+
+ABI (x86_64): `rax` = номер; аргументы `rdi, rsi, rdx, r10, r8, r9`;
+возврат `rax`. 0/положительное — успех; отрицательное — errno-подобный
+код: `-ENOSYS(38)` (нет хендлера/сервиса), `-ENOMEM(12)`,
+`-EEXIST(17)`, `-EINVAL(22)`, `-ENODEV(19)`, `-EOPNOTSUPP(95)` и др.
+(см. `syscall/types.rs`). Номера — плотная таблица (слоты, прямая
+индексация); регистрируются ядром по умолчанию (`install_default_table`).
+
+### 0x00 — система
+
+| № | Сискол | ABI (arg1..arg5) | Возврат |
+|---|--------|------------------|---------|
+| 0x03 | SELF_INFO | индекс слова | см. ниже |
+| 0x04 | SYS_TIME | — | нс (TimeSource платформы) |
+
+SELF_INFO-слова: `0` task_id.lo, `1` task_id.hi, `2` thread_id.lo,
+`3` thread_id.hi, `4` cpu (текущий CPU потока), `5` cpu_count.
+
+### 0x10 — задачи и потоки
+
+| № | Сискол | ABI | Прим. |
+|---|--------|-----|-------|
+| 0x01 | TASK_SPAWN | TaskId(lo,hi), prio | легаси, БЕЗ capability-проверки |
+| 0x10 | TASK_CREATE | хендл TaskTCB(себя), TaskId(lo,hi), prio | право творца |
+| 0x11 | TASK_SET_EXIT_EP | хендл Gate | доставка ExitPayload |
+| 0x12 | TASK_EXIT | код | не возвращается |
+| 0x13 | TASK_KILL | хендл TaskTCB цели | |
+| 0x14 | TASK_EXIT_EXCEPTION | fault_addr, ip, kind, ... | паника рантайма |
+| 0x15 | THREAD_CREATE | хендл TaskTCB, entry, stack_top, ThreadId(lo) | entry с нулевыми регистрами |
+| 0x16 | THREAD_DESTROY | ThreadId(lo,hi) | TCB завершённого |
+| 0x17 | THREAD_TERMINATE | ThreadId(lo,hi) | принудительно в Dead |
+| 0x18 | THREAD_SET_PRIO | id(lo,hi), prio | |
+| 0x19 | THREAD_SUSPEND | id(lo,hi) | себя — тоже |
+| 0x1A | THREAD_RESUME | id(lo,hi) | |
+| 0x1B | THREAD_YIELD | — | L4 yield |
+| 0x1C | THREAD_EX_REGS | id(lo,hi), entry(-1=keep), stack(-1=keep), what | L4 ex_regs |
+
+### 0x20 — capability
+
+| № | Сискол | ABI | Прим. |
+|---|--------|-----|-------|
+| 0x21 | CAP_MINT | src, TaskId(lo,hi), perms, badge | производная |
+| 0x22 | CAP_SEND | src, TaskId(lo,hi) | передача |
+| 0x23 | CAP_REVOKE | src | поддерево; возврат = погашено |
+| 0x24 | CAP_DELETE | src | один хендл |
+| 0x25 | CAP_LIST | индекс слова | 0 = число слотов; далее 2 слова/слот: handle, kind (1 DeviceRef, 2 TaskTCB, 3 Gate, 4 Irq) |
+| 0x26 | CAP_INFO | хендл, индекс слова | 0 kind, 1 perms, 2 badge, 3 alive, 4..5 идентификация |
+
+### 0x30 — IPC
+
+| № | Сискол | ABI | Прим. |
+|---|--------|-----|-------|
+| 0x31 | EP_CREATE | ёмкость (0 = строгий rendezvous) | хендл |
+| 0x32 | IPC_SEND | ep, w0..w2, flags(bit0 try) | блокирующая |
+| 0x33 | IPC_RECV | ep, flags(bit0 try) | слово 0 сообщения |
+| 0x34 | IPC_CALL | ep, reply_ep, w0..w1, flags | L4 ipc_call |
+| 0x35 | IPC_SEND_THREAD | ThreadId(lo,hi), w0..w1, слов | fast-path |
+| 0x36 | IPC_RECV_ANY | flags | open receive |
+| 0x37 | IPC_MSG_WORD | индекс | сквозная индексация |
+| 0x38 | IPC_MSG_LEN | — | (status<<32)\|слов |
+| 0x39 | IPC_MSG_CLEAR | — | |
+| 0x3A | NOTIFY_SIGNAL | ep, слово | doorbell (нужна ёмкость) |
+
+### 0x40 — устройства и IRQ
+
+| № | Сискол | ABI | Прим. |
+|---|--------|-----|-------|
+| 0x02 | DEVICE_INFO | хендл, индекс слова | DeviceRecord |
+| 0x41 | DEVICE_CLAIM | хендл, flags(bit0 try), notify_ep | эксклюзивно |
+| 0x42 | DEVICE_RELEASE | хендл | |
+| 0x43 | DEVICE_CLAIM_STATUS | хендл, индекс | 0 занят, 1..2 owner, 3 waiters, 4 gone |
+| 0x44 | DEVICE_ENUM | индекс слова | 0 = число; далее 4 слова/устройство: kind, path_w0, path_w1, flags(bit0 msi) |
+| 0x45 | DEVICE_MAP_REGION | хендл, индекс ресурса | MMIO BAR → vaddr (zero-copy) |
+| 0x46 | IRQ_ATTACH | хендл, gsi, Gate | прерывание = signal в ep (word = gsi) |
+| 0x47 | IRQ_DETACH | gsi | |
+| 0x48 | IRQ_ACK | gsi | EOI-семантика L4 |
+
+### 0x50 — память
+
+| № | Сискол | ABI | Прим. |
+|---|--------|-----|-------|
+| 0x51 | MEM_ALLOC | страниц, MMAPMemoryFlags | vaddr (READ\|WRITE = 0b011) |
+| 0x52 | MEM_FREE | vaddr | кадры — пулу |
+| 0x53 | MEM_TRANSFER | src_vaddr, страниц, flags(bit0 grant), TaskId(lo,hi) | flexpage-перенос |
+| 0x54 | MEM_INFO | vaddr, индекс | 0 vbase, 1 pbase, 2 страниц |
+
+### 0x60 — SHM / io_uring
+
+| № | Сискол | ABI | Прим. |
+|---|--------|-----|-------|
+| 0x61 | SHM_CREATE | страниц | ShmId |
+| 0x62 | SHM_SETUP_RING | ShmId, sq, cq, слов/слот | sq_off |
+| 0x63 | SHM_BIND_DOORBELL | ShmId, Gate | |
+| 0x64 | SHM_MAP | ShmId, флаги прав | vaddr (zero-copy) |
+| 0x65 | SHM_DESTROY | ShmId | |
+| 0x66 | RING_DOORBELL | ShmId, слово | после submit |
+| 0x67 | SHM_INFO | ShmId, индекс | геометрия/owner |
+
+### 0x70 — отладка
+
+| № | Сискол | ABI | Прим. |
+|---|--------|-----|-------|
+| 0x71 | DEBUG_WRITE | 5 слов (LE, ≤40 байт) | консоль ядра |
+| 0x72 | DEBUG_DUMP_TASKS | индекс слова | |
+| 0x73 | DEBUG_TRACE | 0/1 | трассировка сисколов |
+| 0x74 | DEBUG_DUMP_THREADS | TaskId(lo,hi), индекс | |
+
+### 0x80 — IOMMU / DMA-ремаппинг
+
+| № | Сискол | ABI | Прим. |
+|---|--------|-----|-------|
+| 0x80 | IOMMU_ENUM | 0xFFFFFFFF → число контроллеров; иначе ctrl, word(0 флаги, 1 версия) | флаги: bit0 agaw48, bit1 queued_inval, bit2 pass_through, bit3 include_all, bit4 irq_remap, bit5 large_pages, mgaw<<8 |
+| 0x81 | IOMMU_ATTACH | ctrl, bus, dev, fn | → DeviceId (идемпотентно) |
+| 0x82 | IOMMU_MAP | ctrl, DeviceId, iova, phys, pages\|(prot<<32) | prot bit0 READ, bit1 WRITE; 2 МиБ-выровненные диапазоны кратных 512 стр → huge-лист |
+| 0x83 | IOMMU_UNMAP | ctrl, DeviceId, iova, pages | ТОЧНОЕ совпадение с MAP (v0.8) |
+| 0x84 | IOMMU_DETACH | ctrl, DeviceId | таблицы домена — в пул |
+| 0x85 | IOMMU_IRQ_MAP | ctrl, DeviceId, vector(0x10..0xFE), dest(APIC ID), flags(bit0 level, bit1 logical) | → handle: индекс IRTE; его несёт MSI-адрес устройства |
+| 0x86 | IOMMU_IRQ_UNMAP | ctrl, DeviceId, handle | |
+
+## 4. userlib: C-интероп (`l4_*` / `_start`)
+
+`crates/userlib` — статическая C-библиотека (staticlib, сборка под
+`x86_64-unknown-none`): экспортирует точку входа `_start` и обёртки
+всей syscall-таблицы с префиксом `l4_`. Заголовок: `crates/userlib/
+include/l4.h`. Линкуется в прикладной образ без libc.
+
+Состав:
+
+- **`_start`** (в библиотеке): принимает стартовый IPC, разбирает
+  argv-блок, вызывает прикладной `main(argc, argv)` (символ — ваша
+  программа), возврат — `TASK_EXIT(код & 0xFF)`.
+- **Обёртки**: по одной на сискол, имена `l4_<группа>_<операция>`
+  (полный список — l4.h; совпадает с таблицей раздела 3).
+- **Хелперы консоли**: `l4_debug_write_bytes`, `l4_puts` (ASCIIZ +
+  CRLF порциями ≤ 40 байт), `l4_puthex(prefix, word)` —
+  `prefix + 0x%016x + CRLF`.
+- **Страховки**: `__stack_chk_fail` (умирает с кодом 13);
+  memcpy/memset/memmove/memcmp — из compiler-builtins (бандлится
+  rustc в staticlib: gcc-код с -ffreestanding линкуется чисто).
+
+Сборка C-приложения (как в scripts/build.sh):
+
+```bash
+gcc -O2 -Wall -Wextra -ffreestanding -fno-stack-protector -fno-pie \
+    -I crates/userlib/include -c app.c -o app.o
+gcc -nostdlib -static -no-pie -Wl,-T,crates/init/init.ld \
+    -Wl,--build-id=none -o app app.o \
+    target/x86_64-unknown-none/release/libuserlib.a
+```
+
+Требования к образу (ядро грузит только такие ELF):
+
+- статический `ET_EXEC`, LOAD-сегменты в диапазоне линк-базиса
+  `0x40000000` (init.ld: .text RX / .rodata R / .data+.bss RW,
+  `ENTRY(_start)`);
+- без PIE/динамической секции; `-znoseparate-code` (init.ld уже
+  задаёт) — компактные смежные сегменты (меньше pow2-кадров на
+  сегмент в elfload::user_frames);
+- никаких внезаголовочных данных после PT_LOAD (argv-хвост дописывает
+  ЗАГЛУШКА при сборке ESP, не приложение).
+
+Ограничения: без libc — пишите на «сыром» C (нет printf/malloc);
+FPU между потоками не переключается; сегменты грузятся кадрами из
+ПОЛЬЗОВАТЕЛЬСКОГО пула — образ megabytes-класса съест пул (QEMU:
+512 МиБ, порядок LLfree ограничен 2048 страниц на сегмент).
+
+## 5. Сервер на C: пример capp
+
+`examples/capp.c` — полный референс (собирается scripts/build.sh,
+грузится `scripts/boot_cfg_c.xml`). Скелет:
+
+```c
+#include "l4.h"
+
+int main(int argc, char **argv)
+{
+    l4_puts("hello from C");
+    l4_puthex("cpu_count = ", (uint64_t)l4_self_info(5));
+
+    /* страничка под рабочие данные */
+    int64_t page = l4_mem_alloc(1, 0x3 /* READ|WRITE */);
+    if (page > 0) { /* работаем */ }
+
+    /* серверная петля: ждём IPC от клиентов */
+    for (;;) {
+        int64_t tag = l4_ipc_recv_any(0);
+        if (tag < 0) continue;
+        uint64_t w0 = (uint64_t)l4_ipc_msg_word(0);
+        /* обработать w0..; ответ — l4_ipc_send_thread(...) */
+    }
+}
+```
+
+Идиомы сервера:
+
+- **Конфигурация** — через argv (раздел 2): `<arg>` из boot_cfg.xml и
+  boot_state `имя=значение`.
+- **Ожидание клиентов** — `l4_ipc_recv_any` (open receive) или своя
+  endpoint-дисциплина (`l4_ep_create` + `l4_ipc_recv`).
+- **Уведомления/IRQ** — `l4_notify_signal` / `l4_irq_attach`+Gate:
+  прерывание = signal-сообщение со словом gsi.
+- **Несколько потоков** — `l4_thread_create` по хендлу TaskTCB(себя)
+  (грант kinit; найти: `l4_cap_list`, kind = 2), стек — `l4_mem_alloc`.
+- **Выход** — `return` из main (или `l4_task_exit`).
+
+## 6. Сервер на Rust: пример init
+
+`crates/init` — эталон без userlib (сырые сисколы, `#[no_main]`,
+свой `_start`). Скелет:
+
+```rust
+#![no_std]
+#![no_main]
+
+#[unsafe(no_mangle)]
+pub extern "C" fn _start() -> ! { main_loop() }
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! { unsafe { sys_exit(13) } }
+
+// syscall6: asm!("syscall", rax = nr, rdi/rsi/rdx/r10/r8/r9, ...)
+```
+
+init демонстрирует: приём стартового IPC и argv-блока, SELF_INFO-топологию,
+IOMMU-проход (раздел 8), SMP-стресс (THREAD_CREATE воркеров + yield +
+гистограмма CPU), честный TASK_EXIT(0). Для новых серверов предпочтителен
+userlib: он снимает бойлерплейт протокола и одинаков для C и Rust.
+
+## 7. Сборка и загрузка (build.sh / boot_cfg.xml)
+
+Сборка всей цепочки (ядро+init+userlib+capp+ESP-образ):
+
+```bash
+bash scripts/build.sh                  # ESP с boot_cfg.xml (init)
+BOOT_CFG=scripts/boot_cfg_c.xml bash scripts/build.sh   # capp первым
+```
+
+Формат `boot_cfg.xml` (первый сервер = сервер [0], его стартует ядро;
+пути — от корня ESP-раздела):
+
+```xml
+<boot cmdline="arch=x86_64 console=com1 meltdown=allow">
+  <servers>
+    <server name="init" path="init">
+      <arg>--demo</arg>
+    </server>
+    <server name="fs" path="servers/fs.elf"/>   <!-- грузится модулем -->
+  </servers>
+  <boot_state>
+    <var name="console" value="com1"/>
+  </boot_state>
+</boot>
+```
+
+- `cmdline` — командная строка ЯДРА (BootInfo.cmdline): `meltdown=allow`
+  обязателен под QEMU/TCG (эмулятор не сообщает RDCL_NO); на реальном
+  железе без KPTI ядро обязано отказывать в загрузке — флаг не ставьте.
+- `boot_state` — транзит в init через argv (`имя=значение`).
+- Сборка нового сервера в чейн: положите ELF в `target/esp/`,
+  добавьте `mcopy`-строку в build.sh (или расширите список копирования
+  из каталога) и запись `<server>` в XML.
+
+Запуск (OVMF+UEFI, serial->stdout, таймаут — машина холдится после
+демо, EXIT=124 = норма):
+
+```bash
+QEMU_IOMMU=amd  bash scripts/run_qemu.sh   # AMD-Vi (IVRS), intremap=on
+QEMU_IOMMU=1    bash scripts/run_qemu.sh   # Intel VT-d (DMAR), intremap=on
+QEMU_IOMMU=0    bash scripts/run_qemu.sh   # без IOMMU
+```
+
+## 8. IOMMU-группа: DMA- и IRQ-ремаппинг
+
+Ядро v0.8 поднимает IOMMU-подсистему само (DMAR/IVRS из ACPI, все
+единицы, до release_aps). Пользовательский порядок работы с устройством
+(BDF = сегмент:шина:устройство:функция; демо используют встроенный
+ICH9 AHCI `00:1f.2` — есть в IVHD и под INCLUDE_PCI_ALL Intel):
+
+```c
+int64_t n   = l4_iommu_enum(0xFFFFFFFFULL, 0);   // контроллеры есть?
+uint64_t fl = l4_iommu_enum(0, 0);                // bit4 irq_remap,
+                                                  // bit5 large_pages
+int64_t dev = l4_iommu_attach(0, 0, 0x1f, 2);     // → DeviceId
+
+/* DMA: карта IOVA→физика (буферы устройства) */
+l4_iommu_map(0, dev, iova, phys, pages | (3ULL << 32));   // RW
+l4_iommu_unmap(0, dev, iova, pages);
+
+/* крупными кусками: 2 МиБ-выровненно, кратно 512 страниц —
+ * ядро положит ОДИН huge-лист (быстрее, таблицы в 512 раз меньше) */
+
+/* IRQ: remapped-MSI устройства (v0.8) */
+int64_t h = l4_iommu_irq_map(0, dev, 0x41 /*vector*/, 0 /*APIC 0*/, 0);
+/* h = handle: запишите его в MSI-адрес устройства (MSI capability:
+ * Address[15:0] = handle, SHV=0 — Intel; AMD — индекс per-device
+ * таблицы). Данные MSI (vector) идут обычным полем Data. */
+l4_iommu_irq_unmap(0, dev, h);
+
+l4_iommu_detach(0, dev);
+```
+
+Правила v0.8:
+
+- UNMAP — ТОЧНОЕ совпадение (iova, pages) с предыдущим MAP; частичное
+  снятие — `-EINVAL` (расщепление huge — v0.9).
+- IRQ_MAP без включённого IR на контроллере — `-EOPNOTSUPP`; вектор
+  0x10..0xFE; handle > 0 (0 — «нет»).
+- MSI-ремаппинг ПОЛНЫЙ цикл включает драйвер устройства: ядро даёт
+  handle, а кладёт его в MSI-адрес и поднимает MSI уже драйвер.
+  Включение IR (IRTA/SIRTP/IEC/IRE у Intel; IntCtl=10b/IRTE у AMD)
+  ядро валидирует на этапе init — если контроллер IR не поддержал,
+  `irq_remap`-бит ENUM не поднимется и IRQ_MAP откажет.
+- Мульти-IOMMU: индекс контроллера — сквозной (сперва все Intel в
+  порядке DMAR, затем все AMD в порядке IVRS); BDF должен попадать в
+  coverage контроллера (scope DRHD / device-записи IVHD), иначе
+  ATTACH — `-ENODEV`.
+
+## 9. Права, ограничения и следующие шаги
+
+Capability-модель: право на операцию над чужой задачей — хендл в
+вашем cspace. kinit выдаёт init `TaskTCB(себя)` (право творца):
+THREAD_CREATE/TASK_CREATE работают по нему; чужие задачи — после
+CAP_SEND/CAP_MINT. Устройства — по DeviceReference (выдаёт devmon;
+v0.8 реестр устройств — черновая поверхность DEVICE_ENUM). IOMMU-группа
+v0.8 не гейтируется claim'ом устройства (политика — v0.9, см.
+syscall/iommu.rs).
+
+Ограничения v0.8 (честный список):
+
+- exec/порождение серверов из модулей — нет (init [0] — единственный
+  стартуемый; задача-менеджер spawn-сервера — v0.9);
+- один ELF на адресный базис 0x40000000 (ASLR/общий базис — v0.9);
+- FPU-контекст между потоками не сохраняется;
+- IOMMU: таблицы в физике < 4 GiB (physmap; QEMU-масштаб);
+  доставка remapped-MSI требует драйвера устройства;
+- IRQ-ремаппинг IOAPIC-линий (rte 0x10..0x25 у Intel) — резерв слотов
+  подготовлен, программирование — с IOAPIC-драйвером (v0.9).
+
+Следующие шаги (roadmap v0.9+): spawn-сервер и exec-протокол;
+IOAPIC-драйвер с remapped-линиями; частичный unmap с расщеплением
+huge; device-iotlb (AWT/ATC); PASID (крейты iommu-rs уже несут
+строители); исключения-фолты как IPC (pager-протокол).

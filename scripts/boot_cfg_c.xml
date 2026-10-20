@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ==== boot_cfg_c.xml: конфигурация C-сервера (v0.8) ====
+     Демонстрация userlib: первый сервер — capp (чистый C через
+     libuserlib.a); init (Rust) загружен вторым модулем — грузится
+     заглушкой, но не стартует (первый = сервер [0] протокола). -->
+<boot cmdline="arch=x86_64 console=com1 meltdown=allow">
+  <servers>
+    <!-- capp: C-референс через userlib (сборка: scripts/build.sh). -->
+    <server name="capp" path="capp">
+      <arg>--demo</arg>
+    </server>
+    <!-- init (Rust): грузится модулем [1] (не стартует в этой конфигурации). -->
+    <server name="init" path="init">
+      <arg>stage0</arg>
+    </server>
+  </servers>
+  <boot_state>
+    <var name="console" value="com1"/>
+    <var name="boot_mode" value="normal"/>
+  </boot_state>
+</boot>

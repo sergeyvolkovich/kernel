@@ -1,0 +1,14 @@
+[package]
+name = "userlib"
+version.workspace = true
+edition.workspace = true
+description = "C-ABI интероп-библиотека пользователя: _start + l4_* обёртки сисколов (линкуется в C/Rust-приложения)"
+
+# Статическая библиотека для ЛЮБОГО userspace-линка: C (gcc/clang
+# -nostdlib) и Rust (extern "C"). Собирается под x86_64-unknown-none
+# (freestanding, code-model kernel — единый LTO-мир с core, как init;
+# адрес 0x40000000 < 2^31 — все формы адресации работают).
+
+[lib]
+crate-type = ["staticlib"]
+name = "userlib"

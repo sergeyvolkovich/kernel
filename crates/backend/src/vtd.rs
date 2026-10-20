@@ -29,8 +29,8 @@
 //
 // AMD-Vi (IVRS) — драйвер-собрат `backend/amd.rs`; выбор вендора и
 // установка сервиса сисколов — агрегатор `crate::iommu`. IRQ-ремаппинг
-// (IRTE/IRTA) — следующая итерация: включаем ТОЛЬКО DMA-часть (TE),
-// IRE не трогаем.
+// (IRTE/IRTA) — v0.8: IRTA+SIRTP+IEC-флеш+IRE (Intel); мульти-IOMMU —
+// ВСЕ DRHD-единицы поднимаются и индексируются (IommuService.ctrl).
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -39,8 +39,9 @@ use spin::Mutex;
 
 use intel_iommu::context::{AddrWidth, ContextEntry, RootEntry, TransType};
 use intel_iommu::dmar::{DmarTable, Drhd};
-use intel_iommu::qi::{Granularity, QiCc, QiDesc, QiIotlb, QiWait};
-use intel_iommu::regs::{self, Cap, Ecap, Gcmd, Gsts, Version};
+use intel_iommu::irte::{DeliveryMode, Irte, SourceQualifier, SourceValidationType};
+use intel_iommu::qi::{Granularity, QiCc, QiDesc, QiIec, QiIotlb, QiWait};
+use intel_iommu::regs::{self, Cap, Ecap, Gcmd, Gsts, Irta, Version};
 
 use pkg_generic_interface::hal::traits::iommu::{
     ANIOMMUInterface, DeviceId, IommuError, LIOMMUInterface,
@@ -58,6 +59,13 @@ const SSPTE_RW: u64 = 0b011;
 const SSPTE_R: u64 = 0b001;
 const SSPTE_X: u64 = 0b100;
 
+/// Бит large-page листа уровня 2 (SS-PDE → 2 МиБ, v0.8).
+const SSPDE_HUGE: u64 = 0b1000_0000;
+/// Размер huge-листа SS-PDE (уровень 2).
+const SS_HUGEP: u64 = 512 * 4096;
+/// Записей IRTE в IRTA (v0.8): S=7 → 2^(7+1) = 256 × 16 байт = 4 КиБ.
+const IRTE_COUNT: usize = 256;
+
 fn sspte_prot(prot: IommuProt) -> u64 {
     let mut e = 0u64;
     if prot.contains(IommuProt::READ) {
@@ -73,21 +81,29 @@ fn sspte_prot(prot: IommuProt) -> u64 {
 }
 const SSPTE_W_BIT: u64 = 0b010;
 
-/// Уровни AGAW48: биты IOVA 47:39 / 38:30 / 29:21 / 20:12.
+/// Слот листовой PTE (уровень 1) для IOVA; create — выделять каталоги.
 fn sspt_slot(root: u64, iova: u64, create: bool) -> Option<*mut u64> {
+    sspt_slot_level(root, iova, 1, create)
+}
+
+/// Слот записи на заданном уровне (2 = SS-PDE для huge-листа, 1 = PTE);
+/// create — выделять промежуточные каталоги. v0.8: уровень фиксируем
+/// явно — huge-лист 2 МиБ пишется в PDE уровня 2, минуя уровень 1.
+/// Уровни AGAW48: биты IOVA 47:39 / 38:30 / 29:21 / 20:12.
+fn sspt_slot_level(root: u64, iova: u64, level: u32, create: bool) -> Option<*mut u64> {
     let mut table = root;
     // SAFETY-контракт цикла: `table` — физика выровненной страницы из
     // zero_page (владение — домен), physmap покрывает.
-    for level in (1..=4u32).rev() {
-        let shift = 12 + 9 * (level - 1);
+    for lvl in (level..=4u32).rev() {
+        let shift = 12 + 9 * (lvl - 1);
         let idx = ((iova >> shift) & 0x1FF) as usize;
         // SAFETY: см. контракт цикла.
         let entry = unsafe { phys_ptr::<u64>(table).add(idx) };
-        // SAFETY: как выше.
-        let val = unsafe { entry.read_volatile() };
-        if level == 1 {
+        if lvl == level {
             return Some(entry);
         }
+        // SAFETY: как выше.
+        let val = unsafe { entry.read_volatile() };
         if val & 0xFFF == 0 {
             if !create {
                 return None;
@@ -100,7 +116,7 @@ fn sspt_slot(root: u64, iova: u64, create: bool) -> Option<*mut u64> {
             table = val & !0xFFF;
         }
     }
-    unreachable!("4 уровня исчерпаны")
+    unreachable!("уровни исчерпаны")
 }
 
 /// Освободить все таблицы домена (проход по промежуточным уровням).
@@ -111,6 +127,11 @@ fn sspt_free(root: u64) {
             // SAFETY: таблица наша (домен), physmap покрывает.
             let val = unsafe { phys_ptr::<u64>(table).add(i).read_volatile() };
             if val & 0xFFF == 0 {
+                continue;
+            }
+            // v0.8: huge-лист уровня 2 (бит PS) — НЕ таблица: физика за
+            // ним принадлежит отображению и в пул не возвращается.
+            if level == 2 && val & SSPDE_HUGE != 0 {
                 continue;
             }
             let child = val & !0xFFF;
@@ -129,8 +150,10 @@ fn sspt_free(root: u64) {
 /// Домен изоляции: second-stage корень + карта IOVA-отображений.
 struct Domain {
     sspt_root: u64,
-    /// iova -> (phys, pages, prot).
-    mappings: BTreeMap<u64, (u64, usize, IommuProt)>,
+    /// iova -> (phys, pages, prot, huge). v0.8: раскладка таблиц
+    /// детерминированно повторяет проход map — unmap/set_protection
+    /// идентичны (huge-флаг информативен, обход — по той же геометрии).
+    mappings: BTreeMap<u64, (u64, usize, IommuProt, bool)>,
 }
 
 /// Привязка DeviceId -> (BDF, домен).
@@ -141,7 +164,8 @@ struct DevBind {
 
 // ───────────────────── Драйвер ─────────────────────
 
-/// Состояние драйвера VT-d (один DRHD; мульти-DRHD — v0.7).
+/// Состояние драйвера VT-d — ОДИН контроллер (одна DRHD-единица);
+/// мульти-IOMMU — несколько Vtd в [`VtdDriver`] (v0.8).
 pub struct Vtd {
     mmio: Mmio,
     ver: Version,
@@ -163,6 +187,16 @@ pub struct Vtd {
     devices: BTreeMap<u32, DevBind>,
     next_did: u16,
     next_dev: u32,
+    // v0.8: IRQ-ремаппинг (глобальная IRTA этого контроллера).
+    irta_phys: u64,
+    /// IRE включён (ECAP.IR был и последовательность прошла).
+    ir_enabled: bool,
+    /// Занятость IRTE-слотов (IRTE_COUNT; резервы — 0 и 0x10..=0x25).
+    ir_used: Vec<bool>,
+    /// Устройство -> выделенные ему IRTE-индексы (погашение по handle).
+    dev_irqs: BTreeMap<u32, Vec<u16>>,
+    /// v0.8: 2 МиБ huge-листья поддерживаются (CAP.SSLPS bit0) и работают.
+    huge_ok: bool,
 }
 
 const QI_ENTRIES: usize = 256;
@@ -319,6 +353,11 @@ impl Vtd {
             devices: BTreeMap::new(),
             next_did: 1,
             next_dev: 1,
+            irta_phys: 0,
+            ir_enabled: false,
+            ir_used: Vec::new(),
+            dev_irqs: BTreeMap::new(),
+            huge_ok: cap.sslps() & 0b01 != 0,
         };
         // Scope DRHD: endpoints (типы 1..3 — endpoint/bridge/...). v0.6
         // покрывает точные RID; иерархии мостов — расширение.
@@ -341,9 +380,43 @@ impl Vtd {
             return Err(IommuError::HardwareTimeout);
         }
         crate::kprintln!(
-            "vtd: translation enabled (domains={})",
-            vtd.cap.domain_ids()
+            "vtd: translation enabled (domains={}, huge_pages={})",
+            vtd.cap.domain_ids(),
+            vtd.huge_ok
         );
+
+        // v0.8: IRQ-ремаппинг — IRTA (256 IRTE = 4 КиБ) -> SIRTP ->
+        // IEC-флеш (QI) -> IRE. КАЖДЫЙ бит GCMD — ЗАПРОС (баг v0.6.1):
+        // вместе с one-shot SIRTP/IRE держим уже включённые ENABLE|QIE,
+        // иначе погасим трансляцию/очередь. EIME=0: ядро в xAPIC-режиме,
+        // 8-битные APIC-ID (EIM не нужен).
+        if vtd.ecap.intr_remap() {
+            let irta = zero_page().ok_or(IommuError::OutOfMemory)?;
+            vtd.mmio.write64(regs::IRTA, Irta::new(irta, 7, false).0);
+            vtd.mmio
+                .write32(regs::GCMD, (Gcmd::ENABLE | Gcmd::QIE | Gcmd::SIRTP).bits());
+            if !wait_gsts(vtd.mmio, Gsts::IRTPS, 100) {
+                crate::kprintln!("vtd: SIRTP timeout — IRQ-ремаппинг выключен");
+                free_page(irta);
+            } else {
+                // IEC (interrupt-entry cache) — глобальный флеш ДО IRE.
+                vtd.qi_submit(&QiDesc::Iec(QiIec::new(true, 0, 0)));
+                vtd.qi_sync()?;
+                vtd.mmio
+                    .write32(regs::GCMD, (Gcmd::ENABLE | Gcmd::QIE | Gcmd::IRE).bits());
+                if !wait_gsts(vtd.mmio, Gsts::IRES, 100) {
+                    crate::kprintln!("vtd: IRE timeout — IRQ-ремаппинг выключен");
+                    free_page(irta);
+                } else {
+                    vtd.irta_phys = irta;
+                    vtd.ir_enabled = true;
+                    vtd.ir_used = alloc::vec![false; IRTE_COUNT];
+                    crate::kprintln!("vtd: interrupt remapping enabled (irte={})", IRTE_COUNT);
+                }
+            }
+        } else {
+            crate::kprintln!("vtd: ECAP.IR=0 — IRQ-ремаппинг недоступен");
+        }
         Ok(vtd)
     }
 
@@ -442,23 +515,42 @@ impl Vtd {
         {
             let dom = self.domains.get(&did).ok_or(IommuError::DeviceNotBound)?;
             let end = iova + (count as u64) * 4096;
-            for (&base, &(_, pages, _)) in &dom.mappings {
+            for (&base, &(_, pages, _, _)) in &dom.mappings {
                 let bend = base + (pages as u64) * 4096;
                 if base < end && iova < bend {
                     return Err(IommuError::IovaConflict);
                 }
             }
         }
-        for i in 0..count as u64 {
-            let slot = sspt_slot(root, iova + i * 4096, true).ok_or(IommuError::OutOfMemory)?;
-            // SAFETY: слот — leaf PTE домена (наш).
-            unsafe { slot.write_volatile((phys + i * 4096) | sspte_prot(prot)) };
+        // v0.8: раскладка — детерминированный проход: 2 МиБ-выровненный
+        // кусок >= 512 стр при huge_ok пишется ОДНИМ SS-PDE (huge-лист),
+        // остальное — 4К PTE. Раскладка одинакова у map/unmap/protect —
+        // записи обходятся без хранения зеркала таблиц.
+        let mut used_huge = false;
+        let mut i = 0u64;
+        while i < count as u64 {
+            let a = iova + i * 4096;
+            let p = phys + i * 4096;
+            let left = count as u64 - i;
+            if self.huge_ok && left >= 512 && a % SS_HUGEP == 0 && p % SS_HUGEP == 0 {
+                let slot = sspt_slot_level(root, a, 2, true).ok_or(IommuError::OutOfMemory)?;
+                // SAFETY: слот — SS-PDE домена (наш).
+                unsafe { slot.write_volatile(p | SSPDE_HUGE | sspte_prot(prot)) };
+                i += 512;
+                used_huge = true;
+                crate::kprintln!("vtd: map huge 2MiB iova={:#x} -> phys={:#x}", a, p);
+            } else {
+                let slot = sspt_slot(root, a, true).ok_or(IommuError::OutOfMemory)?;
+                // SAFETY: слот — leaf PTE домена (наш).
+                unsafe { slot.write_volatile(p | sspte_prot(prot)) };
+                i += 1;
+            }
         }
         let dom = self
             .domains
             .get_mut(&did)
             .ok_or(IommuError::DeviceNotBound)?;
-        dom.mappings.insert(iova, (phys, count, prot));
+        dom.mappings.insert(iova, (phys, count, prot, used_huge));
         self.invalidate_all(did)
     }
 
@@ -474,33 +566,43 @@ impl Vtd {
                 .ok_or(IommuError::DeviceNotBound)?;
             (bind.did, dom.sspt_root)
         };
-        let had = {
+        // v0.8: точное снятие — (iova, count) обязан совпадать с записью
+        // карты (частичное снятие с расщеплением huge-листьев — v0.9;
+        // см. CHANGES). Раскладка повторяет map — обход без зеркала.
+        let rec = {
             let dom = self.domains.get(&did).ok_or(IommuError::DeviceNotBound)?;
-            dom.mappings.contains_key(&iova)
+            dom.mappings.get(&iova).copied()
         };
-        if !had {
+        let Some((phys, pages, _prot, _huge)) = rec else {
             return Err(IommuError::MappingNotFound);
+        };
+        if pages != count {
+            return Err(IommuError::InvalidConfig);
         }
-        for i in 0..count as u64 {
-            if let Some(slot) = sspt_slot(root, iova + i * 4096, false) {
-                // SAFETY: слот — leaf PTE домена (наш).
-                unsafe { slot.write_volatile(0) };
+        let mut i = 0u64;
+        while i < count as u64 {
+            let a = iova + i * 4096;
+            let p = phys + i * 4096;
+            let left = count as u64 - i;
+            if self.huge_ok && left >= 512 && a % SS_HUGEP == 0 && p % SS_HUGEP == 0 {
+                if let Some(slot) = sspt_slot_level(root, a, 2, false) {
+                    // SAFETY: слот — SS-PDE домена (наш).
+                    unsafe { slot.write_volatile(0) };
+                }
+                i += 512;
+            } else {
+                if let Some(slot) = sspt_slot(root, a, false) {
+                    // SAFETY: слот — leaf PTE домена (наш).
+                    unsafe { slot.write_volatile(0) };
+                }
+                i += 1;
             }
         }
-        let dom = self
-            .domains
+        self.domains
             .get_mut(&did)
-            .ok_or(IommuError::DeviceNotBound)?;
-        // Полное снятие диапазона (частичное — v0.7 с реестром под-страниц).
-        if let Some((_, pages, _)) = dom.mappings.remove(&iova) {
-            if pages < count {
-                // Снято больше, чем было: вернуть в карту хвост (не терять).
-                dom.mappings.insert(
-                    iova + (pages as u64) * 4096,
-                    (0, count - pages, IommuProt::READ),
-                );
-            }
-        }
+            .ok_or(IommuError::DeviceNotBound)?
+            .mappings
+            .remove(&iova);
         self.invalidate_all(did)
     }
 
@@ -517,14 +619,27 @@ impl Vtd {
             let dom = self.domains.get(&did).ok_or(IommuError::DeviceNotBound)?;
             dom.mappings
                 .iter()
-                .map(|(&k, &(p, n, _))| (k, p, n))
+                .map(|(&k, &(p, n, _, _))| (k, p, n))
                 .collect()
         };
         for (iova, phys, pages) in ranges {
-            for i in 0..pages as u64 {
-                if let Some(slot) = sspt_slot(root, iova + i * 4096, false) {
-                    // SAFETY: слот — leaf PTE домена (наш).
-                    unsafe { slot.write_volatile((phys + i * 4096) | sspte_prot(prot)) };
+            let mut i = 0u64;
+            while i < pages as u64 {
+                let a = iova + i * 4096;
+                let p = phys + i * 4096;
+                let left = pages as u64 - i;
+                if self.huge_ok && left >= 512 && a % SS_HUGEP == 0 && p % SS_HUGEP == 0 {
+                    if let Some(slot) = sspt_slot_level(root, a, 2, false) {
+                        // SAFETY: слот — SS-PDE домена (наш).
+                        unsafe { slot.write_volatile(p | SSPDE_HUGE | sspte_prot(prot)) };
+                    }
+                    i += 512;
+                } else {
+                    if let Some(slot) = sspt_slot(root, a, false) {
+                        // SAFETY: слот — leaf PTE домена (наш).
+                        unsafe { slot.write_volatile(p | sspte_prot(prot)) };
+                    }
+                    i += 1;
                 }
             }
         }
@@ -547,6 +662,24 @@ impl Vtd {
         let slot = self.context_slot(&bind.bdf)?;
         // SAFETY: слот наш.
         unsafe { slot.write_volatile(ContextEntry::new()) };
+        // v0.8: IRTE устройства гасим (handle'ы больше не действуют).
+        if self.ir_enabled {
+            let handles = self.dev_irqs.remove(&dev).unwrap_or_default();
+            for idx in handles {
+                // SAFETY: IRT — наша страница.
+                unsafe {
+                    let p = phys_ptr::<u64>(self.irta_phys).add(idx as usize * 2);
+                    p.write_volatile(0);
+                    p.add(1).write_volatile(0);
+                }
+                if (idx as usize) < IRTE_COUNT {
+                    self.ir_used[idx as usize] = false;
+                }
+            }
+            // IEC-флеш — гасим кэш записей погашенного устройства.
+            self.qi_submit(&QiDesc::Iec(QiIec::new(true, 0, 0)));
+            self.qi_sync()?;
+        }
         // Таблицы домена — в пул (только если устройств домена не осталось).
         let still_used = self.devices.values().any(|b| b.did == bind.did);
         if !still_used {
@@ -555,6 +688,97 @@ impl Vtd {
             }
         }
         self.invalidate_all(bind.did)
+    }
+
+    // ==== IRQ-ремаппинг (v0.8) ====
+
+    /// Занят ли IRTE-слот (резервы: 0 — системный «нет handle»,
+    /// 0x10..=0x25 — диапазон IOAPIC по спеке (0x10+pin), не выдаём).
+    fn irte_slot_free(&self, idx: u16) -> bool {
+        idx != 0 && !(0x10..=0x25).contains(&idx) && !self.ir_used[idx as usize]
+    }
+
+    /// Запрограммировать IRTE (remapped-формат): P|vector|dest|SVT-проверка
+    /// источника по RID устройства. Возврат — handle (индекс IRTE).
+    fn irq_map(&mut self, dev: u32, vector: u8, dest: u8, flags: u8) -> Result<u32, IommuError> {
+        if !self.ir_enabled {
+            return Err(IommuError::RemappingDisabled);
+        }
+        if !(0x10..=0xFE).contains(&vector) {
+            return Err(IommuError::InvalidConfig);
+        }
+        let bind = self.devices.get(&dev).ok_or(IommuError::DeviceNotBound)?;
+        let rid = bind.bdf.to_requester_id();
+        let idx = (0..IRTE_COUNT as u16)
+            .find(|&i| self.irte_slot_free(i))
+            .ok_or(IommuError::OutOfMemory)? as usize;
+        let irte = Irte::new_remapped()
+            .with_present(true)
+            .with_trigger_mode_level(flags & 1 != 0)
+            .with_destination_mode_logical(flags & 2 != 0)
+            .with_delivery_mode(DeliveryMode::Fixed)
+            .with_vector(vector)
+            .with_destination(dest as u32)
+            .with_source_id(rid)
+            // SVT=11b (VerifyFull) + SQ=01b: шина+устройство обязаны
+            // совпасть, функция игнорируется (мосты подменяют function
+            // часть RID при пробросе — сверка не ломается).
+            .with_source_qualifier(SourceQualifier::IgnoreFunction)
+            .with_source_validation(SourceValidationType::VerifyFull);
+        let w = irte.words();
+        // SAFETY: IRT — наша страница, 16 байт на IRTE.
+        unsafe {
+            let p = phys_ptr::<u64>(self.irta_phys).add(idx * 2);
+            p.write_volatile(w[0]);
+            p.add(1).write_volatile(w[1]);
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        // IEC — выборочная инвалидация одного IRTE (IM=0: 2^0 = 1 запись).
+        self.qi_submit(&QiDesc::Iec(QiIec::new(false, idx as u16, 0)));
+        self.qi_sync()?;
+        self.ir_used[idx] = true;
+        self.dev_irqs.entry(dev).or_default().push(idx as u16);
+        crate::kprintln!(
+            "vtd: irte dev={} idx={} vec={:#x} dst={:#x} lvl={} log={}",
+            dev,
+            idx,
+            vector,
+            dest,
+            flags & 1 != 0,
+            flags & 2 != 0
+        );
+        Ok(idx as u32)
+    }
+
+    /// Погасить IRTE по handle (только владелец).
+    fn irq_unmap(&mut self, dev: u32, handle: u32) -> Result<(), IommuError> {
+        if !self.ir_enabled {
+            return Err(IommuError::RemappingDisabled);
+        }
+        let idx = handle as usize;
+        if idx >= IRTE_COUNT || !self.ir_used[idx] {
+            return Err(IommuError::InvalidConfig);
+        }
+        let owns = self
+            .dev_irqs
+            .get(&dev)
+            .is_some_and(|v| v.contains(&(idx as u16)));
+        if !owns {
+            return Err(IommuError::DeviceNotBound);
+        }
+        // SAFETY: IRT — наша страница.
+        unsafe {
+            let p = phys_ptr::<u64>(self.irta_phys).add(idx * 2);
+            p.write_volatile(0);
+            p.add(1).write_volatile(0);
+        }
+        self.qi_submit(&QiDesc::Iec(QiIec::new(false, idx as u16, 0)));
+        self.qi_sync()?;
+        self.ir_used[idx] = false;
+        if let Some(v) = self.dev_irqs.get_mut(&dev) {
+            v.retain(|&x| x != idx as u16);
+        }
+        Ok(())
     }
 }
 
@@ -572,10 +796,14 @@ fn wait_gsts(mmio: Mmio, bits: Gsts, ms: u64) -> bool {
 
 // ───────────────────── КОНТРАКТ ЯДРА: IOMMU ─────────────────────
 
-/// Драйвер как единица LIOMMUInterface.
+/// Драйвер Intel VT-d — ВСЕ поднятые DRHD-единицы (мульти-IOMMU, v0.8).
+/// HAL-путь (ANIOMMUInterface) неймспейсит DeviceId парой
+/// (контроллер << 20 | локальный id) — операции знают контроллер;
+/// сисколы передают контроллер ОТДЕЛЬНЫМ аргументом и работают
+/// с локальными id (ABI v0.6 не меняется).
 pub struct VtdDriver {
-    inner: Mutex<Option<Vtd>>,
-    /// Порядковый номер контроллера (IommuId).
+    inner: Mutex<Vec<Vtd>>,
+    /// Порядковый номер драйвера-вендора (IommuId).
     id: u32,
     /// Готовность (init прошёл; ставится один раз до старта AP).
     ready: AtomicBool,
@@ -584,21 +812,35 @@ pub struct VtdDriver {
 impl VtdDriver {
     const fn new(id: u32) -> Self {
         Self {
-            inner: Mutex::new(None),
+            inner: Mutex::new(Vec::new()),
             id,
             ready: AtomicBool::new(false),
         }
     }
 
-    /// Пометить готовым (try_init после успешного Vtd::init).
+    /// Пометить готовым (try_init после успешных Vtd::init).
     fn mark_ready(&self) {
         self.ready.store(true, AtomicOrdering::Release);
     }
 
-    /// Готовность контроллера (для агрегатора `crate::iommu`).
+    /// Готовность (для агрегатора `crate::iommu`).
     pub fn is_ready(&self) -> bool {
         self.ready.load(AtomicOrdering::Acquire)
     }
+
+    /// Число живых контроллеров (для агрегатора и IommuService).
+    pub fn controller_count(&self) -> usize {
+        if self.ready.load(AtomicOrdering::Acquire) {
+            self.inner.lock().len()
+        } else {
+            0
+        }
+    }
+}
+
+/// HAL-неймспейс DeviceId: (контроллер << 20) | (локальный id & 0xF_FFFF).
+fn hal_dev_id(ctrl: u32, local: u32) -> u32 {
+    (ctrl << 20) | (local & 0xF_FFFF)
 }
 
 /// Информация о контроллере для IOMMU_ENUM (сискол).
@@ -612,12 +854,16 @@ pub struct VtdInfo {
     pub include_all: bool,
     pub mgaw: u32,
     pub domains: u32,
+    /// v0.8: IRQ-ремаппинг включён.
+    pub irq_remap: bool,
+    /// v0.8: 2 МиБ huge-листья работают.
+    pub large_pages: bool,
 }
 
 impl VtdDriver {
-    fn info(&self) -> Option<VtdInfo> {
+    fn info(&self, ctrl: u32) -> Option<VtdInfo> {
         let g = self.inner.lock();
-        g.as_ref().map(|v| VtdInfo {
+        g.get(ctrl as usize).map(|v| VtdInfo {
             major: v.ver.major,
             minor: v.ver.minor,
             agaw48: v.cap.sagaw() & (1 << 2) != 0,
@@ -626,6 +872,8 @@ impl VtdDriver {
             include_all: v.include_all,
             mgaw: v.cap.mgaw(),
             domains: v.cap.domain_ids(),
+            irq_remap: v.ir_enabled,
+            large_pages: v.huge_ok,
         })
     }
 }
@@ -643,29 +891,39 @@ impl ANIOMMUInterface for VtdDriver {
         count: usize,
         prot: IommuProt,
     ) -> Result<(), IommuError> {
+        let ctrl = dev.0 >> 20;
+        let local = dev.0 & 0xF_FFFF;
         let mut g = self.inner.lock();
-        g.as_mut()
-            .ok_or(IommuError::IommuNotPresent)?
-            .map(dev.0, iova, phys.0, count, prot)
+        g.get_mut(ctrl as usize)
+            .ok_or(IommuError::InvalidIndex)?
+            .map(local, iova, phys.0, count, prot)
     }
 
     fn unmap_pages(&mut self, dev: DeviceId, iova: u64, count: usize) -> Result<(), IommuError> {
+        let ctrl = dev.0 >> 20;
+        let local = dev.0 & 0xF_FFFF;
         let mut g = self.inner.lock();
-        g.as_mut()
-            .ok_or(IommuError::IommuNotPresent)?
-            .unmap(dev.0, iova, count)
+        g.get_mut(ctrl as usize)
+            .ok_or(IommuError::InvalidIndex)?
+            .unmap(local, iova, count)
     }
 
     fn set_protection(&mut self, dev: DeviceId, prot: IommuProt) -> Result<(), IommuError> {
+        let ctrl = dev.0 >> 20;
+        let local = dev.0 & 0xF_FFFF;
         let mut g = self.inner.lock();
-        g.as_mut()
-            .ok_or(IommuError::IommuNotPresent)?
-            .set_protection(dev.0, prot)
+        g.get_mut(ctrl as usize)
+            .ok_or(IommuError::InvalidIndex)?
+            .set_protection(local, prot)
     }
 
     fn detach_device(&mut self, dev: DeviceId) -> Result<(), IommuError> {
+        let ctrl = dev.0 >> 20;
+        let local = dev.0 & 0xF_FFFF;
         let mut g = self.inner.lock();
-        g.as_mut().ok_or(IommuError::IommuNotPresent)?.detach(dev.0)
+        g.get_mut(ctrl as usize)
+            .ok_or(IommuError::InvalidIndex)?
+            .detach(local)
     }
 }
 
@@ -694,36 +952,37 @@ impl LIOMMUInterface for VtdDriver {
         if bdf.segment != processor.segment {
             return Err(IommuError::UnknownDevicePath);
         }
+        // v0.8: мульти-IOMMU — перебираем контроллеры, побеждает первый,
+        // чей coverage (scope/INCLUDE_PCI_ALL) принимает BDF; DeviceId
+        // неймспейсится контроллером (см. hal_dev_id).
         let mut g = self.inner.lock();
-        g.as_mut()
-            .ok_or(IommuError::IommuNotPresent)?
-            .attach_bdf(bdf)
-            .map(DeviceId)
+        for (ctrl, unit) in g.iter_mut().enumerate() {
+            if let Ok(local) = unit.attach_bdf(bdf) {
+                return Ok(DeviceId(hal_dev_id(ctrl as u32, local)));
+            }
+        }
+        Err(IommuError::UnknownDevicePath)
     }
 }
 
 // ───────────────────── Сервис сисколов ─────────────────────
 
-/// Единственный контроллер v0.6 (IommuId(1)); 0 = «нет».
+/// Драйвер Intel VT-d (все DRHD-единицы); IommuId(1), 0 = «нет».
 pub static VTD0: VtdDriver = VtdDriver::new(1);
 
 impl IommuService for VtdDriver {
     fn controller_count(&self) -> usize {
-        if self.ready.load(AtomicOrdering::Acquire) {
-            1
-        } else {
-            0
-        }
+        VtdDriver::controller_count(self)
     }
 
     fn controller_info(
         &self,
         idx: u32,
     ) -> Result<pkg_generic_interface::syscall::iommu::IommuInfo, IommuError> {
-        if idx != 0 || !self.ready.load(AtomicOrdering::Acquire) {
+        if !self.ready.load(AtomicOrdering::Acquire) {
             return Err(IommuError::InvalidIndex);
         }
-        let i = self.info().ok_or(IommuError::IommuNotPresent)?;
+        let i = self.info(idx).ok_or(IommuError::InvalidIndex)?;
         Ok(pkg_generic_interface::syscall::iommu::IommuInfo {
             version: ((i.major as u16) << 8) | i.minor as u16,
             mgaw_bits: i.mgaw as u8,
@@ -731,16 +990,15 @@ impl IommuService for VtdDriver {
             queued_inval: i.qi,
             pass_through: i.pass_through,
             include_all: i.include_all,
+            irq_remap: i.irq_remap,
+            large_pages: i.large_pages,
         })
     }
 
     fn attach(&self, ctrl: u32, bus: u8, device: u8, function: u8) -> Result<u32, IommuError> {
-        if ctrl != 0 || !self.ready.load(AtomicOrdering::Acquire) {
-            return Err(IommuError::InvalidIndex);
-        }
         let mut g = self.inner.lock();
-        g.as_mut()
-            .ok_or(IommuError::IommuNotPresent)?
+        g.get_mut(ctrl as usize)
+            .ok_or(IommuError::InvalidIndex)?
             .attach_bdf(Bdf::new(0, bus, device, function))
     }
 
@@ -753,13 +1011,10 @@ impl IommuService for VtdDriver {
         pages: usize,
         prot: u8,
     ) -> Result<(), IommuError> {
-        if ctrl != 0 || !self.ready.load(AtomicOrdering::Acquire) {
-            return Err(IommuError::InvalidIndex);
-        }
         let prot = IommuProt::from_bits_truncate(prot);
         let mut g = self.inner.lock();
-        g.as_mut()
-            .ok_or(IommuError::IommuNotPresent)?
+        g.get_mut(ctrl as usize)
+            .ok_or(IommuError::InvalidIndex)?
             .map(device, iova, phys, pages, prot)
     }
 
@@ -770,33 +1025,48 @@ impl IommuService for VtdDriver {
         iova: u64,
         pages: usize,
     ) -> Result<(), IommuError> {
-        if ctrl != 0 || !self.ready.load(AtomicOrdering::Acquire) {
-            return Err(IommuError::InvalidIndex);
-        }
         let mut g = self.inner.lock();
-        g.as_mut()
-            .ok_or(IommuError::IommuNotPresent)?
+        g.get_mut(ctrl as usize)
+            .ok_or(IommuError::InvalidIndex)?
             .unmap(device, iova, pages)
     }
 
     fn detach(&self, ctrl: u32, device: u32) -> Result<(), IommuError> {
-        if ctrl != 0 || !self.ready.load(AtomicOrdering::Acquire) {
-            return Err(IommuError::InvalidIndex);
-        }
         let mut g = self.inner.lock();
-        g.as_mut()
-            .ok_or(IommuError::IommuNotPresent)?
+        g.get_mut(ctrl as usize)
+            .ok_or(IommuError::InvalidIndex)?
             .detach(device)
+    }
+
+    fn irq_map(
+        &self,
+        ctrl: u32,
+        device: u32,
+        vector: u8,
+        dest: u8,
+        flags: u8,
+    ) -> Result<u32, IommuError> {
+        let mut g = self.inner.lock();
+        g.get_mut(ctrl as usize)
+            .ok_or(IommuError::InvalidIndex)?
+            .irq_map(device, vector, dest, flags)
+    }
+
+    fn irq_unmap(&self, ctrl: u32, device: u32, handle: u32) -> Result<(), IommuError> {
+        let mut g = self.inner.lock();
+        g.get_mut(ctrl as usize)
+            .ok_or(IommuError::InvalidIndex)?
+            .irq_unmap(device, handle)
     }
 }
 
 // ───────────────────── Запуск (через iommu::init_and_install) ─────────────────────
 
-/// Поиск DMAR -> первый пригодный DRHD -> init драйвера -> пометка
-/// готовности. Вызывается ПОСЛЕ kinit (пулы/куча подняты), ДО release_aps
-/// (конкуренции ещё нет). Возврат — готовность (сервис ставит агрегатор
-/// `crate::iommu`; DMAR и IVRS не встречаются на одном железе, порядок
-/// — Intel первым — только для индексации ENUM).
+/// Поиск DMAR -> ВСЕ DRHD-единицы -> init каждой -> пометка готовности.
+/// Мульти-IOMMU (v0.8): единицы поднимаются независимо, индексируются
+/// по порядку в DMAR; attach маршрутизируется coverage-проверкой.
+/// Вызывается ПОСЛЕ kinit (пулы/куча подняты), ДО release_aps
+/// (конкуренции ещё нет). Возврат — готовность.
 pub fn try_init() -> bool {
     // Пул не поднят (ранний fatal-путь run()) — тихо уходим: сисколы
     // ответят ENOSYS.
@@ -831,8 +1101,11 @@ pub fn try_init() -> bool {
             return false;
         }
     };
-    // Предпочитаем INCLUDE_PCI_ALL DRHD; иначе первый.
+    // Все DRHD-единицы (мульти-IOMMU v0.8); дубликаты MMIO-базы —
+    // одна физическая единица — поднимаем один раз.
     let drhds: Vec<Drhd> = dmar.drhd_units().collect();
+    let mut made: Vec<Vtd> = Vec::new();
+    let mut seen_bases: Vec<u64> = Vec::new();
     for d in &drhds {
         crate::kprintln!(
             "vtd: DMAR DRHD seg={:#x} include_all={} scopes={}",
@@ -840,29 +1113,31 @@ pub fn try_init() -> bool {
             d.include_pci_all(),
             d.scopes().count()
         );
-    }
-    let pick = drhds
-        .iter()
-        .find(|d| d.include_pci_all())
-        .or_else(|| drhds.first());
-    let drhd = match pick {
-        Some(d) => *d,
-        None => {
-            crate::kprintln!("vtd: DMAR without DRHD units");
-            return false;
+        if seen_bases.contains(&d.register_base()) {
+            crate::kprintln!(
+                "vtd: duplicate DRHD base={:#x} — skipped",
+                d.register_base()
+            );
+            continue;
         }
-    };
-    match Vtd::init(&drhd) {
-        Ok(v) => {
-            *VTD0.inner.lock() = Some(v);
-            // Готовность: помечаем ПОСЛЕ заполнения (release_aps ещё
-            // не было — конкурентов нет).
-            VTD0.mark_ready();
-            true
-        }
-        Err(e) => {
-            crate::kprintln!("vtd: init failed: {:?} (IOMMU syscalls -> ENOSYS)", e);
-            false
+        seen_bases.push(d.register_base());
+        match Vtd::init(d) {
+            Ok(v) => {
+                crate::kprintln!("vtd[{}]: unit up", made.len());
+                made.push(v);
+            }
+            Err(e) => {
+                crate::kprintln!("vtd: unit init failed: {:?} (skipped)", e);
+            }
         }
     }
+    if made.is_empty() {
+        crate::kprintln!("vtd: DMAR without usable DRHD units");
+        return false;
+    }
+    *VTD0.inner.lock() = made;
+    // Готовность: помечаем ПОСЛЕ заполнения (release_aps ещё не было —
+    // конкурентов нет).
+    VTD0.mark_ready();
+    true
 }

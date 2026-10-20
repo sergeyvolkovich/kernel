@@ -475,8 +475,8 @@ impl SyscallRegistry {
             IrqDetachHandler,
         };
         use crate::syscall::iommu::{
-            IommuAttachHandler, IommuDetachHandler, IommuEnumHandler, IommuMapHandler,
-            IommuUnmapHandler,
+            IommuAttachHandler, IommuDetachHandler, IommuEnumHandler, IommuIrqMapHandler,
+            IommuIrqUnmapHandler, IommuMapHandler, IommuUnmapHandler,
         };
         use crate::syscall::ipc::{
             EpCreateHandler, IpcCallHandler, IpcMsgClearHandler, IpcMsgLenHandler,
@@ -580,6 +580,8 @@ impl SyscallRegistry {
         slot!(nums::IOMMU_MAP, IommuMapHandler);
         slot!(nums::IOMMU_UNMAP, IommuUnmapHandler);
         slot!(nums::IOMMU_DETACH, IommuDetachHandler);
+        slot!(nums::IOMMU_IRQ_MAP, IommuIrqMapHandler);
+        slot!(nums::IOMMU_IRQ_UNMAP, IommuIrqUnmapHandler);
     }
 }
 
