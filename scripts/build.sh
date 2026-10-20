@@ -31,17 +31,27 @@ KERNEL=$OUT/x86_64-unknown-none/release/kernel
 cp -f "$KERNEL" "$OUT/kernel.sym"
 rust-objcopy --strip-all "$KERNEL" "$WS/crates/uefi_stub/kernel.bin"
 
-echo "== [2/5] init (static user ELF @ 0x40000000) =="
-cargo build -p init --target x86_64-unknown-none $R
-
-echo "== [3/5] uefi_stub (kernel.efi: stub + встроенный образ ядра) =="
-cargo build -p uefi_stub --target x86_64-unknown-uefi $R
-
-echo "== [4/5] userlib (C-ABI staticlib) + capp (C-сервер) =="
+echo "== [2/6] userlib (C-ABI staticlib+rlib) =="
 # userlib: статическая C-библиотека (x86_64-unknown-none; code-model
-# kernel — единый LTO-мир с core, 0x40000000 < 2^31 — все формы адресации).
+# kernel — единый LTO-мир с core, 0x40000000 < 2^31 — все формы адресации);
+# rlib-поверхность — для Rust-приложений (crates/rogue).
 cargo build -p userlib --target x86_64-unknown-none $R
 USERLIB=$OUT/x86_64-unknown-none/release/libuserlib.a
+
+echo "== [3/6] rogue (дочерний образ песочницы v0.9, ELF @ 0x40000000) =="
+cargo build -p rogue --target x86_64-unknown-none $R
+ROGUE=$OUT/x86_64-unknown-none/release/rogue
+
+echo "== [4/6] init (static user ELF @ 0x40000000; вшитый образ rogue) =="
+# ROGUE_ELF: build-скрипт init копирует бинарь rogue в OUT_DIR/child.bin,
+# init читает include_bytes! и спавнит домен через TASK_SPAWN_IMAGE
+# (дескриптор: сегменты/стек/argv/лимиты — всё готовит юзерспейс).
+ROGUE_ELF=$ROGUE cargo build -p init --target x86_64-unknown-none $R
+
+echo "== [5/6] uefi_stub (kernel.efi: stub + встроенный образ ядра) =="
+cargo build -p uefi_stub --target x86_64-unknown-uefi $R
+
+echo "== [6/6] capp (C-сервер) =="
 # capp: чистый C — ядро без libc, линк-скрипт init (0x40000000, ENTRY(_start)).
 # -ffreestanding (без libc-примитивов в коде), -fno-stack-protector
 # (иначе ссылается на __stack_chk_fail — userlib даёт страховку-заглушку),

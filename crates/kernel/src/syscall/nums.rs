@@ -120,6 +120,60 @@ pub const THREAD_YIELD: SyscallNumber = SyscallNumber(0x1B);
 /// Требует TaskTCB домена потока.
 pub const THREAD_EX_REGS: SyscallNumber = SyscallNumber(0x1C);
 
+/// Назначить пределы песочницы задаче (атрибуты GTCB, v0.9).
+/// ПРАВО: capability TaskTCB на ЦЕЛЬ. Семантика — трещотка: новые
+/// значения только УЖЕСТОЧАЮТ текущие (`TaskLimits::tighten`).
+/// ABI: arg1 = хендл TaskTCB цели, arg2 = max_pages,
+/// arg3 = max_threads | (max_endpoints << 32),
+/// arg4 = max_shm | (max_caps << 32),
+/// arg5 = max_prio (u8) | (may_spawn ? 0x100 : 0).
+pub const TASK_SET_LIMITS: SyscallNumber = SyscallNumber(0x1D);
+
+/// Снимок атрибутов безопасности задачи (v0.9). ПРАВО: TaskTCB на цель.
+/// Слова по индексу: 0 = max_pages, 1 = usage pages, 2 = usage shm,
+/// 3 = max_threads | (max_endpoints << 32), 4 = max_shm |
+/// (max_caps << 32), 5 = max_prio | (may_spawn ? 0x100 : 0).
+/// ABI: arg1 = хендл TaskTCB цели, arg2 = индекс слова.
+pub const TASK_LIMITS_INFO: SyscallNumber = SyscallNumber(0x1E);
+
+/// Спавн домена из ГОТОВОГО образа (v0.9): сискол ожидает УЖЕ
+/// залинкованный по фиксированным адресам образ, КОПИРОВАННЫЙ
+/// юзерспейсом-родителем в собственные регионы (MEM_ALLOC + запись
+/// байтов) — ядро принимает ТОЛЬКО указатели на память родителя
+/// (дескриптор спавна, сегменты, стек, argv-блок) и мапит готовые
+/// кадры в новое пространство без единой пересылки данных.
+///
+/// Дескриптор (в памяти родителя, little-endian, выравнивание 8):
+/// ```text
+///   +0x00 u64 entry        точка входа ребёнка (линк-адрес)
+///   +0x08 u64 stack_top     вершина стека (THREAD_CREATE-слова)
+///   +0x10 u64 thread_id_lo  ThreadId главного потока (мл. слово)
+///   +0x18 u64 thread_id_hi  ThreadId главного потока (ст. слово)
+///   +0x20 u32 n_segments    число сегментов (1..=16)
+///   +0x24 u32 argv_pages    страницы argv-блока (0 = без argv)
+///   +0x28 u64 argv_src      адрес argv-блока у РОДИТЕЛЯ
+///   +0x30 u64 argv_dst      адрес argv-блока у РЕБЁНКА
+///   +0x38 u64 argv_bytes    длина блока (байт)
+///   +0x40 u64 argc          argc стартового IPC
+///   +0x48 u64 limits[0]     max_pages (TaskLimits)
+///   +0x50 u64 limits[1]     max_threads | (max_endpoints << 32)
+///   +0x58 u64 limits[2]     max_shm | (max_caps << 32)
+///   +0x60 u64 limits[3]     max_prio | (may_spawn ? 0x100 : 0)
+///   +0x68 u8  priority      приоритет домена/потока
+///   +0x70 сегменты, 32 байта каждый:
+///        u64 src   адрес сегмента у РОДИТЕЛЯ (MEM_ALLOC-регион)
+///        u64 dst   линк-адрес сегмента у РЕБЁНКА (4K-выровнен)
+///        u64 pages страниц
+///        u64 flags MMAPMemoryFlags bits (RO/RW/RX)
+/// ```
+/// ПРАВО: TaskTCB на САМОГО вызывающего (право творца) + may_spawn;
+/// лимиты применяются ДО первого потока — ребёнок рождается в
+/// песочнице атомарно. Возврат — хендл TaskTCB(ребёнка) у родителя.
+/// ABI: arg1 = хендл TaskTCB(себя), arg2..3 = TaskId(lo, hi) нового
+/// домена, arg4 = адрес дескриптора у родителя, arg5 = размер
+/// дескриптора (байт: 0x70 + 32*n).
+pub const TASK_SPAWN_IMAGE: SyscallNumber = SyscallNumber(0x1F);
+
 // ==== 0x20: передача прав capability ====
 
 /// Породить производную capability (сужение perms/badge).
@@ -270,6 +324,18 @@ pub const MEM_TRANSFER: SyscallNumber = SyscallNumber(0x53);
 /// 0 = база виртуальная, 1 = база физики, 2 = страниц, 3 = 0
 /// (зарезервировано: external-флаг). ABI: arg1 = адрес, arg2 = индекс.
 pub const MEM_INFO: SyscallNumber = SyscallNumber(0x54);
+
+/// Отобразить СВОИ страницы по ФИКСИРОВАННОМУ адресу в пространстве
+/// ДРУГОЙ задачи (spawn-протокол: родитель грузит ELF/стек/argv
+/// ребёнка; v0.9). ПРАВО: capability TaskTCB на цель — без него
+/// отобразить память в чужой домен нельзя. Страницы зарядаются
+/// пределу ЦЕЛИ (песочница), у источника окно остаётся (кадры —
+/// собственность источника до MEM_FREE, L4 pager-модель).
+/// ABI: arg1 = хендл TaskTCB цели, arg2 = src_vaddr (адрес в
+/// пространстве вызывающего), arg3 = страниц, arg4 = dst_vaddr
+/// (адрес в пространстве цели), arg5 = MMAPMemoryFlags bits.
+/// Возврат: dst_vaddr.
+pub const MEM_MAP_AT: SyscallNumber = SyscallNumber(0x55);
 
 // ==== 0x60: разделяемая память io_uring ====
 

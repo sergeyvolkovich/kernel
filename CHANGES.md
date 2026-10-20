@@ -1,5 +1,134 @@
 # rust-l4: изменения по версиям (workspace)
 
+# v0.9 — Песочница: атрибуты GTCB, спавн по готовому образу, харднинг прав
+
+### Сделано
+
+**Атрибуты песочницы в GTCB (`kernel/task/types.rs`, `task/mod.rs`):**
+- `TaskLimits` (rlimit-стиль, `usize::MAX` = без лимита): `max_pages`
+  (MEM_ALLOC + входящие окна map/transfer/SHM), `max_threads`,
+  `max_endpoints` (живые Gate-capability), `max_shm`, `max_caps`
+  (cspace), `max_prio` (потолок THREAD_SET_PRIO), `may_spawn` (право
+  творца). Хранятся в TCB задачи (`TaskObj`), дефолт — UNLIMITED
+  (доверенные службы).
+- Учёт: `TaskUsage {pages, shm}` — зарядка/возврат в точках расхода
+  (зарядка ДО операции, атомарный откат при отказе подсистемы).
+  «Число endpoint'ов» не хранится счётчиком: считается по живым
+  Gate-capability (CAP_DELETE/REVOKE гасят гейт — учёт честен).
+- СЕМАНТИКА ТРЕЩОТКИ: `set_limits` только УЖЕСТОЧАЕТ (min по числам,
+  И по may_spawn) — задача, владеющая TaskTCB на САМУЮ СЕБЯ, не может
+  расширить свою песочницу. Ошибки: PageQuota/ThreadQuota/ShmQuota →
+  новый errno `QuotaExceeded` (-122, EDQUOT); SpawnDenied → EPERM.
+- Сисколы: TASK_SET_LIMITS (0x1D, право TaskTCB на цель, упаковка
+  слов — см. nums.rs) и TASK_LIMITS_INFO (0x1E, аудит: пределы+usage).
+
+**Спавн по ГОТОВОМУ образу — TASK_SPAWN_IMAGE (0x1F):**
+- Сискол ожидает УЖЕ залинкованный образ и принимает ТОЛЬКО
+  указатели: родитель (юзерспейс) сам разбирает ELF64, выделяет свои
+  регионы MEM_ALLOC, копирует сегменты/стек/argv и собирает дескриптор
+  спавна (формат — `syscall/nums.rs`: entry/stack_top/thread_id/
+  n_segments/argv/limits/priority + сегменты 32 байта: src у родителя,
+  dst-линк-адрес, страницы, флаги). Ядро читает дескриптор через
+  copyin-канал `UserCopy` (физика региона через MemRouter + direct-map
+  платформы) и мапит ГОТОВЫЕ кадры родителя в новое пространство
+  (map_external_at) — без единой пересылки данных.
+- Атомарность песочницы: лимиты применяются ДО первого потока —
+  «окно без лимитов» у ребёнка невозможно; стартовое IPC
+  ([argc, argv_ptr, argv_bytes]) паркуется в очередь потока, как
+  kinit делает для init. Отказ любого шага — полный откат домена
+  (Dead-каскад → destroy_space → TCB destroy).
+- Возврат — хендл TaskTCB(ребёнка) у родителя (лимиты/потоки/kill).
+- TASK_CREATE (0x10) дополнен тем же грантом (право родителя) и
+  фабрикой пространств; TASK_CREATE + THREAD_CREATE + MEM_MAP_AT
+  (0x55, map_fixed по праву TaskTCB) остаются низкоуровневым путём.
+
+**Рантайм-адресные пространства (`kernel/mem/mod.rs` + startup):**
+- `SpaceFactory` (create_space/destroy_space) — тип-стёртый сервис,
+  реализует PlatformSpaces (GCTL + Platform): геометрия окна — от
+  платформы (`configure_runtime_spaces`), MMAP-бекенд — `make_mmap()`.
+- `MemoryManager::create_task_space/destroy_task_space` — фасады под
+  владением менеджера (slab-кэш под spin::Mutex: рантайм-аллокация
+  через &self, kinit-пути — get_mut без лока); смерть домена дропает
+  фасад: owned-кадры возвращаются пулу, external-окна (стейджинг
+  родителя) остаются источнику — L4 pager-модель.
+- Glue::reap_thread — полный контракт смерти домена: revoke_all(cspace)
+  → SHM-регионы → TCB destroy → destroy_space; диагностика
+  «[kernel] task reaped: cspace revoked, space dropped».
+
+**Харднинг системы безопасности (закрытые дыры v0.8):**
+- IOMMU-группа 0x80 гейтована новой capability `IommuAdmin`
+  (kind=5): выдаётся ядром доверенным задачам (kinit — init), дети её
+  не получают и не передают. Ранее ЛЮБОЙ домен мог репрограммировать
+  IOMMU (ENUM/ATTACH/MAP/UNMAP/DETACH/IRQ_MAP/IRQ_UNMAP без проверок).
+- MEM_TRANSFER (0x53): flexpage-окно в чужой домен — только по
+  TaskTCB-праву на ПОЛУЧАТЕЛЯ (знание TaskId правом не было).
+- CAP_MINT/CAP_SEND: передача в ЧУЖОЙ cspace — только по TaskTCB на
+  получателя + предел max_caps получателя (флуд чужого cspace — DoS).
+- THREAD_TERMINATE/THREAD_DESTROY/THREAD_SET_PRIO: требовали только
+  знания ThreadId — теперь право домена (TaskTCB ИЛИ свой домен) +
+  потолок max_prio цели (эскалация 255 — захват CPU).
+- SHM (SETUP_RING/BIND_DOORBELL/MAP/DESTROY/RING_DOORBELL): все
+  операции — только владельцу региона (угаданный ShmId ранее позволял
+  разрушить чужие кадры и утянуть чужую память отображением).
+- TASK_CREATE + TASK_SPAWN_IMAGE: право творца гасится атрибутом
+  may_spawn (песочница не плодит домены-«побеги» с чистыми лимитами).
+- Багфикс IPC_RECV (0x33): прямая встреча (неблокирующий путь)
+  выбрасывала сообщение после чтения слова 0 — слова 1.. были
+  недоступны IPC_MSG_WORD (класс бага v0.5.2, у recv_any починен,
+  у recv — нет). Все пути теперь заполняют mailbox.
+- Аудит: каждая блокировка песочницы печатает «[kernel: sandbox] …»
+  в консоль отладки (квоты/права/угаданные хендлы) — оператор видит
+  картину атаки вживую.
+
+**Демо (init v0.9 S4 + крейт `rogue`):**
+- init встраивает образ rogue байтами (`include_bytes!`; build.sh:
+  ROGUE_ELF → build.rs → OUT_DIR/child.bin), парсит ELF64, готовит
+  регионы, дескриптор с песочницей (max_pages 61 = образ+стек+argv+40,
+  threads 4, endpoints 3, shm 2, caps 8, prio 100, may_spawn=0) и
+  спавнит домен ОДНИМ сисколом — ядро получает только указатели.
+- Протокол: порт init → CAP_MINT копии ребёнку; TaskTCB(ребёнка) →
+  CAP_MINT (своя кухня — квоты держат даже хозяина TCB); GO → READY →
+  PING x3 (эхо+контрольная сумма) → ATTACK → REPORT → TASK_EXIT(0x5A);
+  exit-уведомление — на порт init (TASK_SET_EXIT_EP ребёнка), затем
+  init возвращает стейджинг пулу (MEM_FREE x6) и печатает вердикт.
+- rogue открывает свои порты (2 из 3: третья — в квоте), после
+  команды атакует: флуд потоков (3 потока, 4-й -122), эскалация
+  приоритета (-122), kill родителя по угаданному хендлу (-9), спавн
+  своего домена (EPERM, may_spawn=0), захват IOMMU (EPERM, нет
+  IommuAdmin), SHM-флуд (2 из 2, третья -122) и разрушение региона
+  РОДИТЕЛЯ (EPERM, owner-гейт), проталкивание capability в cspace
+  родителя (EPERM), флуд памяти (35 страниц, затем -122). Итог:
+  9 нарушений заблокировано, вердикт «sandbox HELD» во всех трёх
+  конфигурациях QEMU (без IOMMU / Intel VT-d intremap=on / AMD-Vi
+  intremap=on).
+
+**userlib (C-ABI) + rogue (Rust-приложение):**
+- userlib: crate-type += rlib (Rust-приложения линкуют те же _start и
+  l4_*); новые обёртки l4_task_set_limits/l4_task_limits_info/
+  l4_task_spawn_image/l4_mem_map_at + прототипы в include/l4.h.
+
+### Верификация
+
+- Host-тесты: 152 passed (138 ядро: +8 новых — квоты страниц/SHM с
+  откатами, трещотка лимитов, spawn-image по указателю (дескриптор,
+  песочница до потока, старт-IPC, откат битого размера), права
+  transfer/terminate/SETPRIO/отправки капов, потолок приоритета).
+- rustfmt: чисто; сборка образа exit 0; три прогона QEMU: sandbox
+  HELD (по 9 аудит-линий ядра, ping-pong 3/3, exit 0x5A, стейджинг
+  возвращён), IOMMU smoke Intel/AMD зелёный (v0.8 паритет).
+- Логи: logs/v0.9/ (build + qemu-1-baseline + qemu-2-intel +
+  qemu-3-amd).
+
+### Открытые пункты (v0.10+)
+
+- «Ленивая» квота потоков при SMP-гонке создаётся по счётчику в GTCB
+  (сейчас — живой обход реестра, с big-kernel-lock это честно).
+- Спавн PIE-образов (динамический релок) — по-прежнему только
+  статические линк-адреса (как elfload ядра).
+- CPU-квоты (timeslice) — планировщик бекенда пока квант не режет.
+- Отзыв IommuAdmin производными (revoke-дерево) — стандартный путь
+  есть, политику оборачивания init-ем — на v0.10.
+
 ## v0.8 — IOMMU: IRQ-ремаппинг + мульти-IOMMU + крупные страницы; userlib (C-ABI)
 
 ### Сделано

@@ -43,7 +43,11 @@
 use crate::capability::{
     CapHandle, CapabilityGate, ContainerACCCapability, MintSpec, RevokeReport,
 };
-use crate::ipc::{ExitPayload, FaultInfo, KillSource, RegisterSnapshot};
+use crate::hal::traits::mmap::{MMAPMemoryFlags, PAGE_SIZE};
+use crate::ipc::{
+    ExitPayload, FaultInfo, IPC_KERNEL_FROM, IpcMessage, KillSource, RegisterSnapshot,
+};
+use crate::task::TaskLimits;
 use crate::task::TaskView;
 use crate::task::{TaskId, TaskPriority, TaskState, ThreadId};
 
@@ -335,7 +339,10 @@ impl SyscallHandler for ThreadCreateHandler {
     }
 }
 
-/// Принудительное гашение потока. ABI: arg1..2 = ThreadId(lo, hi).
+/// Принудительное гашение потока. ПРАВО (v0.9): TaskTCB домена потока
+/// ИЛИ собственный домен (как suspend/resume — «своя кухня»);
+/// без права гасить чужой поток нельзя.
+/// ABI: arg1..2 = ThreadId(lo, hi).
 pub struct ThreadTerminateHandler;
 
 impl ThreadTerminateHandler {
@@ -345,12 +352,15 @@ impl ThreadTerminateHandler {
 impl SyscallHandler for ThreadTerminateHandler {
     fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
         let id = task_id_from_args(args.arg(1), args.arg(2));
+        require_thread_domain(ctx, &id)?;
         ctx.tasks.thread_set_state(&id, TaskState::Dead)?;
         Ok(0)
     }
 }
 
-/// Разрушение TCB завершённого потока. ABI: arg1..2 = ThreadId(lo, hi).
+/// Разрушение TCB завершённого потока. ПРАВО (v0.9): TaskTCB домена
+/// ИЛИ собственный домен.
+/// ABI: arg1..2 = ThreadId(lo, hi).
 pub struct ThreadDestroyHandler;
 
 impl ThreadDestroyHandler {
@@ -360,13 +370,17 @@ impl ThreadDestroyHandler {
 impl SyscallHandler for ThreadDestroyHandler {
     fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
         let id = task_id_from_args(args.arg(1), args.arg(2));
+        require_thread_domain(ctx, &id)?;
         ctx.tasks.destroy_thread(id)?;
         Ok(0)
     }
 }
 
-/// Приоритет задачи/потока (общее пространство имён). ABI: arg1..2 = id,
-/// arg3 = приоритет.
+/// Приоритет задачи/потока (общее пространство имён). ПРАВО (v0.9):
+/// TaskTCB домена ИЛИ собственный домен; плюс ПОТОЛОК max_prio из
+/// атрибутов песочницы ЦЕЛИ (песочница не даёт выйти за приоритет,
+/// даже своему домену — иначе DoS-захват CPU).
+/// ABI: arg1..2 = id, arg3 = приоритет.
 pub struct ThreadSetPrioHandler;
 
 impl ThreadSetPrioHandler {
@@ -377,6 +391,19 @@ impl SyscallHandler for ThreadSetPrioHandler {
     fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
         let id = task_id_from_args(args.arg(1), args.arg(2));
         let priority = TaskPriority(args.arg(3) as u8);
+        let target_domain = if let Some(owner) = ctx.tasks.thread_task(&id) {
+            owner
+        } else {
+            id // не поток — считаем задачей (общее пространство имён)
+        };
+        require_thread_domain(ctx, &id)?;
+        // v0.9: потолок приоритета цели (атрибут GTCB).
+        if let Some(sec) = ctx.tasks.sec_view(&target_domain) {
+            if priority.as_u8() > sec.limits.max_prio {
+                sandbox_audit("priority escalation blocked: above sandbox ceiling");
+                return Err(SyscallError::QuotaExceeded);
+            }
+        }
         if ctx.tasks.thread_view(&id).is_some() {
             ctx.tasks.thread_set_priority(&id, priority)?;
         } else {
@@ -442,6 +469,14 @@ impl SyscallHandler for TaskExitHandler {
 /// ПРАВО: capability TaskTCB на САМОГО ВЫЗЫВАЮЩЕГО — ядро выдаёт её
 /// доверенным задачам (spawn-сервер, devmon) как сигнал «можно плодить
 /// домены»; платформа управляет доверием выдачей этого гранта.
+/// Плюс v0.9: атрибут GTCB `may_spawn` (песочница гасит право творца
+/// даже при наличии capability — наследование песочницы).
+///
+/// Возвращаемое слово — хендл TaskTCB(новой задачи) в cspace вызывающего
+/// (право родителя: лимиты/потоки/kill). Если к фасаду подключена
+/// фабрика пространств (`with_space`), домен рождается СО своим
+/// адресным пространством (rollback: отказ фабрики гасит домен до
+/// выдачи каких-либо прав).
 /// ABI: arg1 = хендл TaskTCB(себя), arg2..3 = TaskId(lo, hi) новой
 /// задачи, arg4 = приоритет.
 pub struct TaskCreateHandler;
@@ -461,10 +496,329 @@ impl SyscallHandler for TaskCreateHandler {
         if task_id != ctx.task {
             return Err(SyscallError::MissingRight);
         }
+        // v0.9: атрибут песочницы may_spawn (без него домен — «тупиковая
+        // ветвь»: свои потомки не плодит).
+        if !ctx.tasks.may_spawn(&ctx.task).unwrap_or(false) {
+            sandbox_audit("spawn denied: task is sandboxed (may_spawn=0)");
+            return Err(SyscallError::MissingRight);
+        }
         let new_task = task_id_from_args(args.arg(2), args.arg(3));
         let priority = TaskPriority(args.arg(4) as u8);
         ctx.tasks.create(new_task, priority)?;
+        // v0.9: адресное пространство домена (фабрика — сервис платформы).
+        // Отказ — полный откат: домен без права и памяти не существует.
+        if let Some(factory) = ctx.space {
+            if let Err(e) = factory.create_space(new_task) {
+                let _ = ctx.tasks.set_state(&new_task, TaskState::Dead);
+                let _ = ctx.tasks.destroy(new_task);
+                return Err(e.into());
+            }
+        }
+        // v0.9: родителю — TaskTCB(нового домена): право назначать
+        // лимиты (песочница), создавать потоки, убивать.
+        let gate = crate::capability::CapabilityGate::new(
+            ContainerACCCapability::TaskTCB { task_id: new_task },
+            crate::capability::ActionPermissions::all(),
+            crate::capability::CapabilityBadge::FULL,
+        );
+        match ctx.caps.grant(ctx.tasks, ctx.task, gate) {
+            Ok(h) => Ok(h.bits() as usize),
+            Err(e) => {
+                // Откат: гасим домен (пространство умерло вместе с ним).
+                if let Some(factory) = ctx.space {
+                    let _ = factory.destroy_space(new_task);
+                }
+                let _ = ctx.tasks.set_state(&new_task, TaskState::Dead);
+                let _ = ctx.tasks.destroy(new_task);
+                Err(e.into())
+            }
+        }
+    }
+}
+
+/// Назначение пределов песочницы задаче (v0.9, атрибуты GTCB).
+///
+/// ПРАВО: TaskTCB на ЦЕЛЬ. Семантика — ТРЕЩОТКА: переданные значения
+/// только УЖЕСТОЧАЮТ текущие (меньше предел — строже; may_spawn —
+/// только гасится). Задача, владеющая TCB на себя, расширить свою
+/// песочницу не может — трещотка не даёт.
+///
+/// ABI: arg1 = хендл TaskTCB цели, arg2 = max_pages,
+/// arg3 = max_threads | (max_endpoints << 32),
+/// arg4 = max_shm | (max_caps << 32),
+/// arg5 = max_prio (u8) | (may_spawn ? 0x100 : 0).
+pub struct TaskSetLimitsHandler;
+
+impl TaskSetLimitsHandler {
+    pub const SYSCALL: SyscallNumber = nums::TASK_SET_LIMITS;
+}
+
+impl SyscallHandler for TaskSetLimitsHandler {
+    fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+        let handle = CapHandle(args.arg(1) as u64);
+        let view = ctx.resolve(handle)?;
+        let ContainerACCCapability::TaskTCB { task_id } = view.cap_ref else {
+            return Err(SyscallError::MissingRight);
+        };
+        let w32 = |w: usize| (w & 0xFFFF_FFFF) as usize;
+        let limits = crate::task::TaskLimits {
+            max_pages: args.arg(2),
+            max_threads: w32(args.arg(3)),
+            max_endpoints: args.arg(3) >> 32,
+            max_shm: w32(args.arg(4)),
+            max_caps: args.arg(4) >> 32,
+            max_prio: (args.arg(5) & 0xFF) as u8,
+            may_spawn: args.arg(5) & 0x100 != 0,
+        };
+        ctx.tasks.set_limits(&task_id, limits)?;
+        sandbox_audit("limits tightened for child domain");
         Ok(0)
+    }
+}
+
+/// Снимок атрибутов безопасности задачи (v0.9). ПРАВО: TaskTCB на цель
+/// (аудит песочницы — привилегия родителя/самого домена).
+///
+/// Слова по индексу: 0 = max_pages, 1 = usage pages, 2 = usage shm,
+/// 3 = max_threads | (max_endpoints << 32), 4 = max_shm |
+/// (max_caps << 32), 5 = max_prio | (may_spawn ? 0x100 : 0).
+/// ABI: arg1 = хендл TaskTCB цели, arg2 = индекс слова.
+pub struct TaskLimitsInfoHandler;
+
+impl TaskLimitsInfoHandler {
+    pub const SYSCALL: SyscallNumber = nums::TASK_LIMITS_INFO;
+}
+
+impl SyscallHandler for TaskLimitsInfoHandler {
+    fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+        let handle = CapHandle(args.arg(1) as u64);
+        let view = ctx.resolve(handle)?;
+        let ContainerACCCapability::TaskTCB { task_id } = view.cap_ref else {
+            return Err(SyscallError::MissingRight);
+        };
+        let sec = ctx.tasks.sec_view(&task_id).ok_or(SyscallError::NotFound)?;
+        let words = [
+            sec.limits.max_pages,
+            sec.usage.pages,
+            sec.usage.shm,
+            (sec.limits.max_threads & 0xFFFF_FFFF) | (sec.limits.max_endpoints << 32),
+            (sec.limits.max_shm & 0xFFFF_FFFF) | (sec.limits.max_caps << 32),
+            (sec.limits.max_prio as usize) | if sec.limits.may_spawn { 0x100 } else { 0 },
+        ];
+        let idx = args.arg(2);
+        words.get(idx).copied().ok_or(SyscallError::InvalidArgument)
+    }
+}
+
+// ==== Спавн по готовому образу (v0.9) ====
+
+/// Размер заголовка спавн-дескриптора (байт; см. ABI в `nums::TASK_SPAWN_IMAGE`).
+pub const SPAWN_DESC_HEADER_BYTES: usize = 0x70;
+/// Размер одного сегментного дескриптора.
+pub const SPAWN_DESC_SEGMENT_BYTES: usize = 32;
+/// Максимум сегментов (полный размер дескриптора = 0x70 + 32*n).
+pub const SPAWN_MAX_SEGMENTS: usize = 16;
+/// Полный размер дескриптора (лимит copyin за один вызов).
+pub const SPAWN_DESC_MAX_BYTES: usize =
+    SPAWN_DESC_HEADER_BYTES + SPAWN_MAX_SEGMENTS * SPAWN_DESC_SEGMENT_BYTES;
+
+/// Спавн домена из ЗАЛИНКОВАННОГО образа, подготовленного юзерспейсом.
+///
+/// Родитель (spawn-сервер, init) УЖЕ: разобрал ELF, выделил регионы
+/// (MEM_ALLOC), скопировал байты сегментов/стека/argv и собрал
+/// дескриптор. Ядро принимает ТОЛЬКО указатели на память родителя:
+/// читает дескриптор (copyin-канал) и мапит готовые кадры в новое
+/// пространство (map_external_at) — без единой пересылки данных.
+///
+/// Атомарность песочницы: лимиты применяются ДО первого потока —
+/// ребёнок рождается в песочнице, «окно без лимитов» невозможно.
+pub struct TaskSpawnImageHandler;
+
+impl TaskSpawnImageHandler {
+    pub const SYSCALL: SyscallNumber = nums::TASK_SPAWN_IMAGE;
+}
+
+/// Откат спавна: домен гасится целиком (Dead-каскад → пространство →
+/// TCB). Кадры сегментов остаются у родителя (external-отображения);
+/// cspace ребёнка пуст по построению (грант шёл в cspace родителя).
+fn rollback_spawned_domain(
+    ctx: &SyscallCtx<'_>,
+    factory: &dyn crate::mem::SpaceFactory,
+    task: TaskId,
+) {
+    let _ = ctx.tasks.set_state(&task, TaskState::Dead);
+    let _ = factory.destroy_space(task);
+    let _ = ctx.tasks.destroy(task);
+}
+
+impl SyscallHandler for TaskSpawnImageHandler {
+    fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+        // 0. Сервисы: фабрика пространств + чтение памяти + роутер.
+        let factory = ctx.space.ok_or(SyscallError::NotSupported)?;
+        let copy = ctx.copy.ok_or(SyscallError::NotSupported)?;
+        let router = ctx.memory.ok_or(SyscallError::NotSupported)?;
+
+        // 1. Право творца: TaskTCB на себя + may_spawn-атрибут.
+        let handle = CapHandle(args.arg(1) as u64);
+        let view = ctx.resolve(handle)?;
+        let ContainerACCCapability::TaskTCB { task_id } = view.cap_ref else {
+            return Err(SyscallError::MissingRight);
+        };
+        if task_id != ctx.task {
+            return Err(SyscallError::MissingRight);
+        }
+        if !ctx.tasks.may_spawn(&ctx.task).unwrap_or(false) {
+            sandbox_audit("spawn-image denied: sandboxed creator (may_spawn=0)");
+            return Err(SyscallError::MissingRight);
+        }
+        let new_task = task_id_from_args(args.arg(2), args.arg(3));
+
+        // 2. Дескриптор: чтение из памяти родителя по указателю.
+        let desc_ptr = args.arg(4);
+        let desc_len = args.arg(5);
+        if desc_len < SPAWN_DESC_HEADER_BYTES
+            || desc_len > SPAWN_DESC_MAX_BYTES
+            || (desc_len - SPAWN_DESC_HEADER_BYTES) % SPAWN_DESC_SEGMENT_BYTES != 0
+        {
+            return Err(SyscallError::InvalidArgument);
+        }
+        let mut desc = [0u8; SPAWN_DESC_MAX_BYTES];
+        copy.read_task_bytes(ctx.task, desc_ptr, &mut desc[..desc_len])
+            .map_err(SyscallError::from)?;
+        let word = |i: usize| u64::from_le_bytes(desc[i * 8..i * 8 + 8].try_into().unwrap());
+        let u32_at = |i: usize| u32::from_le_bytes(desc[i..i + 4].try_into().unwrap());
+        let entry = word(0) as usize;
+        let stack_top = word(1) as usize;
+        let thread_id = task_id_from_args(word(2) as usize, word(3) as usize);
+        let n_segments = u32_at(0x20) as usize;
+        let argv_pages = u32_at(0x24) as usize;
+        let argv_src = word(5) as usize;
+        let argv_dst = word(6) as usize;
+        let argv_bytes = word(7) as usize;
+        let argc = word(8) as usize;
+        let priority = desc[0x68];
+        // Валидация геометрии ДО создания домена (отказ ничего не создаёт).
+        if entry == 0 || stack_top == 0 || priority == 0 {
+            return Err(SyscallError::InvalidArgument);
+        }
+        if n_segments == 0
+            || n_segments > SPAWN_MAX_SEGMENTS
+            || n_segments != (desc_len - SPAWN_DESC_HEADER_BYTES) / SPAWN_DESC_SEGMENT_BYTES
+        {
+            return Err(SyscallError::InvalidArgument);
+        }
+        if argv_pages > 0
+            && (argv_src == 0
+                || argv_dst == 0
+                || argv_dst % PAGE_SIZE != 0
+                || argv_bytes == 0
+                || argv_bytes > argv_pages * PAGE_SIZE)
+        {
+            return Err(SyscallError::InvalidArgument);
+        }
+        let w32 = |w: u64| (w & 0xFFFF_FFFF) as usize;
+        let limits = TaskLimits {
+            max_pages: word(9) as usize,
+            max_threads: w32(word(10)),
+            max_endpoints: (word(10) >> 32) as usize,
+            max_shm: w32(word(11)),
+            max_caps: (word(11) >> 32) as usize,
+            max_prio: (word(12) & 0xFF) as u8,
+            may_spawn: word(12) & 0x100 != 0,
+        };
+
+        // 3. Домен + пространство + ПЕСОЧНИЦА (лимиты до первого потока).
+        ctx.tasks.create(new_task, TaskPriority(priority))?;
+        if let Err(e) = factory.create_space(new_task) {
+            let _ = ctx.tasks.set_state(&new_task, TaskState::Dead);
+            let _ = ctx.tasks.destroy(new_task);
+            return Err(e.into());
+        }
+        if let Err(e) = ctx.tasks.set_limits(&new_task, limits) {
+            rollback_spawned_domain(ctx, factory, new_task);
+            return Err(e.into());
+        }
+        // 4. Право родителя: TaskTCB(ребёнка) — до любых отображений
+        //    (отказ гранта откатывает пустой домен безхитростно; хендл
+        //    возвращается последним словом вызова).
+        let gate = CapabilityGate::new(
+            ContainerACCCapability::TaskTCB { task_id: new_task },
+            crate::capability::ActionPermissions::all(),
+            crate::capability::CapabilityBadge::FULL,
+        );
+        let parent_handle = match ctx.caps.grant(ctx.tasks, ctx.task, gate) {
+            Ok(h) => h,
+            Err(e) => {
+                rollback_spawned_domain(ctx, factory, new_task);
+                return Err(e.into());
+            }
+        };
+        // 5. Сегменты: готовые кадры родителя → линк-адреса ребёнка.
+        for i in 0..n_segments {
+            let base = SPAWN_DESC_HEADER_BYTES + i * SPAWN_DESC_SEGMENT_BYTES;
+            let seg = |k: usize| {
+                u64::from_le_bytes(desc[base + k * 8..base + k * 8 + 8].try_into().unwrap())
+            };
+            let src = seg(0) as usize;
+            let dst = seg(1) as usize;
+            let pages = seg(2) as usize;
+            let flags = MMAPMemoryFlags::from_bits_retain(seg(3) as u8);
+            if pages == 0 || dst % PAGE_SIZE != 0 {
+                rollback_spawned_domain(ctx, factory, new_task);
+                return Err(SyscallError::InvalidArgument);
+            }
+            if let Err(e) = ctx.tasks.charge_pages(&new_task, pages) {
+                sandbox_audit("spawn-image: segment exceeds child page quota");
+                rollback_spawned_domain(ctx, factory, new_task);
+                return Err(e.into());
+            }
+            if let Err(e) = router.map_external_at(new_task, ctx.task, src, dst, pages, flags) {
+                sandbox_audit("spawn-image: segment mapping failed");
+                ctx.tasks.refund_pages(&new_task, pages);
+                rollback_spawned_domain(ctx, factory, new_task);
+                return Err(e.into());
+            }
+        }
+        // 6. argv-блок (тот же механизм: кадры родителя → адрес ребёнка).
+        if argv_pages > 0 {
+            if let Err(e) = ctx.tasks.charge_pages(&new_task, argv_pages) {
+                rollback_spawned_domain(ctx, factory, new_task);
+                return Err(e.into());
+            }
+            let flags = MMAPMemoryFlags::RW;
+            if let Err(e) =
+                router.map_external_at(new_task, ctx.task, argv_src, argv_dst, argv_pages, flags)
+            {
+                ctx.tasks.refund_pages(&new_task, argv_pages);
+                rollback_spawned_domain(ctx, factory, new_task);
+                return Err(e.into());
+            }
+        }
+        // 7. Главный поток (лимиты уже на месте: create_thread проверит
+        //    max_threads, приоритет — потолок max_prio через set_limits).
+        if let Err(e) = ctx.tasks.create_thread(
+            thread_id,
+            new_task,
+            TaskPriority(priority),
+            entry,
+            stack_top,
+        ) {
+            rollback_spawned_domain(ctx, factory, new_task);
+            return Err(e.into());
+        }
+        // 8. Стартовое IPC ([argc, argv_dst, argv_bytes]) — паркуется в
+        //    очередь потока (как kinit для init): протокол запуска L4.
+        if let Some(ipc) = ctx.ipc {
+            let msg = alloc::boxed::Box::new(IpcMessage::start_args(
+                IPC_KERNEL_FROM,
+                argc as u64,
+                argv_dst as u64,
+                argv_bytes as u64,
+            ));
+            let _ = ipc.send_thread(ctx.tasks, ctx.memory, IPC_KERNEL_FROM, thread_id, msg);
+        }
+        sandbox_audit("spawn-image: domain ready (linked image mapped)");
+        Ok(parent_handle.bits() as usize)
     }
 }
 
@@ -692,6 +1046,7 @@ impl SyscallHandler for CapInfoHandler {
             }
             ContainerACCCapability::Gate { gate_id } => [gate_id.0, 0],
             ContainerACCCapability::Irq { irq, obj_id } => [irq.0 as u64, obj_id.0],
+            ContainerACCCapability::IommuAdmin => [0xFFFF_FFFF_FFFF_0001, 0],
             ContainerACCCapability::DeviceReference { .. } => {
                 // Полный путь — только в реестре устройств; компактная
                 // кодировка пути — та же, что у DEVICE_ENUM.
@@ -721,6 +1076,7 @@ fn cap_kind_word(cap: &ContainerACCCapability) -> u64 {
         ContainerACCCapability::TaskTCB { .. } => 2,
         ContainerACCCapability::Gate { .. } => 3,
         ContainerACCCapability::Irq { .. } => 4,
+        ContainerACCCapability::IommuAdmin => 5,
     }
 }
 
@@ -759,9 +1115,62 @@ fn require_thread_domain(ctx: &SyscallCtx<'_>, thread: &ThreadId) -> Result<(), 
     }
 }
 
+// ==== Хелперы безопасности v0.9 (скан cspace вызывающего) ====
+
+/// Есть ли у вызывающего TaskTCB-право на задачу `target`? Тот же паттерн
+/// идентификации, что у `require_thread_domain`: право — факт владения
+/// capability, а не знание TaskId.
+pub(crate) fn has_tcb_cap_on(ctx: &SyscallCtx<'_>, target: &TaskId) -> bool {
+    let mut permitted = false;
+    ctx.caps.for_each_task_cap(ctx.tasks, ctx.task, |v| {
+        if let ContainerACCCapability::TaskTCB { task_id } = &v.cap_ref {
+            if *task_id == *target {
+                permitted = true;
+            }
+        }
+    });
+    permitted
+}
+
+/// Есть ли у вызывающего мастер-право IommuAdmin (гейт группы 0x80).
+pub(crate) fn has_iommu_admin(ctx: &SyscallCtx<'_>) -> bool {
+    let mut permitted = false;
+    ctx.caps.for_each_task_cap(ctx.tasks, ctx.task, |v| {
+        if matches!(v.cap_ref, ContainerACCCapability::IommuAdmin) {
+            permitted = true;
+        }
+    });
+    permitted
+}
+
+/// Число живых Gate-capability вызывающего (учёт предела endpoint'ов).
+pub(crate) fn gate_cap_count(ctx: &SyscallCtx<'_>) -> usize {
+    let mut n = 0usize;
+    ctx.caps.for_each_task_cap(ctx.tasks, ctx.task, |v| {
+        if matches!(v.cap_ref, ContainerACCCapability::Gate { .. }) {
+            n += 1;
+        }
+    });
+    n
+}
+
+/// Аудит песочницы: строка в консоль отладки ядра (каждая блокировка
+/// операции домена-песочницы видна оператору — v0.9).
+pub(crate) fn sandbox_audit(line: &str) {
+    use alloc::fmt::Write;
+    if let Some(sink) = crate::syscall::debug::debug_sink() {
+        let mut s = alloc::string::String::with_capacity(line.len() + 24);
+        let _ = write!(s, "\r\n[kernel: sandbox] {line}\r\n");
+        sink.write(s.as_bytes());
+    }
+}
+
 // ==== Передача прав capability (map/grant-наследники L4) ====
 
 /// Mint: производная capability (сужение прав/badge).
+/// ПРАВО v0.9: на ПОЛУЧАТЕЛЯ — свой домен ИЛИ TaskTCB получателя в
+/// cspace вызывающего (знание TaskId чужого cspace правом не является);
+/// плюс предел max_caps получателя (флуд чужого cspace — DoS).
 /// ABI: arg1 = хендл источника, arg2..3 = TaskId получателя, arg4 = perms,
 /// arg5 = badge.
 pub struct CapMintHandler;
@@ -774,6 +1183,7 @@ impl SyscallHandler for CapMintHandler {
     fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
         let src = CapHandle(args.arg(1) as u64);
         let dst = task_id_from_args(args.arg(2), args.arg(3));
+        require_dst_capable(ctx, &dst)?;
         let spec = MintSpec {
             perms: crate::capability::ActionPermissions::from_bits_retain(args.arg(4) as u8),
             badge: crate::capability::CapabilityBadge::from_bits(args.arg(5) as u64),
@@ -784,6 +1194,8 @@ impl SyscallHandler for CapMintHandler {
 }
 
 /// Send: передача хендла (право Send у источника).
+/// ПРАВО v0.9: на ПОЛУЧАТЕЛЯ — как у mint (свой домен ИЛИ TaskTCB
+/// получателя) + предел max_caps получателя.
 /// ABI: arg1 = хендл источника, arg2..3 = TaskId получателя.
 pub struct CapSendHandler;
 
@@ -795,9 +1207,31 @@ impl SyscallHandler for CapSendHandler {
     fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
         let src = CapHandle(args.arg(1) as u64);
         let dst = task_id_from_args(args.arg(2), args.arg(3));
+        require_dst_capable(ctx, &dst)?;
         let handle = ctx.caps.send(ctx.tasks, ctx.task, src, dst)?;
         Ok(handle.bits() as usize)
     }
+}
+
+/// Право на передачу capability в чужой cspace (v0.9): получатель —
+/// САМ вызывающий ИЛИ у вызывающего есть TaskTCB на получателя.
+/// Плюс ресурсный предел: живых хендлов получателя < max_caps.
+fn require_dst_capable(ctx: &SyscallCtx<'_>, dst: &TaskId) -> Result<(), SyscallError> {
+    if *dst == ctx.task {
+        return Ok(());
+    }
+    if !has_tcb_cap_on(ctx, dst) {
+        sandbox_audit("cap transfer blocked: no TaskTCB on destination");
+        return Err(SyscallError::MissingRight);
+    }
+    if let Some(sec) = ctx.tasks.sec_view(dst) {
+        let live = ctx.tasks.cap_count(dst).unwrap_or(0);
+        if live >= sec.limits.max_caps {
+            sandbox_audit("cap transfer blocked: destination cspace is full (max_caps)");
+            return Err(SyscallError::QuotaExceeded);
+        }
+    }
+    Ok(())
 }
 
 /// Revoke: отзыв хендла со всем поддеревом. ABI: arg1 = хендл.
@@ -847,13 +1281,15 @@ mod tests {
         ActionPermissions, CapHandle, CapabilityBadge, CapabilityGate, CapabilityManager,
         ContainerACCCapability, MintSpec,
     };
-    use crate::task::{TaskPriority, TaskState, TcbManager};
+    use crate::task::{TaskId, TaskPriority, TaskState, TcbManager};
 
     use super::super::nums;
     use super::super::types::SyscallArgs;
     use super::super::types::SyscallError;
     use super::super::{SyscallFacade, SyscallRegistry};
-    use super::TaskSpawnHandler;
+    use super::{
+        SPAWN_DESC_HEADER_BYTES, SPAWN_DESC_SEGMENT_BYTES, TaskSpawnHandler, TaskSpawnImageHandler,
+    };
     /// Детерминированно-уникальный TaskId для тестов: uuid без фичи v4 —
     /// генератора нет, счётчик процесса даёт достаточную уникальность.
     fn uuid_next() -> uuid::Uuid {
@@ -1288,8 +1724,54 @@ mod tests {
             Err(SyscallError::MissingRight)
         );
 
-        // Право на себя — домен создан (L4 task_new).
+        // Право на себя — домен создан (L4 task_new); возврат — хендл
+        // TaskTCB(нового домена) в cspace творца (v0.9: право родителя
+        // назначать лимиты/потоки/kill).
         let h_self = grant_tcb(caps, tasks, creator, creator);
+        let args = SyscallArgs::new([
+            0,
+            h_self.bits() as usize,
+            v as usize,
+            (v >> 64) as usize,
+            5,
+            0,
+        ]);
+        let ret = reg.dispatch_number(nums::TASK_CREATE, &mut ctx, &args);
+        assert!(ret.is_ok(), "TASK_CREATE с правом творца: {ret:?}");
+        let child_handle = CapHandle(ret.unwrap() as u64);
+        assert!(child_handle.bits() > 0, "возврат — хендл, не ноль");
+        assert_eq!(tasks.get(&new_id).unwrap().priority, TaskPriority(5));
+        // Хендл из возврата резолвится как TaskTCB именно на нового.
+        let view = ctx.caps.get(tasks, creator, child_handle).unwrap();
+        assert!(matches!(
+            view.cap_ref,
+            ContainerACCCapability::TaskTCB { task_id } if task_id == new_id
+        ));
+    }
+
+    #[test]
+    fn task_create_denied_in_sandbox() {
+        let (reg, tasks, caps) = default_table_world();
+        let creator = uuid_next();
+        tasks.create(creator, TaskPriority::DEFAULT).unwrap();
+        // Песочница: право творца погашено атрибутом may_spawn = false
+        // (трещотка: даже при живой TaskTCB-капабилити).
+        tasks
+            .set_limits(&creator, crate::task::TaskLimits::UNLIMITED)
+            .unwrap();
+        tasks
+            .set_limits(
+                &creator,
+                crate::task::TaskLimits {
+                    may_spawn: false,
+                    ..crate::task::TaskLimits::UNLIMITED
+                },
+            )
+            .unwrap();
+        let h_self = grant_tcb(caps, tasks, creator, creator);
+        let new_id = uuid_next();
+        let v = new_id.as_u128();
+        let mut ctx = crate::syscall::SyscallCtx::core(0, creator, tasks, caps);
         let args = SyscallArgs::new([
             0,
             h_self.bits() as usize,
@@ -1300,9 +1782,420 @@ mod tests {
         ]);
         assert_eq!(
             reg.dispatch_number(nums::TASK_CREATE, &mut ctx, &args),
+            Err(SyscallError::MissingRight)
+        );
+        assert!(!tasks.contains(&new_id), "домен не создан");
+    }
+
+    #[test]
+    fn sandbox_limits_ratchet_and_quotas() {
+        let (reg, tasks, caps) = default_table_world();
+        let parent = uuid_next();
+        tasks.create(parent, TaskPriority::DEFAULT).unwrap();
+        // «Создаём» ребёнка напрямую менеджером (spawn-путь покрыт тестом
+        // выше) и назначаем песочницу через сискол по праву TaskTCB.
+        let child = uuid_next();
+        tasks.create(child, TaskPriority(80)).unwrap();
+        let h_child = grant_tcb(caps, tasks, parent, child);
+        let mut ctx = crate::syscall::SyscallCtx::core(0, parent, tasks, caps);
+
+        // TASK_SET_LIMITS: страницы 8, потоки 2, endpoints 1, prio 100.
+        let pack = |lo: usize, hi: usize| (lo & 0xFFFF_FFFF) | (hi << 32);
+        let args = SyscallArgs::new([
+            0,
+            h_child.bits() as usize,
+            8,
+            pack(2, 1),
+            pack(usize::MAX, usize::MAX),
+            100,
+        ]);
+        assert_eq!(
+            reg.dispatch_number(nums::TASK_SET_LIMITS, &mut ctx, &args),
             Ok(0)
         );
-        assert_eq!(tasks.get(&new_id).unwrap().priority, TaskPriority(5));
+
+        // Трещотка: попытка РАСШИРИТЬ (страницы 100) — принимается как
+        // ужесточение не бывает: предел остался 8.
+        let args = SyscallArgs::new([
+            0,
+            h_child.bits() as usize,
+            100,
+            pack(usize::MAX, usize::MAX),
+            pack(usize::MAX, usize::MAX),
+            255 | 0x100,
+        ]);
+        assert_eq!(
+            reg.dispatch_number(nums::TASK_SET_LIMITS, &mut ctx, &args),
+            Ok(0)
+        );
+        let sec = tasks.sec_view(&child).unwrap();
+        assert_eq!(sec.limits.max_pages, 8, "трещотка: расширение не прошло");
+        assert_eq!(sec.limits.max_threads, 2);
+        assert_eq!(sec.limits.max_endpoints, 1);
+        assert_eq!(sec.limits.max_prio, 100, "трещотка: приоритет не расширен");
+        assert!(!sec.limits.may_spawn, "may_spawn погашен");
+
+        // Квоты менеджера: страницы сверх — PageQuota; потоки — ThreadQuota.
+        tasks.charge_pages(&child, 8).unwrap();
+        assert!(matches!(
+            tasks.charge_pages(&child, 1),
+            Err(crate::task::TaskError::PageQuota { .. })
+        ));
+        tasks.refund_pages(&child, 8);
+        let t1 = uuid_next();
+        tasks
+            .create_thread(t1, child, TaskPriority(1), 0x1000, 0x9000)
+            .unwrap();
+        let t2 = uuid_next();
+        tasks
+            .create_thread(t2, child, TaskPriority(1), 0x1000, 0x9000)
+            .unwrap();
+        let t3 = uuid_next();
+        assert!(matches!(
+            tasks.create_thread(t3, child, TaskPriority(1), 0x1000, 0x9000),
+            Err(crate::task::TaskError::ThreadQuota { .. })
+        ));
+
+        // TASK_LIMITS_INFO: слова читаются по праву TaskTCB.
+        let mut word = |i: usize| {
+            let args = SyscallArgs::new([0, h_child.bits() as usize, i, 0, 0, 0]);
+            reg.dispatch_number(nums::TASK_LIMITS_INFO, &mut ctx, &args)
+                .unwrap()
+        };
+        assert_eq!(word(0), 8);
+        assert_eq!(word(3) & 0xFFFF_FFFF, 2);
+        assert_eq!(word(3) >> 32, 1);
+        assert_eq!(word(5) & 0xFF, 100);
+    }
+
+    #[test]
+    fn thread_terminate_requires_domain_right() {
+        let (reg, tasks, caps) = default_table_world();
+        let attacker = uuid_next();
+        tasks.create(attacker, TaskPriority::DEFAULT).unwrap();
+        let victim = uuid_next();
+        tasks.create(victim, TaskPriority::DEFAULT).unwrap();
+        let victim_thread = uuid_next();
+        tasks
+            .create_thread(victim_thread, victim, TaskPriority(5), 0x1000, 0x9000)
+            .unwrap();
+
+        // Чужой поток без TaskTCB на его домен — EPERM (v0.9: до —
+        // гашение по голому ThreadId).
+        let mut ctx = crate::syscall::SyscallCtx::core(0, attacker, tasks, caps);
+        let v = victim_thread.as_u128();
+        let args = SyscallArgs::new([0, v as usize, (v >> 64) as usize, 0, 0, 0]);
+        assert_eq!(
+            reg.dispatch_number(nums::THREAD_TERMINATE, &mut ctx, &args),
+            Err(SyscallError::MissingRight)
+        );
+        assert!(
+            tasks
+                .thread_view(&victim_thread)
+                .is_some_and(|t| t.state != TaskState::Dead),
+            "поток жив: прав не было"
+        );
+
+        // С правом — гасится.
+        let _h = grant_tcb(caps, tasks, attacker, victim);
+        assert_eq!(
+            reg.dispatch_number(nums::THREAD_TERMINATE, &mut ctx, &args),
+            Ok(0)
+        );
+        assert!(
+            tasks
+                .thread_view(&victim_thread)
+                .is_some_and(|t| t.state == TaskState::Dead)
+        );
+    }
+
+    #[test]
+    fn priority_ceiling_of_sandbox_blocks_escalation() {
+        let (reg, tasks, caps) = default_table_world();
+        let rogue = uuid_next();
+        tasks.create(rogue, TaskPriority(60)).unwrap();
+        let rogue_thread = uuid_next();
+        tasks
+            .create_thread(rogue_thread, rogue, TaskPriority(60), 0x1000, 0x9000)
+            .unwrap();
+        // Песочница: потолок 80; rogue владеет TaskTCB на себя («своя
+        // кухня» — гейт пройдёт), но квота — нет.
+        tasks
+            .set_limits(
+                &rogue,
+                crate::task::TaskLimits {
+                    max_prio: 80,
+                    ..crate::task::TaskLimits::UNLIMITED
+                },
+            )
+            .unwrap();
+        let _h_self = grant_tcb(caps, tasks, rogue, rogue);
+        let mut ctx = crate::syscall::SyscallCtx::core(0, rogue, tasks, caps);
+        let v = rogue_thread.as_u128();
+        let args = SyscallArgs::new([0, v as usize, (v >> 64) as usize, 255, 0, 0]);
+        assert_eq!(
+            reg.dispatch_number(nums::THREAD_SET_PRIO, &mut ctx, &args),
+            Err(SyscallError::QuotaExceeded)
+        );
+        // Внутри потолка — разрешено.
+        let args = SyscallArgs::new([0, v as usize, (v >> 64) as usize, 80, 0, 0]);
+        assert_eq!(
+            reg.dispatch_number(nums::THREAD_SET_PRIO, &mut ctx, &args),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn spawn_image_from_userspace_pointer() {
+        use crate::hal::traits::kmap::{KMAPInterface, KernelRegion};
+        use crate::hal::traits::mmap::{
+            MMAPInterface, MMAPMemoryFlags, MemErrorCode, PageInfo, PhysADDR, VirtualADDR,
+        };
+        use crate::mem::{
+            ARCPool, MemRouterImpl, MemoryManager, SpaceFactory, UserCopy, install_p_allocator,
+        };
+
+        // Мок MMAP+KMAP: записи фасада без реальных таблиц.
+        #[derive(Clone)]
+        struct SpawnMmap;
+        impl MMAPInterface for SpawnMmap {
+            fn extend_region(
+                &mut self,
+                _a: &llfree::LLFree<'static>,
+                _v: VirtualADDR,
+                p: PhysADDR,
+                n: usize,
+                _f: MMAPMemoryFlags,
+            ) -> Result<PageInfo, MemErrorCode> {
+                Ok(PageInfo::new(p, n))
+            }
+            fn shrink_region(
+                &mut self,
+                _a: &llfree::LLFree<'static>,
+                _v: VirtualADDR,
+                _n: usize,
+            ) -> Result<(), MemErrorCode> {
+                Ok(())
+            }
+        }
+        impl KMAPInterface for SpawnMmap {
+            fn map_kernel_region(&mut self, _r: &KernelRegion) -> Result<(), MemErrorCode> {
+                Ok(())
+            }
+            fn unmap_kernel_region(&mut self, _r: &KernelRegion) -> Result<(), MemErrorCode> {
+                Ok(())
+            }
+        }
+
+        struct TestSpaceFactory(&'static MemoryManager<SpawnMmap, ARCPool>);
+        impl SpaceFactory for TestSpaceFactory {
+            fn create_space(&self, task: TaskId) -> Result<(), MemErrorCode> {
+                self.0
+                    .configure_runtime_spaces(64, 1, VirtualADDR(0x1000_0000));
+                self.0.create_task_space(task, SpawnMmap)
+            }
+            fn destroy_space(&self, task: TaskId) -> Result<(), MemErrorCode> {
+                self.0.destroy_task_space(&task)
+            }
+        }
+
+        /// «Память пользователя»: дескриптор уже собран родителем —
+        /// copyin-канал просто отдаёт байты.
+        struct TestCopy(Vec<u8>);
+        impl UserCopy for TestCopy {
+            fn read_task_bytes(
+                &self,
+                _task: TaskId,
+                _vaddr: usize,
+                out: &mut [u8],
+            ) -> Result<(), MemErrorCode> {
+                out.copy_from_slice(&self.0[..out.len()]);
+                Ok(())
+            }
+        }
+
+        let tasks: &'static TcbManager = Box::leak(Box::new(TcbManager::new().unwrap()));
+        let caps: &'static CapabilityManager =
+            Box::leak(Box::new(CapabilityManager::new().unwrap()));
+        let p_alloc = install_p_allocator(make_llfree_local(2048));
+        let mut mm_box = Box::new(MemoryManager::<SpawnMmap, ARCPool>::new(p_alloc).unwrap());
+        let parent = uuid_next();
+        tasks.create(parent, TaskPriority(80)).unwrap();
+        let facade = mm_box
+            .create_facade(SpawnMmap, 64, 1, VirtualADDR(0x1000_0000))
+            .unwrap();
+        mm_box.bind_facade(parent, &facade);
+        core::mem::forget(facade);
+        let mm: &'static MemoryManager<SpawnMmap, ARCPool> = Box::leak(mm_box);
+        mm.configure_runtime_spaces(64, 1, VirtualADDR(0x1000_0000));
+        let factory: &'static TestSpaceFactory = Box::leak(Box::new(TestSpaceFactory(mm)));
+        let ipc: &'static crate::ipc::IpcManager =
+            Box::leak(Box::new(crate::ipc::IpcManager::new()));
+
+        // Родитель УЖЕ подготовил регион образа (MEM_ALLOC + копия байтов
+        // — в моке байтов нет, есть записи фасада; ядро их только мапит).
+        let router = MemRouterImpl::new(mm);
+        let mut ctx = crate::syscall::SyscallCtx::core(0, parent, tasks, caps)
+            .with_ipc(ipc)
+            .with_memory(&router)
+            .with_space(factory);
+        let seg_src = crate::syscall::SyscallHandler::invoke(
+            &crate::syscall::mem::MemAllocHandler,
+            &mut ctx,
+            &SyscallArgs::new([0, 2, MMAPMemoryFlags::RW.bits() as usize, 0, 0, 0]),
+        )
+        .unwrap();
+
+        // argv-блок — СВОЙ регион родителя (инвариант фасада: одна
+        // физическая страница — одно виртуальное окно в пространстве).
+        let argv_src = crate::syscall::SyscallHandler::invoke(
+            &crate::syscall::mem::MemAllocHandler,
+            &mut ctx,
+            &SyscallArgs::new([0, 1, MMAPMemoryFlags::RW.bits() as usize, 0, 0, 0]),
+        )
+        .unwrap();
+
+        // Дескриптор спавна: 1 сегмент RX + argv-блок.
+        let child = uuid_next();
+        let thread_id = uuid_next();
+        let cv = child.as_u128();
+        let tv = thread_id.as_u128();
+        let push64 = |v: &mut Vec<u8>, x: u64| v.extend_from_slice(&x.to_le_bytes());
+        let mut d = Vec::new();
+        push64(&mut d, 0x4000_1000); // entry (линк-адрес)
+        push64(&mut d, 0x4002_0000); // stack_top
+        push64(&mut d, tv as u64); // thread_id lo
+        push64(&mut d, (tv >> 64) as u64); // thread_id hi
+        d.extend_from_slice(&1u32.to_le_bytes()); // n_segments
+        d.extend_from_slice(&1u32.to_le_bytes()); // argv_pages
+        push64(&mut d, argv_src as u64); // argv_src (свой регион родителя)
+        push64(&mut d, 0x4003_0000u64); // argv_dst
+        push64(&mut d, 24u64); // argv_bytes
+        push64(&mut d, 1u64); // argc
+        push64(&mut d, 8u64); // limits[0]: max_pages = 8
+        push64(&mut d, 2u64); // limits[1]: max_threads = 2
+        push64(&mut d, 4u64); // limits[2]: max_shm = 4
+        push64(&mut d, 100u64); // limits[3]: max_prio = 100, may_spawn = 0
+        d.push(90); // priority
+        while d.len() < SPAWN_DESC_HEADER_BYTES {
+            d.push(0);
+        }
+        // Сегмент: src у родителя, dst — линк-адрес, 2 стр RX.
+        push64(&mut d, seg_src as u64);
+        push64(&mut d, 0x4000_0000u64);
+        push64(&mut d, 2u64);
+        push64(&mut d, MMAPMemoryFlags::RX.bits() as u64);
+        assert_eq!(d.len(), SPAWN_DESC_HEADER_BYTES + SPAWN_DESC_SEGMENT_BYTES);
+
+        let copy: &'static TestCopy = Box::leak(Box::new(TestCopy(d.clone())));
+        let h_self = grant_tcb(caps, tasks, parent, parent);
+        let mut ctx = crate::syscall::SyscallCtx::core(0, parent, tasks, caps)
+            .with_ipc(ipc)
+            .with_memory(&router)
+            .with_space(factory)
+            .with_copy(copy);
+        let args = SyscallArgs::new([
+            0,
+            h_self.bits() as usize,
+            cv as usize,
+            (cv >> 64) as usize,
+            0x1000_0000, // указатель на дескриптор (TestCopy отдаёт байты)
+            d.len(),
+        ]);
+        let ret = crate::syscall::SyscallHandler::invoke(&TaskSpawnImageHandler, &mut ctx, &args)
+            .expect("spawn по готовому образу");
+        assert!(ret > 0, "возврат — хендл TaskTCB(ребёнка)");
+        let h_child = CapHandle(ret as u64);
+        let view = ctx.caps.get(tasks, parent, h_child).unwrap();
+        assert!(matches!(
+            view.cap_ref,
+            ContainerACCCapability::TaskTCB { task_id } if task_id == child
+        ));
+
+        // Домен: приоритет из дескриптора, песочница применена ДО потока.
+        assert_eq!(tasks.get(&child).unwrap().priority, TaskPriority(90));
+        let sec = tasks.sec_view(&child).unwrap();
+        assert_eq!(sec.limits.max_pages, 8);
+        assert_eq!(sec.limits.max_threads, 2);
+        assert!(!sec.limits.may_spawn);
+        assert_eq!(sec.usage.pages, 3, "сегмент (2) + argv (1)");
+
+        // Главный поток: Ready с линк-точкой входа; стартовое IPC —
+        // припарковано (протокол запуска L4, как у init).
+        let tv2 = tasks.thread_view(&thread_id).unwrap();
+        assert_eq!(tv2.state, TaskState::Ready);
+        assert_eq!(tv2.entry, 0x4000_1000);
+        assert_eq!(tv2.stack_top, 0x4002_0000);
+        let parked = tasks
+            .with_thread(&thread_id, |t| t.parked.len())
+            .unwrap_or(0);
+        assert_eq!(parked, 1, "start-args припаркованы в очередь потока");
+        let mm_has_child = mm.has_facade(&child);
+        assert!(mm_has_child, "пространство ребёнка живо у менеджера");
+
+        // Битый размер дескриптора — EINVAL, домен НЕ создан.
+        let ghost = uuid_next();
+        let gv = ghost.as_u128();
+        let args = SyscallArgs::new([
+            0,
+            h_self.bits() as usize,
+            gv as usize,
+            (gv >> 64) as usize,
+            0x1000_0000,
+            SPAWN_DESC_HEADER_BYTES - 8,
+        ]);
+        assert_eq!(
+            crate::syscall::SyscallHandler::invoke(&TaskSpawnImageHandler, &mut ctx, &args),
+            Err(SyscallError::InvalidArgument)
+        );
+        assert!(!tasks.contains(&ghost));
+    }
+
+    /// Локальная мини-LLFree для спавн-теста (та же схема, что mem-тестов).
+    fn make_llfree_local(frames: usize) -> llfree::LLFree<'static> {
+        use llfree::{Alloc, Classing, MetaData};
+        let (cl, _) = Classing::simple(1);
+        let sizes = llfree::LLFree::metadata_size(&cl, frames);
+        let mut local = aligned_box::AlignedBox::slice_from_value(64, sizes.local, 0u8).unwrap();
+        let mut trees = aligned_box::AlignedBox::slice_from_value(64, sizes.trees, 0u8).unwrap();
+        let mut lower = aligned_box::AlignedBox::slice_from_value(64, sizes.lower, 0u8).unwrap();
+        let meta = unsafe {
+            MetaData {
+                local: core::slice::from_raw_parts_mut(local.as_mut_ptr(), local.len()),
+                trees: core::slice::from_raw_parts_mut(trees.as_mut_ptr(), trees.len()),
+                lower: core::slice::from_raw_parts_mut(lower.as_mut_ptr(), lower.len()),
+            }
+        };
+        core::mem::forget((local, trees, lower));
+        llfree::LLFree::new(frames, llfree::Init::FreeAll, &cl, meta).unwrap()
+    }
+
+    #[test]
+    fn cap_send_to_foreign_cspace_requires_tcb_right() {
+        let (reg, tasks, caps) = default_table_world();
+        let attacker = uuid_next();
+        tasks.create(attacker, TaskPriority::DEFAULT).unwrap();
+        let victim = uuid_next();
+        tasks.create(victim, TaskPriority::DEFAULT).unwrap();
+        let h_any = grant_tcb(caps, tasks, attacker, attacker);
+
+        // Отправить capability жертве «по адресу» — нельзя (нет права
+        // на ЕЁ cspace: знание TaskId правом не является).
+        let mut ctx = crate::syscall::SyscallCtx::core(0, attacker, tasks, caps);
+        let vv = victim.as_u128();
+        let args = SyscallArgs::new([
+            0,
+            h_any.bits() as usize,
+            vv as usize,
+            (vv >> 64) as usize,
+            0,
+            0,
+        ]);
+        assert_eq!(
+            reg.dispatch_number(nums::CAP_SEND, &mut ctx, &args),
+            Err(SyscallError::MissingRight)
+        );
+        assert_eq!(tasks.cap_count(&victim).unwrap(), 0, "cspace жертвы пуст");
     }
 
     #[test]

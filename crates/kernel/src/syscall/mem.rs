@@ -16,6 +16,7 @@ use crate::syscall::nums;
 use crate::task::TaskId;
 
 use super::SyscallHandler;
+use super::task::{has_tcb_cap_on, sandbox_audit};
 use super::types::{SyscallArgs, SyscallCtx, SyscallError, SyscallNumber, SyscallRet};
 
 fn task_id_from(lo: usize, hi: usize) -> TaskId {
@@ -34,9 +35,23 @@ impl SyscallHandler for MemAllocHandler {
     fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
         let router = ctx.memory.ok_or(SyscallError::NotSupported)?;
         let pages = args.arg(1);
+        if pages == 0 {
+            return Err(SyscallError::InvalidArgument);
+        }
+        // v0.9: зарядка предела памяти домена ДО аллокации (песочница).
+        if let Err(e) = ctx.tasks.charge_pages(&ctx.task, pages) {
+            sandbox_audit("MEM_ALLOC blocked: page quota");
+            return Err(e.into());
+        }
         let flags = MMAPMemoryFlags::from_bits_retain(args.arg(2) as u8);
-        let vaddr = router.alloc_region(ctx.task, pages, flags)?;
-        Ok(vaddr.0)
+        match router.alloc_region(ctx.task, pages, flags) {
+            Ok(vaddr) => Ok(vaddr.0),
+            Err(e) => {
+                // Откат зарядки: память не выделена — предел не расходован.
+                ctx.tasks.refund_pages(&ctx.task, pages);
+                Err(e.into())
+            }
+        }
     }
 }
 
@@ -49,7 +64,14 @@ impl MemFreeHandler {
 impl SyscallHandler for MemFreeHandler {
     fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
         let router = ctx.memory.ok_or(SyscallError::NotSupported)?;
-        router.free_region(ctx.task, VirtualADDR(args.arg(1)))?;
+        let vaddr = VirtualADDR(args.arg(1));
+        let pages = router.region_at(ctx.task, vaddr).map(|(_, _, pages)| pages);
+        router.free_region(ctx.task, vaddr)?;
+        // v0.9: возврат страниц в предел домена (каков размер региона
+        // был ДО снятия — из снимка выше).
+        if let Some(pages) = pages {
+            ctx.tasks.refund_pages(&ctx.task, pages);
+        }
         Ok(0)
     }
 }
@@ -69,10 +91,76 @@ impl SyscallHandler for MemTransferHandler {
         let pages = args.arg(2);
         let grant = args.arg(3) & 1 != 0;
         let dst = task_id_from(args.arg(4), args.arg(5));
+        // v0.9 ПРАВО: flexpage-окно в чужой домен — только по TaskTCB
+        // получателя (знание TaskId правом не является).
+        if dst != ctx.task && !has_tcb_cap_on(ctx, &dst) {
+            sandbox_audit("MEM_TRANSFER blocked: no TaskTCB on destination");
+            return Err(SyscallError::MissingRight);
+        }
+        // v0.9: зарядка ЦЕЛИ (map и grant одинаково расходуют её предел).
+        if let Err(e) = ctx.tasks.charge_pages(&dst, pages) {
+            sandbox_audit("MEM_TRANSFER blocked: destination page quota");
+            return Err(e.into());
+        }
         // Права отображения: RW по умолчанию (сужение — будущие флаги ABI).
         let flags = MMAPMemoryFlags::RW;
-        let at = router.transfer(dst, 0, ctx.task, src_vaddr, pages, grant, flags)?;
-        Ok(at)
+        match router.transfer(dst, 0, ctx.task, src_vaddr, pages, grant, flags) {
+            Ok(at) => {
+                // Grant: владение кадрами у источника снято — вернуть
+                // страницы в его предел (у цели уже заряжено).
+                if grant {
+                    ctx.tasks.refund_pages(&ctx.task, pages);
+                }
+                Ok(at)
+            }
+            Err(e) => {
+                ctx.tasks.refund_pages(&dst, pages);
+                Err(e.into())
+            }
+        }
+    }
+}
+
+// ==== MEM_MAP_AT (spawn-протокол v0.9) ====
+
+/// Отображение окна своей памяти по фиксированному адресу в чужом
+/// пространстве (родитель грузит ELF/стек/argv ребёнка).
+///
+/// ПРАВО: TaskTCB на цель (гейт, как MEM_TRANSFER). Зарядка — цели.
+pub struct MemMapAtHandler;
+
+impl MemMapAtHandler {
+    pub const SYSCALL: SyscallNumber = nums::MEM_MAP_AT;
+}
+
+impl SyscallHandler for MemMapAtHandler {
+    fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+        let router = ctx.memory.ok_or(SyscallError::NotSupported)?;
+        // 1. ПРАВО: TaskTCB-capability на цель (хендл из cspace вызывающего).
+        let handle = CapHandle(args.arg(1) as u64);
+        let view = ctx.resolve(handle)?;
+        let ContainerACCCapability::TaskTCB { task_id } = view.cap_ref else {
+            return Err(SyscallError::MissingRight);
+        };
+        let src_vaddr = args.arg(2);
+        let pages = args.arg(3);
+        let dst_vaddr = args.arg(4);
+        let flags = MMAPMemoryFlags::from_bits_retain(args.arg(5) as u8);
+        if pages == 0 || dst_vaddr % crate::hal::traits::mmap::PAGE_SIZE != 0 {
+            return Err(SyscallError::InvalidArgument);
+        }
+        // 2. Зарядка предела ЦЕЛИ (песочница считает все входящие окна).
+        if let Err(e) = ctx.tasks.charge_pages(&task_id, pages) {
+            sandbox_audit("MEM_MAP_AT blocked: destination page quota");
+            return Err(e.into());
+        }
+        match router.map_external_at(task_id, ctx.task, src_vaddr, dst_vaddr, pages, flags) {
+            Ok(at) => Ok(at),
+            Err(e) => {
+                ctx.tasks.refund_pages(&task_id, pages);
+                Err(e.into())
+            }
+        }
     }
 }
 
@@ -117,8 +205,24 @@ impl SyscallHandler for ShmCreateHandler {
     fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
         let shm = ctx.shm.ok_or(SyscallError::NotSupported)?;
         let pages = args.arg(1);
-        let id = shm.create(ctx.task, pages)?;
-        Ok(id.as_u64() as usize)
+        // v0.9: пределы домена — кадры региона + счётчик регионов.
+        if let Err(e) = ctx.tasks.charge_pages(&ctx.task, pages) {
+            sandbox_audit("SHM_CREATE blocked: page quota");
+            return Err(e.into());
+        }
+        if let Err(e) = ctx.tasks.charge_shm(&ctx.task) {
+            ctx.tasks.refund_pages(&ctx.task, pages);
+            sandbox_audit("SHM_CREATE blocked: region quota");
+            return Err(e.into());
+        }
+        match shm.create(ctx.task, pages) {
+            Ok(id) => Ok(id.as_u64() as usize),
+            Err(e) => {
+                ctx.tasks.refund_shm(&ctx.task);
+                ctx.tasks.refund_pages(&ctx.task, pages);
+                Err(e.into())
+            }
+        }
     }
 }
 
@@ -132,6 +236,7 @@ impl SyscallHandler for ShmSetupRingHandler {
     fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
         let shm = ctx.shm.ok_or(SyscallError::NotSupported)?;
         let id = ShmId(args.arg(1) as u64);
+        require_shm_owner(ctx, id)?;
         let sq_entries = args.arg(2);
         let cq_entries = args.arg(3);
         let entry_words = args.arg(4);
@@ -150,6 +255,7 @@ impl SyscallHandler for ShmBindDoorbellHandler {
     fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
         let shm = ctx.shm.ok_or(SyscallError::NotSupported)?;
         let id = ShmId(args.arg(1) as u64);
+        require_shm_owner(ctx, id)?;
         let ep = CapHandle(args.arg(2) as u64);
         // Резолв Gate-capability вызывающего -> ObjId.
         let view = ctx.resolve(ep)?;
@@ -172,6 +278,9 @@ impl SyscallHandler for ShmMapHandler {
         let shm = ctx.shm.ok_or(SyscallError::NotSupported)?;
         let router = ctx.memory.ok_or(SyscallError::NotSupported)?;
         let id = ShmId(args.arg(1) as u64);
+        // v0.9: отображать регион — только владельцу (карта чужого региона
+        // по угаданному ShmId — утечка чужой памяти в своё пространство).
+        require_shm_owner(ctx, id)?;
         let flags = MMAPMemoryFlags::from_bits_retain(args.arg(2) as u8);
         shm.map_into(router, ctx.task, id, flags)
             .map_err(|e| e.into())
@@ -187,7 +296,16 @@ impl ShmDestroyHandler {
 impl SyscallHandler for ShmDestroyHandler {
     fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
         let shm = ctx.shm.ok_or(SyscallError::NotSupported)?;
-        shm.destroy(ShmId(args.arg(1) as u64))?;
+        let id = ShmId(args.arg(1) as u64);
+        // v0.9: разрушать регион — только владельцу (чужой destroy —
+        // мгновенный DoS: кадры в пул, пользовательские кольца повисают).
+        require_shm_owner(ctx, id)?;
+        let pages = shm.info(id).map(|i| i.pages);
+        shm.destroy(id)?;
+        ctx.tasks.refund_shm(&ctx.task);
+        if let Some(pages) = pages {
+            ctx.tasks.refund_pages(&ctx.task, pages);
+        }
         Ok(0)
     }
 }
@@ -240,9 +358,26 @@ impl SyscallHandler for RingDoorbellHandler {
         let shm = ctx.shm.ok_or(SyscallError::NotSupported)?;
         let ipc = ctx.ipc.ok_or(SyscallError::NotSupported)?;
         let id = ShmId(args.arg(1) as u64);
+        require_shm_owner(ctx, id)?;
         let word = args.arg(2) as u64;
         shm.doorbell(ipc, ctx.tasks, ctx.caps, id, word)?;
         Ok(0)
+    }
+}
+
+/// ПРАВО v0.9: операция над SHM-регионом — только владельцу (угаданный
+/// ShmId правом не является; доступ к чужой памяти — нарушение изоляции).
+fn require_shm_owner(ctx: &SyscallCtx<'_>, id: ShmId) -> Result<(), SyscallError> {
+    let Some(shm) = ctx.shm else {
+        return Err(SyscallError::NotSupported);
+    };
+    match shm.owner_of(id) {
+        Some(owner) if owner == ctx.task => Ok(()),
+        Some(_) => {
+            sandbox_audit("SHM op blocked: not the region owner");
+            Err(SyscallError::MissingRight)
+        }
+        None => Err(SyscallError::NotFound),
     }
 }
 
@@ -352,6 +487,8 @@ mod tests {
         reg.register(ShmInfoHandler::SYSCALL, &ShmInfoHandler)
             .unwrap();
         reg.register(MemInfoHandler::SYSCALL, &MemInfoHandler)
+            .unwrap();
+        reg.register(MemMapAtHandler::SYSCALL, &MemMapAtHandler)
             .unwrap();
 
         // Обе задачи и фасады — в ОДНОМ менеджере (как в GCTL: сисколы
@@ -477,6 +614,18 @@ mod tests {
         let peer = f.peer;
         assert!(f.mm.has_facade(&peer));
 
+        // v0.9: flexpage-окно в чужой домен — по праву TaskTCB(получателя)
+        // в cspace отправителя (фикстура грейтит, как init ребёнку).
+        use crate::capability::{
+            ActionPermissions, CapabilityBadge, CapabilityGate, ContainerACCCapability,
+        };
+        let gate = CapabilityGate::new(
+            ContainerACCCapability::TaskTCB { task_id: peer },
+            ActionPermissions::all(),
+            CapabilityBadge::FULL,
+        );
+        f.caps.grant(f.tasks, f.task, gate).unwrap();
+
         // Отправитель аллоцирует 4 страницы и передаёт окно получателю.
         let vaddr = dispatch(
             &f,
@@ -507,6 +656,251 @@ mod tests {
                 .is_some()
         );
     }
+    #[test]
+    fn mem_alloc_enforces_sandbox_quota() {
+        let f = fixture();
+        // Песочница: лимит 3 страницы.
+        f.tasks
+            .set_limits(
+                &f.task,
+                crate::task::TaskLimits {
+                    max_pages: 3,
+                    ..crate::task::TaskLimits::UNLIMITED
+                },
+            )
+            .unwrap();
+        let a = |n: usize| {
+            dispatch(
+                &f,
+                &a(
+                    MemAllocHandler::SYSCALL,
+                    [n, MMAPMemoryFlags::RW.bits() as usize, 0, 0, 0],
+                ),
+            )
+        };
+        assert!(a(2).is_ok(), "первая аллокация — в лимите");
+        // 2+2 > 3 — квота отклоняет ДО касания пула.
+        assert_eq!(a(2), Err(SyscallError::QuotaExceeded));
+        assert!(a(1).is_ok(), "ровно до лимита");
+        assert_eq!(a(1), Err(SyscallError::QuotaExceeded));
+        let sec = f.tasks.sec_view(&f.task).unwrap();
+        assert_eq!(sec.usage.pages, 3, "заряжено ровно лимит");
+    }
+
+    #[test]
+    fn mem_alloc_quota_refunded_on_free() {
+        let f = fixture();
+        f.tasks
+            .set_limits(
+                &f.task,
+                crate::task::TaskLimits {
+                    max_pages: 2,
+                    ..crate::task::TaskLimits::UNLIMITED
+                },
+            )
+            .unwrap();
+        let v = dispatch(
+            &f,
+            &a(
+                MemAllocHandler::SYSCALL,
+                [2, MMAPMemoryFlags::RW.bits() as usize, 0, 0, 0],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch(
+                &f,
+                &a(
+                    MemAllocHandler::SYSCALL,
+                    [1, MMAPMemoryFlags::RW.bits() as usize, 0, 0, 0]
+                ),
+            ),
+            Err(SyscallError::QuotaExceeded)
+        );
+        dispatch(&f, &a(MemFreeHandler::SYSCALL, [v, 0, 0, 0, 0])).unwrap();
+        assert!(
+            dispatch(
+                &f,
+                &a(
+                    MemAllocHandler::SYSCALL,
+                    [1, MMAPMemoryFlags::RW.bits() as usize, 0, 0, 0]
+                ),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn mem_transfer_requires_tcb_on_peer() {
+        let f = fixture();
+        let vaddr = dispatch(
+            &f,
+            &a(
+                MemAllocHandler::SYSCALL,
+                [4, MMAPMemoryFlags::RW.bits() as usize, 0, 0, 0],
+            ),
+        )
+        .unwrap();
+        let pv = f.peer.as_u128();
+        // Без TaskTCB(peer) — EPERM (v0.9: раньше окно уходило любому,
+        // кто знает TaskId получателя).
+        assert_eq!(
+            dispatch(
+                &f,
+                &a(
+                    MemTransferHandler::SYSCALL,
+                    [vaddr, 2, 0, pv as usize, (pv >> 64) as usize]
+                ),
+            ),
+            Err(SyscallError::MissingRight)
+        );
+        // Квота цели не тронута: отказ до зарядки.
+        assert_eq!(f.tasks.sec_view(&f.peer).unwrap().usage.pages, 0);
+    }
+
+    #[test]
+    fn mem_map_at_maps_window_at_fixed_addr() {
+        let f = fixture();
+        // Право на peer (как init — ребёнку).
+        use crate::capability::{
+            ActionPermissions, CapabilityBadge, CapabilityGate, ContainerACCCapability,
+        };
+        let gate = CapabilityGate::new(
+            ContainerACCCapability::TaskTCB { task_id: f.peer },
+            ActionPermissions::all(),
+            CapabilityBadge::FULL,
+        );
+        let h_peer = f.caps.grant(f.tasks, f.task, gate).unwrap();
+
+        // Источник: 2 страницы у отправителя (мок-фасад: записи без
+        // реальных host-отображений — писать в vaddr из теста нельзя).
+        let vaddr = dispatch(
+            &f,
+            &a(
+                MemAllocHandler::SYSCALL,
+                [2, MMAPMemoryFlags::RW.bits() as usize, 0, 0, 0],
+            ),
+        )
+        .unwrap();
+
+        // MAP_AT по фиксированному адресу peer-пространства.
+        let at = dispatch(
+            &f,
+            &a(
+                MemMapAtHandler::SYSCALL,
+                [
+                    h_peer.bits() as usize,
+                    vaddr,
+                    2,
+                    0x2000_0000,
+                    MMAPMemoryFlags::RW.bits() as usize,
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(at, 0x2000_0000);
+        // Окно у источника живо (кадры — его собственность).
+        assert!(
+            f.mm.with_facade(&f.task, |fl| fl.region_at(VirtualADDR(vaddr)))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn mem_map_at_charges_destination_quota() {
+        let f = fixture();
+        use crate::capability::{
+            ActionPermissions, CapabilityBadge, CapabilityGate, ContainerACCCapability,
+        };
+        let gate = CapabilityGate::new(
+            ContainerACCCapability::TaskTCB { task_id: f.peer },
+            ActionPermissions::all(),
+            CapabilityBadge::FULL,
+        );
+        let h_peer = f.caps.grant(f.tasks, f.task, gate).unwrap();
+        // Песочница PEER: 1 страница.
+        f.tasks
+            .set_limits(
+                &f.peer,
+                crate::task::TaskLimits {
+                    max_pages: 1,
+                    ..crate::task::TaskLimits::UNLIMITED
+                },
+            )
+            .unwrap();
+        let vaddr = dispatch(
+            &f,
+            &a(
+                MemAllocHandler::SYSCALL,
+                [2, MMAPMemoryFlags::RW.bits() as usize, 0, 0, 0],
+            ),
+        )
+        .unwrap();
+        // 2 страницы в цель с квотой 1 — QuotaExceeded.
+        assert_eq!(
+            dispatch(
+                &f,
+                &a(
+                    MemMapAtHandler::SYSCALL,
+                    [
+                        h_peer.bits() as usize,
+                        vaddr,
+                        2,
+                        0x2000_0000,
+                        MMAPMemoryFlags::RW.bits() as usize
+                    ]
+                ),
+            ),
+            Err(SyscallError::QuotaExceeded)
+        );
+        // 1 страница — ок.
+        assert!(
+            dispatch(
+                &f,
+                &a(
+                    MemMapAtHandler::SYSCALL,
+                    [
+                        h_peer.bits() as usize,
+                        vaddr,
+                        1,
+                        0x2000_0000,
+                        MMAPMemoryFlags::RW.bits() as usize
+                    ]
+                ),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn shm_destroy_is_owner_only() {
+        let f = fixture();
+        // Владелец создаёт регион.
+        let id = dispatch(&f, &a(ShmCreateHandler::SYSCALL, [1, 0, 0, 0, 0])).unwrap() as u64;
+        // Чужая задача (peer) пытается разрушить по угаданному id.
+        let pv = f.peer.as_u128();
+        let router = MemRouterImpl::new(f.mm);
+        let mut c = SyscallCtx::core(0, f.peer, f.tasks, f.caps)
+            .with_shm(f.shm)
+            .with_memory(&router);
+        let args = SyscallArgs::new([0, id as usize, 0, 0, 0, 0]);
+        assert_eq!(
+            f.reg
+                .dispatch_number(ShmDestroyHandler::SYSCALL, &mut c, &args),
+            Err(SyscallError::MissingRight)
+        );
+        assert_eq!(f.shm.count(), 1, "регион жив: destroy без права не прошёл");
+        // Владелец — разрушает; квота страницы возвращается.
+        assert!(
+            dispatch(
+                &f,
+                &a(ShmDestroyHandler::SYSCALL, [id as usize, 0, 0, 0, 0])
+            )
+            .is_ok()
+        );
+        assert_eq!(f.shm.count(), 0);
+    }
+
     #[test]
     fn mem_info_reports_region() {
         let f = fixture();

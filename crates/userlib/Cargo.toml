@@ -10,5 +10,7 @@ description = "C-ABI интероп-библиотека пользовател�
 # адрес 0x40000000 < 2^31 — все формы адресации работают).
 
 [lib]
-crate-type = ["staticlib"]
+# staticlib — для C (gcc -nostdlib); rlib — для Rust-приложений крейта
+# (crates/rogue: sandbox-демо), тот же код.
+crate-type = ["staticlib", "rlib"]
 name = "userlib"

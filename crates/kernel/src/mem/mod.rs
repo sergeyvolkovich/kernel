@@ -1,9 +1,9 @@
 use alloc::collections::BTreeMap;
 use attachable_slab_allocator::{SlabBox, SlabCache, locks::SpinLock};
-use core::cell::{RefCell, UnsafeCell};
+use core::cell::{Cell, RefCell, UnsafeCell};
 use heapless::{arc_pool, pool::arc::ArcPool};
 use llfree::LLFree;
-use spin::{LazyLock, Once};
+use spin::{LazyLock, Mutex, Once};
 
 /// Владеющий `Arc` и `ArcBlock` из heapless-пула (общие типы физического
 /// аллокатора у всех фасадов крейта; ре-экспорт, чтобы внешнему коду
@@ -109,6 +109,67 @@ pub trait MemRouter {
         grant: bool,
         flags: MMAPMemoryFlags,
     ) -> Result<usize, MemErrorCode>;
+
+    /// Отобразить внешние кадры (окно региона задачи `src`) в пространство
+    /// задачи `dst` по ФИКСИРОВАННОМУ адресу (spawn-протокол v0.9:
+    /// MEM_MAP_AT — родитель кладёт ELF-сегменты/стек/argv ребёнка).
+    /// Кадры остаются собственностью источника (запись `external = true`
+    /// у получателя: смерть цели их НЕ возвращает пулу).
+    /// Возврат: `dst_vaddr` (тот же, что запросили).
+    fn map_external_at(
+        &self,
+        dst: crate::task::TaskId,
+        src: crate::task::TaskId,
+        src_vaddr: usize,
+        dst_vaddr: usize,
+        pages: usize,
+        flags: MMAPMemoryFlags,
+    ) -> Result<usize, MemErrorCode>;
+}
+
+// ==== Фабрика адресных пространств (v0.9) ====
+
+/// Создание/разрушение пользовательских адресных пространств в рантайме
+/// (TASK_CREATE порождает домен СО пространством; смерть домена —
+/// разрушение пространства).
+///
+/// Тип-стёртый сервисный контракт (как [`MemRouter`]): syscall-слой не
+/// знает параметр MMAP платформы. Реализует startup-обёртка над GCTL
+/// (геометрия окна/стек — политика платформы). Отсутствие фабрики —
+/// TASK_CREATE создаёт «голый» домен без пространства (совместимость).
+pub trait SpaceFactory {
+    /// Создать и привязать пространство задачи. Идемпотентность НЕ
+    /// гарантируется: повторный вызов для живой задачи — ошибка
+    /// `AlreadyMapped`-класса на усмотрение реализации.
+    fn create_space(&self, task: crate::task::TaskId) -> Result<(), MemErrorCode>;
+
+    /// Разрушить пространство задачи (unbind + дроп фасада; записи с
+    /// `external = false` возвращают кадры пулу). Кос TASK_CREATE не
+    /// вызывает. Инициализационные пространства (kinit) могут быть
+    /// «вечными» — их разрушение возвращает ошибку.
+    fn destroy_space(&self, task: crate::task::TaskId) -> Result<(), MemErrorCode>;
+}
+
+// ==== Чтение памяти задач из ядра (v0.9) ====
+
+/// Канал «ядро читает память задачи» (copyin-примитив без промотирования
+/// страниц ядра): физика региона — через [`MemRouter`], байты — через
+/// direct-map платформы. Единственный на сегодня пользователь —
+/// TASK_SPAWN_IMAGE (чтение спавн-дескриптора из памяти родителя);
+/// будущие протоколы (серверы конфигурации, copyout) — тот же контракт.
+///
+/// Отсутствие сервиса — сисколы, требующие чтения памяти пользователя,
+/// отвечают ENOSYS (платформа без direct-map — совместимость).
+pub trait UserCopy {
+    /// Прочитать `out.len()` байт задачи `task` по адресу `vaddr`.
+    /// Отказ — адрес вне регионов задачи ИЛИ окно выходит за регион
+    /// (дескриптор не может «читать за» отведённую страницу).
+    fn read_task_bytes(
+        &self,
+        task: crate::task::TaskId,
+        vaddr: usize,
+        out: &mut [u8],
+    ) -> Result<(), MemErrorCode>;
 }
 
 struct APXCTL(UnsafeCell<ArcBlock<LLFree<'static>>>);
@@ -168,14 +229,17 @@ pub fn install_p_allocator(p_allocator: LLFree<'static>) -> Arc<ARCPool> {
 
 pub struct MemoryManager<MmapWraper: MMAPInterface, AP: ArcPool<Data = LLFree<'static>>> {
     p_allocator: Arc<AP>,
-    allocator: SlabCache<UFacade<MmapWraper, AP>, SpinLock, FACADE_SLAB_SIZE>,
+    /// Слот-кэш фасадов. Mutex — интерьерная мутабельность: РАНТАЙМ-пути
+    /// (v0.9 `create_task_space` из syscall-контекста через &self)
+    /// берут lock; пути с &mut self (kinit/тесты) — `get_mut` без лока.
+    allocator: spin::Mutex<SlabCache<UFacade<MmapWraper, AP>, SpinLock, FACADE_SLAB_SIZE>>,
     /// Таблица адресного пространства ядра (KMAP) с политикой изоляции.
     /// Влияет только на фасады, созданные после установки (`create_ufacade`):
     /// каждый новый UMAP получает из неё ядро ОС с учётом Meltdown/Spectre.
     kmap: KMap,
     /// Пул тегов ASID/PCID для тегированных фасадов (KPTI без сброса TLB).
     ///
-    /// `None` (дефолт) — платформа не регистрировала пул: тегированные пути
+    /// `None` (дефолт) — платформа не регистрировала пул: тегированные фасады
     /// ([`Self::create_ufacade_asid`]) отказывают, нетегированные работают
     /// как раньше. Пул — `&'static dyn` (глобальный сервис, как планировщик
     /// у `TcbManager`): время жизни ≥ времени жизни менеджера.
@@ -188,6 +252,17 @@ pub struct MemoryManager<MmapWraper: MMAPInterface, AP: ArcPool<Data = LLFree<'s
     /// ссылке; однопоточный контракт крейта — тот же рефлекс, что
     /// UnsafeRef в интрузивных контейнерах).
     facades: RefCell<BTreeMap<crate::task::TaskId, *mut UFacade<MmapWraper, AP>>>,
+    /// Рантайм-фасады v0.9 (владение менеджером): TASK_CREATE-порождённые
+    /// пространства. Фасад инициализации (kinit/платформа) здесь НЕ лежит
+    /// — он «вечный» (leak), разрушение — платформенная ответственность.
+    owned: RefCell<BTreeMap<crate::task::TaskId, FacadeBox<MmapWraper, AP>>>,
+    /// Геометрия рантайм-пространств (копится с первого `configure_spaces`):
+    /// окно фасада (страниц) + базы. Политика платформы, устанавливается
+    /// startup-кодом ДО первого TASK_CREATE.
+    runtime_window_pages: Cell<usize>,
+    runtime_cpu_count: Cell<usize>,
+    runtime_base: Cell<VirtualADDR>,
+    runtime_geometry_set: Cell<bool>,
 }
 
 impl<MmapWraper: MMAPInterface, AP: ArcPool<Data = LLFree<'static>>> MemoryManager<MmapWraper, AP> {
@@ -200,13 +275,18 @@ impl<MmapWraper: MMAPInterface, AP: ArcPool<Data = LLFree<'static>>> MemoryManag
     pub fn new(p_allocator: Arc<AP>) -> Result<Self, MemErrorCode> {
         Ok(Self {
             p_allocator,
-            allocator: SlabCache::new().map_err(MemErrorCode::SlabError)?,
+            allocator: Mutex::new(SlabCache::new().map_err(MemErrorCode::SlabError)?),
             // Безопасный дефолт: KPTI-изоляция включена, таблица пуста.
             // Пока платформа не докажет обратное (см. IsolationPolicy),
             // крейт не доверяет железу.
             kmap: KMap::new(IsolationPolicy::conservative()),
             asid_allocator: None,
             facades: RefCell::new(BTreeMap::new()),
+            owned: RefCell::new(BTreeMap::new()),
+            runtime_window_pages: Cell::new(0),
+            runtime_cpu_count: Cell::new(1),
+            runtime_base: Cell::new(VirtualADDR(0)),
+            runtime_geometry_set: Cell::new(false),
         })
     }
 
@@ -408,11 +488,99 @@ impl<MmapWraper: MMAPInterface, AP: ArcPool<Data = LLFree<'static>>> MemoryManag
         // Слот из кэша неинициализирован: инициализируем записью значения,
         // после чего бокс становится его единственным владельцем (дроп бокса
         // выполнит `drop_in_place::<UFacade>` и вернёт слот в кэш).
-        let slot = self.allocator.alloc()?; // SlabError -> MemErrorCode (#[from])
+        // Mutex::get_mut: путь &mut self — без блокировки.
+        let slot = self.allocator.get_mut().alloc()?; // SlabError -> MemErrorCode (#[from])
         // SAFETY: `SlabCache::alloc` отдаёт неинициализированную память;
         // значение записывается здесь же, до любого разыменования бокса.
         unsafe { core::ptr::write(slot.as_ptr(), facade) };
         Ok(slot)
+    }
+
+    // ==== Рантайм-пространства v0.9 (TASK_CREATE/смерть домена) ====
+
+    /// Задать геометрию рантайм-пространств (политика платформы:
+    /// окно фасада/число CPU/база — те же константы, что у фасада init).
+    /// Вызывается startup-кодом один раз, ДО первого TASK_CREATE.
+    pub fn configure_runtime_spaces(
+        &self,
+        window_pages: usize,
+        cpu_count: usize,
+        base: VirtualADDR,
+    ) {
+        self.runtime_window_pages.set(window_pages);
+        self.runtime_cpu_count.set(cpu_count);
+        self.runtime_base.set(base);
+        self.runtime_geometry_set.set(true);
+    }
+
+    /// Создать адресное пространство задачи в РАНТАЙМЕ (через &self —
+    /// интерьерная мутабельность: slab-кэш под Mutex, привязки под
+    /// RefCell; однопоточный контракт крейта сохраняется).
+    ///
+    /// Владение фасадом переходит менеджеру (`owned`): при смерти домена
+    /// [`Self::destroy_task_space`] дропает бокс — записи фасада с
+    /// `external = false` возвращают кадры пулу, `external = true`
+    /// (map_at-окна родителя) остаются за источником (L4 pager-модель).
+    pub fn create_task_space(
+        &self,
+        task: crate::task::TaskId,
+        mmap_interface: MmapWraper,
+    ) -> Result<(), MemErrorCode>
+    where
+        MmapWraper: KMAPInterface,
+    {
+        if !self.runtime_geometry_set.get() {
+            return Err(MemErrorCode::InvalidArgument(
+                "runtime space geometry is not configured",
+            ));
+        }
+        if self.has_facade(&task) {
+            return Err(MemErrorCode::AlreadyMapped);
+        }
+        let facade = UFacade::new_with_kernel(
+            self.p_allocator.clone(),
+            mmap_interface,
+            self.runtime_window_pages.get(),
+            self.runtime_cpu_count.get(),
+            self.runtime_base.get(),
+            &self.kmap,
+        )?;
+        // Слот под Mutex (рантайм-путь): alloc() возвращает ВЛАДЕЮЩИЙ бокс
+        // неинициализированного слота — та же схема, что write_facade_slot.
+        let slot = self.allocator.lock().alloc()?;
+        // SAFETY: слот неинициализирован; значение записывается здесь же,
+        // до любого разыменования — контракт `SlabCache::alloc`.
+        unsafe { core::ptr::write(slot.as_ptr(), facade) };
+        // Привязка ДО помещения во владение: с этой точки сисколы
+        // памяти задачи находят фасад; ошибка ниже откатит привязку.
+        let ptr = slot.as_ptr() as *mut UFacade<MmapWraper, AP>;
+        self.facades.borrow_mut().insert(task, ptr);
+        self.owned.borrow_mut().insert(task, slot);
+        Ok(())
+    }
+
+    /// Разрушить рантайм-пространство задачи (unbind + дроп фасада;
+    /// кадры owned-записей фасада вернутся пулу). Отказ — пространства
+    /// нет ИЛИ оно не рантайм-ное (kinit-фасад «вечный»: владение не у
+    /// менеджера).
+    pub fn destroy_task_space(&self, task: &crate::task::TaskId) -> Result<(), MemErrorCode> {
+        let removed = self.owned.borrow_mut().remove(task);
+        match removed {
+            Some(_box) => {
+                // Сначала снятие привязки (контракт bind/unbind), затем
+                // дроп бокса-владельца (порядок: пользователь уже мёртв,
+                // сисколы этого фасада больше не приходят).
+                self.unbind_facade(task);
+                drop(_box);
+                Ok(())
+            }
+            None => Err(MemErrorCode::NotFound),
+        }
+    }
+
+    /// Число рантайм-пространств под владением менеджера (аудит).
+    pub fn owned_space_count(&self) -> usize {
+        self.owned.borrow().len()
     }
 }
 
@@ -526,5 +694,42 @@ impl<MMAP: MMAPInterface> MemRouter for MemRouterImpl<'_, MMAP> {
                 .unwrap_or(Err(MemErrorCode::NotFound))?;
         }
         Ok(dst_vaddr.0)
+    }
+
+    fn map_external_at(
+        &self,
+        dst: crate::task::TaskId,
+        src: crate::task::TaskId,
+        src_vaddr: usize,
+        dst_vaddr: usize,
+        pages: usize,
+        flags: MMAPMemoryFlags,
+    ) -> Result<usize, MemErrorCode> {
+        if pages == 0 {
+            return Err(MemErrorCode::InvalidArgument("pages must be > 0"));
+        }
+        // 1. Физика источника: окно региона, содержащего src_vaddr
+        //    (выравнивание вниз до база региона — как transfer).
+        let (v_base, p_base, region_pages) = self
+            .region_info(src, VirtualADDR(src_vaddr))
+            .ok_or(MemErrorCode::NotFound)?;
+        let page_off = (src_vaddr - v_base.0) / crate::hal::traits::mmap::PAGE_SIZE;
+        if src_vaddr < v_base.0
+            || page_off + pages > region_pages
+            || (src_vaddr - v_base.0) % crate::hal::traits::mmap::PAGE_SIZE != 0
+        {
+            return Err(MemErrorCode::InvalidArgument(
+                "map_at window exceeds source region",
+            ));
+        }
+        let window_paddr = PhysADDR(p_base.0 + page_off * crate::hal::traits::mmap::PAGE_SIZE);
+        // 2. Фиксированное отображение у получателя (external = true:
+        //    кадры — собственность источника, смерть цели их не тронет).
+        self.mm
+            .with_facade(&dst, |f| {
+                f.map_fixed(VirtualADDR(dst_vaddr), window_paddr, pages, flags, true)
+            })
+            .unwrap_or(Err(MemErrorCode::NotFound))?;
+        Ok(dst_vaddr)
     }
 }

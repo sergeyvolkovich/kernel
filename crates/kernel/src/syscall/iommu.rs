@@ -9,13 +9,15 @@
 // X86Platform::run; без установленного сервиса все хендлеры — ENOSYS
 // (честный отказ, не паника).
 //
-// Права (v0.6): BDF передаётся напрямую, claim-гейт устройства —
-// следующая итерация (политика: IOMMU-операции на устройстве требуют
-// живой claim того же BDF; сейчас доверяем вызывающему домену).
+// Права (v0.9): ВСЯ группа 0x80 гейтована мастер-capability IommuAdmin
+// (выдаёт ядро доверенным задачам: init — менеджер устройств; сектор
+// предоставляет DeviceReference+claim отдельно). До v0.9 хендлеры не
+// проверяли права вовсе — любой домен мог репрограммировать IOMMU.
 
 use spin::Once;
 
 use crate::hal::traits::iommu::IommuError;
+use crate::syscall::task::{has_iommu_admin, sandbox_audit};
 use crate::syscall::types::{SyscallArgs, SyscallError, SyscallNumber, SyscallRet};
 use crate::syscall::{SyscallCtx, SyscallHandler};
 
@@ -161,7 +163,14 @@ impl IommuEnumHandler {
 }
 
 impl SyscallHandler for IommuEnumHandler {
-    fn invoke(&self, _ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+    fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+        // v0.9 ПРАВО: группа 0x80 — только держателям мастер-гранта
+        // IommuAdmin (выдаёт ядро: init — менеджер устройств).
+        if !has_iommu_admin(ctx) {
+            sandbox_audit("IOMMU op blocked: no IommuAdmin capability");
+            return Err(SyscallError::MissingRight);
+        }
+
         let Some(svc) = service() else {
             return Err(SyscallError::NotSupported);
         };
@@ -199,7 +208,14 @@ impl IommuAttachHandler {
 }
 
 impl SyscallHandler for IommuAttachHandler {
-    fn invoke(&self, _ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+    fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+        // v0.9 ПРАВО: группа 0x80 — только держателям мастер-гранта
+        // IommuAdmin (выдаёт ядро: init — менеджер устройств).
+        if !has_iommu_admin(ctx) {
+            sandbox_audit("IOMMU op blocked: no IommuAdmin capability");
+            return Err(SyscallError::MissingRight);
+        }
+
         let Some(svc) = service() else {
             return Err(SyscallError::NotSupported);
         };
@@ -225,7 +241,14 @@ impl IommuMapHandler {
 }
 
 impl SyscallHandler for IommuMapHandler {
-    fn invoke(&self, _ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+    fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+        // v0.9 ПРАВО: группа 0x80 — только держателям мастер-гранта
+        // IommuAdmin (выдаёт ядро: init — менеджер устройств).
+        if !has_iommu_admin(ctx) {
+            sandbox_audit("IOMMU op blocked: no IommuAdmin capability");
+            return Err(SyscallError::MissingRight);
+        }
+
         let Some(svc) = service() else {
             return Err(SyscallError::NotSupported);
         };
@@ -252,7 +275,14 @@ impl IommuUnmapHandler {
 }
 
 impl SyscallHandler for IommuUnmapHandler {
-    fn invoke(&self, _ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+    fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+        // v0.9 ПРАВО: группа 0x80 — только держателям мастер-гранта
+        // IommuAdmin (выдаёт ядро: init — менеджер устройств).
+        if !has_iommu_admin(ctx) {
+            sandbox_audit("IOMMU op blocked: no IommuAdmin capability");
+            return Err(SyscallError::MissingRight);
+        }
+
         let Some(svc) = service() else {
             return Err(SyscallError::NotSupported);
         };
@@ -276,7 +306,14 @@ impl IommuDetachHandler {
 }
 
 impl SyscallHandler for IommuDetachHandler {
-    fn invoke(&self, _ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+    fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+        // v0.9 ПРАВО: группа 0x80 — только держателям мастер-гранта
+        // IommuAdmin (выдаёт ядро: init — менеджер устройств).
+        if !has_iommu_admin(ctx) {
+            sandbox_audit("IOMMU op blocked: no IommuAdmin capability");
+            return Err(SyscallError::MissingRight);
+        }
+
         let Some(svc) = service() else {
             return Err(SyscallError::NotSupported);
         };
@@ -300,7 +337,14 @@ impl IommuIrqMapHandler {
 }
 
 impl SyscallHandler for IommuIrqMapHandler {
-    fn invoke(&self, _ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+    fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+        // v0.9 ПРАВО: группа 0x80 — только держателям мастер-гранта
+        // IommuAdmin (выдаёт ядро: init — менеджер устройств).
+        if !has_iommu_admin(ctx) {
+            sandbox_audit("IOMMU op blocked: no IommuAdmin capability");
+            return Err(SyscallError::MissingRight);
+        }
+
         let Some(svc) = service() else {
             return Err(SyscallError::NotSupported);
         };
@@ -325,7 +369,14 @@ impl IommuIrqUnmapHandler {
 }
 
 impl SyscallHandler for IommuIrqUnmapHandler {
-    fn invoke(&self, _ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+    fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+        // v0.9 ПРАВО: группа 0x80 — только держателям мастер-гранта
+        // IommuAdmin (выдаёт ядро: init — менеджер устройств).
+        if !has_iommu_admin(ctx) {
+            sandbox_audit("IOMMU op blocked: no IommuAdmin capability");
+            return Err(SyscallError::MissingRight);
+        }
+
         let Some(svc) = service() else {
             return Err(SyscallError::NotSupported);
         };
@@ -494,6 +545,19 @@ mod tests {
         task: TaskId,
         thread: ThreadId,
     ) -> SyscallCtx<'a> {
+        // v0.9: группа 0x80 гейтована мастер-грантом IommuAdmin —
+        // тестовый домен получает его, как init в kinit.
+        if !tasks.contains(&task) {
+            tasks
+                .create(task, crate::task::TaskPriority::DEFAULT)
+                .unwrap();
+        }
+        let gate = crate::capability::CapabilityGate::new(
+            crate::capability::ContainerACCCapability::IommuAdmin,
+            crate::capability::ActionPermissions::all(),
+            crate::capability::CapabilityBadge::FULL,
+        );
+        let _ = caps.grant(tasks, task, gate);
         SyscallCtx::core(5, task, tasks, caps).with_thread(thread)
     }
 
@@ -501,8 +565,11 @@ mod tests {
     fn enum_words() {
         ensure_svc();
         let r = registry_with_iommu();
-        let tasks = TcbManager::new().unwrap();
-        let caps = CapabilityManager::new().unwrap();
+        // Leaked-менеджеры: IommuAdmin-грант живёт до конца процесса
+        // (контракт drop TcbManager: cspace обязан опустеть раньше).
+        let tasks: &'static TcbManager = Box::leak(Box::new(TcbManager::new().unwrap()));
+        let caps: &'static CapabilityManager =
+            Box::leak(Box::new(CapabilityManager::new().unwrap()));
         let id = TaskId::from_u128(0x9001);
         let mut ctx = ctx_of(&tasks, &caps, id, id);
         assert_eq!(
@@ -545,8 +612,11 @@ mod tests {
     fn attach_map_unmap_detach_cycle() {
         ensure_svc();
         let r = registry_with_iommu();
-        let tasks = TcbManager::new().unwrap();
-        let caps = CapabilityManager::new().unwrap();
+        // Leaked-менеджеры: IommuAdmin-грант живёт до конца процесса
+        // (контракт drop TcbManager: cspace обязан опустеть раньше).
+        let tasks: &'static TcbManager = Box::leak(Box::new(TcbManager::new().unwrap()));
+        let caps: &'static CapabilityManager =
+            Box::leak(Box::new(CapabilityManager::new().unwrap()));
         let id = TaskId::from_u128(0x9002);
         let mut ctx = ctx_of(&tasks, &caps, id, id);
         let dev = r
@@ -626,8 +696,11 @@ mod tests {
     fn irq_map_unmap_cycle() {
         ensure_svc();
         let r = registry_with_iommu();
-        let tasks = TcbManager::new().unwrap();
-        let caps = CapabilityManager::new().unwrap();
+        // Leaked-менеджеры: IommuAdmin-грант живёт до конца процесса
+        // (контракт drop TcbManager: cspace обязан опустеть раньше).
+        let tasks: &'static TcbManager = Box::leak(Box::new(TcbManager::new().unwrap()));
+        let caps: &'static CapabilityManager =
+            Box::leak(Box::new(CapabilityManager::new().unwrap()));
         let id = TaskId::from_u128(0x9004);
         let mut ctx = ctx_of(&tasks, &caps, id, id);
         let dev = r
@@ -687,8 +760,11 @@ mod tests {
     fn default_table_contains_iommu() {
         ensure_svc();
         let r = registry_with_iommu();
-        let tasks = TcbManager::new().unwrap();
-        let caps = CapabilityManager::new().unwrap();
+        // Leaked-менеджеры: IommuAdmin-грант живёт до конца процесса
+        // (контракт drop TcbManager: cspace обязан опустеть раньше).
+        let tasks: &'static TcbManager = Box::leak(Box::new(TcbManager::new().unwrap()));
+        let caps: &'static CapabilityManager =
+            Box::leak(Box::new(CapabilityManager::new().unwrap()));
         let id = TaskId::from_u128(0x9003);
         let mut ctx = ctx_of(&tasks, &caps, id, id);
         // Дефолтная таблица диспетчеризует IOMMU-группу (без сервиса —

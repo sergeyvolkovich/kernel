@@ -96,6 +96,111 @@ pub struct TaskView {
     pub priority: TaskPriority,
 }
 
+// ==== Атрибуты песочницы v0.9 (rlimit-стиль в GTCB) ====
+//
+// Песочница задачи — это НАБОР ПРЕДЕЛОВ в её TCB (задача-домен = GTCB
+// rust-l4: cspace + адресное пространство + атрибуты защиты). Лимиты
+// назначает держатель TaskTCB-права на домен (родитель — порождённому),
+// семантика изменения — «трещотка»: значения можно только УЖЕСТОЧАТЬ
+// (уменьшить предел, снять право), поэтому даже задача, владеющая
+// TaskTCB на САМУЮ СЕБЯ, не может расширить собственную песочницу.
+// usize::MAX — «без предела» (дефолт: доверенные службы ядра).
+
+/// Пределы задачи (атрибуты песочницы в GTCB). `usize::MAX` = без лимита.
+///
+/// Поля-числа — верхние границы потребления; `may_spawn` — право творца
+/// (L4: holder TaskTCB на себя) — НЕ наследуется порождёнными доменами
+/// автоматически, гасится родителем явно.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskLimits {
+    /// Память: максимум страниц (MEM_ALLOC + входящие map/transfer/SHM).
+    pub max_pages: usize,
+    /// Потоки: максимум живых потоков домена (THREAD_CREATE).
+    pub max_threads: usize,
+    /// Endpoint'ы: максимум живых Gate-capability (EP_CREATE).
+    pub max_endpoints: usize,
+    /// SHM-регионы: максимум одновременных (SHM_CREATE).
+    pub max_shm: usize,
+    /// Capability: максимум живых хендлов в cspace (grant/mint/send).
+    pub max_caps: usize,
+    /// Приоритет: потолок для THREAD_SET_PRIO/TASK приоритета (0..=255).
+    pub max_prio: u8,
+    /// Право творца: разрешено ли TASK_CREATE (создание новых доменов).
+    pub may_spawn: bool,
+}
+
+impl TaskLimits {
+    /// Доверенная задача: без песочницы (все пределы сняты).
+    pub const UNLIMITED: Self = Self {
+        max_pages: usize::MAX,
+        max_threads: usize::MAX,
+        max_endpoints: usize::MAX,
+        max_shm: usize::MAX,
+        max_caps: usize::MAX,
+        max_prio: u8::MAX,
+        may_spawn: true,
+    };
+
+    /// Ужесточение (трещотка): каждое числовое поле — минимум из пары,
+    /// `may_spawn` — логическое И. Итог никогда слабее текущего не будет.
+    pub const fn tighten(&self, other: &Self) -> Self {
+        Self {
+            max_pages: if other.max_pages < self.max_pages {
+                other.max_pages
+            } else {
+                self.max_pages
+            },
+            max_threads: if other.max_threads < self.max_threads {
+                other.max_threads
+            } else {
+                self.max_threads
+            },
+            max_endpoints: if other.max_endpoints < self.max_endpoints {
+                other.max_endpoints
+            } else {
+                self.max_endpoints
+            },
+            max_shm: if other.max_shm < self.max_shm {
+                other.max_shm
+            } else {
+                self.max_shm
+            },
+            max_caps: if other.max_caps < self.max_caps {
+                other.max_caps
+            } else {
+                self.max_caps
+            },
+            max_prio: if other.max_prio < self.max_prio {
+                other.max_prio
+            } else {
+                self.max_prio
+            },
+            may_spawn: self.may_spawn && other.may_spawn,
+        }
+    }
+}
+
+/// Текущее потребление задачи (учёт для пределов; копия-снимок для аудита).
+///
+/// Поля-счётчики ведёт ядро в точках зарядки (сисколы памяти/IPC);
+/// категория «endpoints» не хранится — она вычисляется по живым
+/// Gate-capability cspace (cчётчик разошёлся бы с реальностью при
+/// CAP_DELETE/CAP_REVOKE гейта).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TaskUsage {
+    /// Заряжено страниц (MEM_ALLOC + входящие окна map/transfer/SHM).
+    pub pages: usize,
+    /// Живые SHM-регионы (SHM_CREATE − SHM_DESTROY).
+    pub shm: usize,
+}
+
+/// Снимок атрибутов безопасности задачи (аудит песочницы, TASK_LIMITS_INFO).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskSecView {
+    pub limits: TaskLimits,
+    pub usage: TaskUsage,
+}
+
 /// Снимок состояния потока для аудита (копия): L4-модель, поток —
 /// единица планирования, живущая в задаче-домене `owner`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,4 +269,21 @@ pub enum TaskError {
     /// фиксируются: хуки вызываются до записи нового состояния.
     #[error("scheduler backend error: {0}")]
     Scheduler(#[from] crate::task::scheduler::SchedulerError),
+    // ==== Песочница v0.9 (атрибуты GTCB) ====
+    /// Предел памяти домена исчерпан (зарядка страниц сверх max_pages).
+    #[error("task {task} page quota exceeded (used {used}, limit {limit})")]
+    PageQuota {
+        task: TaskId,
+        used: usize,
+        limit: usize,
+    },
+    /// Предел потоков домена исчерпан (max_threads).
+    #[error("task {task} thread quota exceeded (limit {limit})")]
+    ThreadQuota { task: TaskId, limit: usize },
+    /// Предел SHM-регионов домена исчерпан (max_shm).
+    #[error("task {task} shm quota exceeded (limit {limit})")]
+    ShmQuota { task: TaskId, limit: usize },
+    /// Право творца погашено атрибутом песочницы (may_spawn = false).
+    #[error("task {0} is not allowed to spawn domains")]
+    SpawnDenied(TaskId),
 }

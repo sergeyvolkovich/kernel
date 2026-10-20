@@ -39,6 +39,19 @@ impl SyscallHandler for EpCreateHandler {
     fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
         let ipc = ctx.ipc.ok_or(SyscallError::NotSupported)?;
         let capacity = args.arg(1);
+        // v0.9: предел endpoint'ов + общий предел cspace домена.
+        if let Some(sec) = ctx.tasks.sec_view(&ctx.task) {
+            let live = super::task::gate_cap_count(ctx);
+            if live >= sec.limits.max_endpoints {
+                super::task::sandbox_audit("EP_CREATE blocked: endpoint quota");
+                return Err(SyscallError::QuotaExceeded);
+            }
+            let caps = ctx.tasks.cap_count(&ctx.task).unwrap_or(0);
+            if caps >= sec.limits.max_caps {
+                super::task::sandbox_audit("EP_CREATE blocked: cspace quota");
+                return Err(SyscallError::QuotaExceeded);
+            }
+        }
         let handle = ipc.create_endpoint(
             ctx.tasks,
             ctx.caps,
@@ -98,7 +111,15 @@ impl SyscallHandler for IpcRecvHandler {
         // Ящик чистим ПЕРЕД приёмом: новое сообщение — единственное в нём.
         ipc.mailbox_clear(ctx.tasks, ctx.thread);
         match ipc.recv(ctx.tasks, ctx.caps, ctx.thread, ep, mode)? {
-            RecvOutcome::Message(msg) => Ok(msg.word(0) as usize),
+            // Прямая встреча: слово 0 — возврат, весь ящик (слова 1..)
+            // обязан быть доступен IPC_MSG_WORD — v0.9 фиксирует тот же
+            // баг класса «v0.5.2», что был у recv_any: сообщение
+            // выбрасывалось после чтения слова 0.
+            RecvOutcome::Message(msg) => {
+                let word0 = msg.word(0) as usize;
+                ipc.mailbox_set(ctx.tasks, ctx.thread, msg);
+                Ok(word0)
+            }
             // Поток заблокирован: сообщение окажется в ящике при встрече.
             RecvOutcome::Blocked => Ok(0),
         }

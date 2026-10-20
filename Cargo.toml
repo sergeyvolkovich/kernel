@@ -10,6 +10,7 @@ members = [
     "crates/uefi_stub",
     "crates/init",
     "crates/userlib",
+    "crates/rogue",
 ]
 
 # Хост-сборка (cargo build / cargo test без --target) — только

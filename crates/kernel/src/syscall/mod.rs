@@ -484,7 +484,7 @@ impl SyscallRegistry {
             IpcSendThreadHandler, NotifySignalHandler,
         };
         use crate::syscall::mem::{
-            MemAllocHandler, MemFreeHandler, MemInfoHandler, MemTransferHandler,
+            MemAllocHandler, MemFreeHandler, MemInfoHandler, MemMapAtHandler, MemTransferHandler,
             RingDoorbellHandler, ShmBindDoorbellHandler, ShmCreateHandler, ShmDestroyHandler,
             ShmInfoHandler, ShmMapHandler, ShmSetupRingHandler,
         };
@@ -492,8 +492,9 @@ impl SyscallRegistry {
         use crate::syscall::task::{
             CapDeleteHandler, CapInfoHandler, CapListHandler, CapMintHandler, CapRevokeHandler,
             CapSendHandler, TaskCreateHandler, TaskExitExceptionHandler, TaskExitHandler,
-            TaskKillHandler, TaskSetExitEpHandler, ThreadCreateHandler, ThreadDestroyHandler,
-            ThreadExRegsHandler, ThreadResumeHandler, ThreadSetPrioHandler, ThreadSuspendHandler,
+            TaskKillHandler, TaskLimitsInfoHandler, TaskSetExitEpHandler, TaskSetLimitsHandler,
+            TaskSpawnImageHandler, ThreadCreateHandler, ThreadDestroyHandler, ThreadExRegsHandler,
+            ThreadResumeHandler, ThreadSetPrioHandler, ThreadSuspendHandler,
             ThreadTerminateHandler, ThreadYieldHandler,
         };
 
@@ -522,6 +523,9 @@ impl SyscallRegistry {
         slot!(nums::THREAD_RESUME, ThreadResumeHandler);
         slot!(nums::THREAD_YIELD, ThreadYieldHandler);
         slot!(nums::THREAD_EX_REGS, ThreadExRegsHandler);
+        slot!(nums::TASK_SET_LIMITS, TaskSetLimitsHandler);
+        slot!(nums::TASK_LIMITS_INFO, TaskLimitsInfoHandler);
+        slot!(nums::TASK_SPAWN_IMAGE, TaskSpawnImageHandler);
 
         // 0x20: capability.
         slot!(nums::CAP_MINT, CapMintHandler);
@@ -558,6 +562,7 @@ impl SyscallRegistry {
         slot!(nums::MEM_FREE, MemFreeHandler);
         slot!(nums::MEM_TRANSFER, MemTransferHandler);
         slot!(nums::MEM_INFO, MemInfoHandler);
+        slot!(nums::MEM_MAP_AT, MemMapAtHandler);
 
         // 0x60: SHM io_uring.
         slot!(nums::SHM_CREATE, ShmCreateHandler);
@@ -620,6 +625,8 @@ pub struct SyscallFacade<'a> {
     shm: Option<&'a ShmManager>,
     devices: Option<&'a DeviceManager>,
     memory: Option<&'a dyn MemRouter>,
+    space: Option<&'a dyn crate::mem::SpaceFactory>,
+    copy: Option<&'a dyn crate::mem::UserCopy>,
     irq: Option<&'a crate::hal::device::IrqRouter>,
 }
 
@@ -639,6 +646,8 @@ impl<'a> SyscallFacade<'a> {
             shm: None,
             devices: None,
             memory: None,
+            space: None,
+            copy: None,
             irq: None,
         }
     }
@@ -664,6 +673,19 @@ impl<'a> SyscallFacade<'a> {
     /// Подключить роутер памяти (builder; живёт пока жив фасад).
     pub fn with_memory(mut self, memory: &'a dyn MemRouter) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Подключить фабрику адресных пространств (v0.9: TASK_CREATE
+    /// порождает домен со своим пространством).
+    pub fn with_space(mut self, space: &'a dyn crate::mem::SpaceFactory) -> Self {
+        self.space = Some(space);
+        self
+    }
+
+    /// Подключить канал чтения памяти задач (v0.9: спавн-дескриптор).
+    pub fn with_copy(mut self, copy: &'a dyn crate::mem::UserCopy) -> Self {
+        self.copy = Some(copy);
         self
     }
 
@@ -702,6 +724,8 @@ impl<'a> SyscallFacade<'a> {
             shm: self.shm,
             devices: self.devices,
             memory: self.memory,
+            space: self.space,
+            copy: self.copy,
             irq: self.irq,
         };
         self.registry.dispatch(&mut ctx, args)
@@ -726,6 +750,8 @@ impl<'a> SyscallFacade<'a> {
             shm: self.shm,
             devices: self.devices,
             memory: self.memory,
+            space: self.space,
+            copy: self.copy,
             irq: self.irq,
         };
         self.registry.dispatch_number(number, &mut ctx, args)

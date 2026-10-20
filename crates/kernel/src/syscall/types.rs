@@ -16,7 +16,7 @@ use crate::capability::{CapHandle, CapabilityError, CapabilityManager, Capabilit
 use crate::hal::device::{DeviceManager, IrqRouter};
 use crate::hal::traits::mmap::MemErrorCode;
 use crate::ipc::{IpcManager, ShmManager};
-use crate::mem::MemRouter;
+use crate::mem::{MemRouter, SpaceFactory, UserCopy};
 use crate::task::{CpuId, TaskError, TaskId, TcbManager, ThreadId};
 
 // ───────────────────────────── Номер и аргументы ─────────────────────────────
@@ -160,6 +160,11 @@ pub enum SyscallError {
     #[error("device is gone (removed)")]
     DeviceGone,
 
+    /// Предел песочницы задачи исчерпан (v0.9: страницы/потоки/
+    /// endpoint'ы/SHM/caps; EDQUOT-аналог).
+    #[error("sandbox quota exceeded")]
+    QuotaExceeded,
+
     /// Внутренняя ошибка ядра (EIO-аналог): инвариант, протокол, slab.
     #[error("internal kernel error")]
     Internal,
@@ -181,6 +186,7 @@ impl SyscallError {
             Self::GateNotInstalled => 19, // ENODEV
             Self::TryAgain => 11,         // EAGAIN
             Self::DeviceGone => 6,        // ENXIO (ENODEV занят гейтом)
+            Self::QuotaExceeded => 122,   // EDQUOT
             Self::Internal => 5,          // EIO
         }
     }
@@ -236,6 +242,12 @@ impl From<TaskError> for SyscallError {
             TaskError::ThreadNotDead(_) => Self::Busy,
             TaskError::ThreadWaitState(_) => Self::InvalidArgument,
             TaskError::Scheduler(_) => Self::Internal,
+            // Песочница v0.9: пределы GTCB → EDQUOT; SpawnDenied —
+            // «нет права», это атрибут безопасности, не ресурсный отказ.
+            TaskError::PageQuota { .. }
+            | TaskError::ThreadQuota { .. }
+            | TaskError::ShmQuota { .. } => Self::QuotaExceeded,
+            TaskError::SpawnDenied(_) => Self::MissingRight,
         }
     }
 }
@@ -305,6 +317,11 @@ pub struct SyscallCtx<'a> {
     pub devices: Option<&'a DeviceManager>,
     /// Роутер памяти (аллокация регионов, flexpage-переносы).
     pub memory: Option<&'a dyn MemRouter>,
+    /// Фабрика адресных пространств (v0.9: TASK_CREATE рождает домен
+    /// СО пространством; смерть домена — destroy_space).
+    pub space: Option<&'a dyn SpaceFactory>,
+    /// Чтение памяти задач из ядра (v0.9: спавн-дескриптор родителя).
+    pub copy: Option<&'a dyn UserCopy>,
     /// IRQ-роутер (привязки прерываний драйверов к endpoint'ам).
     pub irq: Option<&'a IrqRouter>,
 }
@@ -329,6 +346,8 @@ impl<'a> SyscallCtx<'a> {
             shm: None,
             devices: None,
             memory: None,
+            space: None,
+            copy: None,
             irq: None,
         }
     }
@@ -336,6 +355,18 @@ impl<'a> SyscallCtx<'a> {
     /// Исполняющийся поток (L4-модель).
     pub fn with_thread(mut self, thread: ThreadId) -> Self {
         self.thread = thread;
+        self
+    }
+
+    /// Подключить фабрику адресных пространств (v0.9).
+    pub fn with_space(mut self, space: &'a dyn SpaceFactory) -> Self {
+        self.space = Some(space);
+        self
+    }
+
+    /// Подключить канал чтения памяти задач (v0.9).
+    pub fn with_copy(mut self, copy: &'a dyn UserCopy) -> Self {
+        self.copy = Some(copy);
         self
     }
 

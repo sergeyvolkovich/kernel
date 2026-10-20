@@ -65,6 +65,13 @@ int64_t l4_task_set_exit_ep(uint64_t gate);
 __attribute__((noreturn)) void l4_task_exit(uint64_t code);
 
 /* TASK_KILL(0x13): убить задачу (право TaskTCB на цель). */
+int64_t l4_task_set_limits(uint64_t tcb, uint64_t max_pages,
+                            uint64_t threads_eps, uint64_t shm_caps,
+                            uint64_t prio_spawn);
+int64_t l4_task_limits_info(uint64_t tcb, uint64_t index);
+int64_t l4_task_spawn_image(uint64_t tcb_self, uint64_t id_lo,
+                            uint64_t id_hi, uint64_t desc_ptr,
+                            uint64_t desc_bytes);
 int64_t l4_task_kill(uint64_t tcb);
 
 /* THREAD_CREATE(0x15): поток в домене (L4 thread_control).
@@ -210,6 +217,8 @@ int64_t l4_mem_transfer(uint64_t src_vaddr, uint64_t pages, uint64_t flags,
                         uint64_t dst_lo, uint64_t dst_hi);
 
 /* MEM_INFO(0x54): регион по адресу (0 = vbase, 1 = pbase, 2 = страниц). */
+int64_t l4_mem_map_at(uint64_t tcb_dst, uint64_t src,
+                              uint64_t pages, uint64_t dst, uint64_t flags);
 int64_t l4_mem_info(uint64_t addr, uint64_t index);
 
 /* ─────────────── 0x60: SHM / io_uring ─────────────── */

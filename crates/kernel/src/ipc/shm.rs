@@ -237,6 +237,12 @@ impl ShmManager {
         self.regions.borrow().len()
     }
 
+    /// Владелец региона (v0.9: проверка права на операции SHM — доступ
+    /// к чужому региону по угаданному ShmId правом не является).
+    pub fn owner_of(&self, id: ShmId) -> Option<TaskId> {
+        self.regions.borrow().get(&id).map(|r| r.owner)
+    }
+
     /// Создать регион из `pages` физических кадров (zero-copy: кадры
     /// раздаются отображениями, данные не копируются).
     pub fn create(&self, owner: TaskId, pages: usize) -> Result<ShmId, ShmError> {

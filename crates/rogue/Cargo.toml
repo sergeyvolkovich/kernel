@@ -1,0 +1,13 @@
+[package]
+name = "rogue"
+version.workspace = true
+edition.workspace = true
+description = "Sandbox-демо v0.9: дочерняя задача, спавнится init'ом из встроенного образа (TASK_SPAWN_IMAGE), открывает порты, обменивается данными и пытается вырваться из песочницы / устроить DoS — атрибуты GTCB её останавливают"
+
+[[bin]]
+name = "rogue"
+path = "src/main.rs"
+
+[dependencies]
+# userlib (rlib): _start + l4_* (тот же ABI, что и у C-приложений).
+userlib = { path = "../userlib" }

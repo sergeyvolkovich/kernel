@@ -130,6 +130,45 @@ pub extern "C" fn l4_task_exit(code: u64) -> ! {
     }
 }
 
+/// TASK_SET_LIMITS(0x1D, v0.9): назначить пределы песочницы задаче
+/// (трещотка: только ужесточение). Право: TaskTCB на цель.
+#[unsafe(no_mangle)]
+pub extern "C" fn l4_task_set_limits(
+    tcb: u64,
+    max_pages: u64,
+    threads_eps: u64,
+    shm_caps: u64,
+    prio_spawn: u64,
+) -> i64 {
+    unsafe { l4_syscall6(0x1D, tcb, max_pages, threads_eps, shm_caps, prio_spawn, 0) }
+}
+
+/// TASK_LIMITS_INFO(0x1E, v0.9): слово атрибутов безопасности задачи.
+/// Право: TaskTCB на цель. Слова: 0 = max_pages, 1 = usage pages,
+/// 2 = usage shm, 3 = threads|endpoints<<32, 4 = shm|caps<<32,
+/// 5 = prio | may_spawn<<8.
+#[unsafe(no_mangle)]
+pub extern "C" fn l4_task_limits_info(tcb: u64, index: u64) -> i64 {
+    unsafe { l4_syscall6(0x1E, tcb, index, 0, 0, 0, 0) }
+}
+
+/// TASK_SPAWN_IMAGE(0x1F, v0.9): спавн домена из ГОТОВОГО образа.
+/// Родитель заранее (1) разобрал залинкованный ELF, (2) выделил себе
+/// регионы MEM_ALLOC, (3) скопировал сегменты/стек/argv и (4) собрал
+/// дескриптор. Ядро принимает ТОЛЬКО указатели и мапит готовые кадры.
+/// ABI: (tcb_self, id_lo, id_hi, desc_ptr, desc_bytes). Возврат — хендл
+/// TaskTCB(ребёнка). Формат дескриптора — syscall/nums.rs ядра.
+#[unsafe(no_mangle)]
+pub extern "C" fn l4_task_spawn_image(
+    tcb_self: u64,
+    id_lo: u64,
+    id_hi: u64,
+    desc_ptr: u64,
+    desc_bytes: u64,
+) -> i64 {
+    unsafe { l4_syscall6(0x1F, tcb_self, id_lo, id_hi, desc_ptr, desc_bytes, 0) }
+}
+
 /// TASK_KILL(0x13): убить задачу по хендлу TaskTCB.
 #[unsafe(no_mangle)]
 pub extern "C" fn l4_task_kill(tcb: u64) -> i64 {
@@ -379,6 +418,12 @@ pub extern "C" fn l4_mem_transfer(
 }
 
 /// MEM_INFO(0x54): регион по адресу (аудит рантайма).
+#[unsafe(no_mangle)]
+pub extern "C" fn l4_mem_map_at(tcb_dst: u64, src: u64, pages: u64, dst: u64, flags: u64) -> i64 {
+    unsafe { l4_syscall6(0x55, tcb_dst, src, pages, dst, flags, 0) }
+}
+
+/// MEM_INFO(0x54): слово региона задачи по адресу.
 #[unsafe(no_mangle)]
 pub extern "C" fn l4_mem_info(addr: u64, index: u64) -> i64 {
     unsafe { l4_syscall6(0x54, addr, index, 0, 0, 0, 0) }

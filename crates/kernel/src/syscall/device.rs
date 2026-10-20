@@ -676,6 +676,17 @@ mod tests {
             ) -> Result<usize, crate::hal::traits::mmap::MemErrorCode> {
                 unreachable!()
             }
+            fn map_external_at(
+                &self,
+                _dst: crate::task::TaskId,
+                _src: crate::task::TaskId,
+                _src_vaddr: usize,
+                _dst_vaddr: usize,
+                _pages: usize,
+                _flags: MMAPMemoryFlags,
+            ) -> Result<usize, crate::hal::traits::mmap::MemErrorCode> {
+                unreachable!("map_at не нужен map_region-тесту")
+            }
         }
 
         let tasks = TcbManager::new().unwrap();

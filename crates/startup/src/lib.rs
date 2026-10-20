@@ -196,6 +196,62 @@ pub trait KernelGlue: Send + Sync {
 
 static GLUE: spin::Once<&'static dyn KernelGlue> = spin::Once::new();
 
+// ───────────────────── v0.9: сервисы над GCTL+платформой ─────────────────────
+
+/// Фабрика адресных пространств над платформой (SpaceFactory):
+/// TASK_CREATE/TASK_SPAWN_IMAGE рождает домен со своим UMAP;
+/// смерть домена — destroy_space (кадры owned-записей возвращаются
+/// пулу, external-окна остаются источнику).
+struct PlatformSpaces<P: Platform + 'static> {
+    platform: &'static P,
+    gctl: &'static GCTL<P::Mmap>,
+}
+
+impl<P: Platform + 'static> pkg_generic_interface::mem::SpaceFactory for PlatformSpaces<P> {
+    fn create_space(&self, task: TaskId) -> Result<(), MemErrorCode> {
+        // Геометрию рантайм-пространств kinit уже настроил
+        // (configure_runtime_spaces) — фабрика только строит MMAP-бекенд
+        // и отдаёт его менеджеру.
+        let mmap = self
+            .platform
+            .make_mmap()
+            .map_err(|_| MemErrorCode::InternalError)?;
+        self.gctl.memory_manager().create_task_space(task, mmap)
+    }
+
+    fn destroy_space(&self, task: TaskId) -> Result<(), MemErrorCode> {
+        self.gctl.memory_manager().destroy_task_space(&task)
+    }
+}
+
+/// Чтение памяти задачи из ядра (UserCopy): физика региона через
+/// MemRouter + direct-map платформы. Спавн-дескриптор и будущие
+/// copyin-протоколы (серверы конфигурации) читаются так, без
+/// промотирования страниц ядра.
+impl<P: Platform + 'static> pkg_generic_interface::mem::UserCopy for PlatformSpaces<P> {
+    fn read_task_bytes(
+        &self,
+        task: TaskId,
+        vaddr: usize,
+        out: &mut [u8],
+    ) -> Result<(), MemErrorCode> {
+        let router = self.gctl.leak_mem_router();
+        let (v_base, p_base, pages) = router
+            .region_at(task, VirtualADDR(vaddr))
+            .ok_or(MemErrorCode::NotFound)?;
+        let off = vaddr - v_base.0;
+        let len = out.len();
+        if off + len > pages * 4096 {
+            return Err(MemErrorCode::InvalidArgument(
+                "user window exceeds its region",
+            ));
+        }
+        let src = self.platform.phys_slice(p_base.0 as u64 + off as u64, len);
+        out.copy_from_slice(src);
+        Ok(())
+    }
+}
+
 /// Установить glue (одноразово; вызывается kinit перед platform.run()).
 pub fn install_glue(glue: &'static dyn KernelGlue) {
     GLUE.call_once(|| glue);
@@ -213,6 +269,9 @@ pub fn glue() -> Option<&'static dyn KernelGlue> {
 struct Glue<MMAP: MMAPInterface + 'static> {
     gctl: &'static GCTL<MMAP>,
     router: &'static dyn pkg_generic_interface::mem::MemRouter,
+    /// Фабрика адресных пространств + чтение памяти задач (v0.9).
+    space: &'static dyn pkg_generic_interface::mem::SpaceFactory,
+    copy: &'static dyn pkg_generic_interface::mem::UserCopy,
 }
 
 // SAFETY (дисциплина v0.5, как APXCTL в ядре): однопроцессорная загрузка.
@@ -247,7 +306,12 @@ impl<MMAP: MMAPInterface + KMAPInterface + ASIDInterface + 'static> KernelGlue f
         number: u64,
         args: &SyscallArgs,
     ) -> isize {
-        let facade = self.gctl.syscall_facade().with_memory(self.router);
+        let facade = self
+            .gctl
+            .syscall_facade()
+            .with_memory(self.router)
+            .with_space(self.space)
+            .with_copy(self.copy);
         let ret: SyscallRet =
             facade.dispatch_number(cpu, task, thread, syscall::SyscallNumber(number), args);
         pkg_generic_interface::syscall::types::syscall_ret_to_raw(ret)
@@ -319,7 +383,23 @@ impl<MMAP: MMAPInterface + KMAPInterface + ASIDInterface + 'static> KernelGlue f
             .filter(|t| t.state != TaskState::Dead)
             .count();
         if task_dead && live == 0 {
+            // v0.9: полный контракт смерти домена —
+            //   1. cspace домена: отозвать все его capability;
+            //   2. SHM-регионы домена: кадры в пул (владелец мёртв);
+            //   3. TCB (теперь пустой) — разрушить;
+            //   4. адресное пространство — unbind + дроп фасада
+            //      (owned-кадры в пул, external-окна остаются источникам).
+            // Порядок — контракт «revoke_all → destroy» менеджеров;
+            // отказы шагов не фатальны (idempotent-хвост).
+            let _ = self.gctl.capability_manager().revoke_all(tasks, owner);
+            for id in self.gctl.shm_manager().regions_of(&owner) {
+                let _ = self.gctl.shm_manager().destroy(id);
+            }
             let _ = tasks.destroy(owner);
+            let _ = self.space.destroy_space(owner);
+            if let Some(sink) = syscall::debug::debug_sink() {
+                sink.write(b"\r\n[kernel] task reaped: cspace revoked, space dropped\r\n");
+            }
         }
     }
 
@@ -374,7 +454,7 @@ fn task_id(v: u128) -> TaskId {
 ///
 /// Любой фатальный отказ печатается в консоль и останавливает машину
 /// (v0.5: паника загрузки честнее, чем «продолжим как-нибудь»).
-pub fn kinit<P: Platform>(bi: &BootInfo, platform: &'static P) -> ! {
+pub fn kinit<P: Platform + 'static>(bi: &BootInfo, platform: &'static P) -> ! {
     logln(platform, "kinit: startup sequence v0.5");
 
     // 1. Протокол загрузки.
@@ -437,22 +517,40 @@ pub fn kinit<P: Platform>(bi: &BootInfo, platform: &'static P) -> ! {
     // THREAD_CREATE для SMP-стресса и TASK_CREATE для порождения служб.
     // L4-модель: право выдаётся явным грантом ядра, init находит хендл
     // через CAP_LIST (kind = 2).
+    //
+    // 8.2 Мастер-грант IOMMU (v0.9): группа сисколов 0x80 гейтована
+    // capability IommuAdmin — init (менеджер устройств) получает его
+    // здесь; порождённые песочницы его НЕ получают и не передают.
     {
         use pkg_generic_interface::capability::{
             ActionPermissions, CapabilityBadge, CapabilityGate, ContainerACCCapability,
         };
-        let gate = CapabilityGate::new(
+        let creator_gate = CapabilityGate::new(
             ContainerACCCapability::TaskTCB { task_id: init_task },
+            ActionPermissions::all(),
+            CapabilityBadge::FULL,
+        );
+        if let Err(e) =
+            gctl.capability_manager()
+                .grant(gctl.task_manager(), init_task, creator_gate)
+        {
+            fatal(
+                platform,
+                &alloc::format!("kinit: FATAL init TaskTCB grant: {e:?}\r\n"),
+            );
+        }
+        let iommu_gate = CapabilityGate::new(
+            ContainerACCCapability::IommuAdmin,
             ActionPermissions::all(),
             CapabilityBadge::FULL,
         );
         if let Err(e) = gctl
             .capability_manager()
-            .grant(gctl.task_manager(), init_task, gate)
+            .grant(gctl.task_manager(), init_task, iommu_gate)
         {
             fatal(
                 platform,
-                &alloc::format!("kinit: FATAL init TaskTCB grant: {e:?}\r\n"),
+                &alloc::format!("kinit: FATAL init IommuAdmin grant: {e:?}\r\n"),
             );
         }
     }
@@ -541,9 +639,23 @@ pub fn kinit<P: Platform>(bi: &BootInfo, platform: &'static P) -> ! {
     }
 
     // 10. Glue (арх-гейт <-> ядро) и диспетчеризация.
+    //
+    // v0.9: фабрика адресных пространств — над GCTL + платформой
+    // (геометрия окна/стек — политика Platform). Leaked на век системы:
+    // Glue раздаёт её syscall-фасаду (TASK_CREATE рождает домен СО
+    // пространством) и убирает пространства мёртвых доменов в reap.
+    gctl.memory_manager().configure_runtime_spaces(
+        platform.user_window_pages(),
+        platform.cpu_count(),
+        platform.user_alloc_base(),
+    );
+    let space_factory: &'static PlatformSpaces<P> =
+        Box::leak(Box::new(PlatformSpaces { platform, gctl }));
     install_glue(Box::leak(Box::new(Glue {
         gctl,
         router: gctl.leak_mem_router(),
+        space: space_factory,
+        copy: space_factory,
     })));
 
     logln(platform, "kinit: handing off to dispatcher");

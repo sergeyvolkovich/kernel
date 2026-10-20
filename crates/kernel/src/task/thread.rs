@@ -174,6 +174,23 @@ impl TcbManager {
             return Err(TaskError::ThreadExists(thread_id));
         }
 
+        // Песочница v0.9: предел живых потоков домена (атрибут GTCB).
+        // Потоки, переведённые в Dead, не считаются — каскад смерти
+        // уже погасил их.
+        let live_threads = inner
+            .threads
+            .by_uuid
+            .iter()
+            .filter(|t| t.owner == owner && t.state != TaskState::Dead)
+            .count();
+        let thread_limit = owner_tcb.limits.max_threads;
+        if live_threads >= thread_limit {
+            return Err(TaskError::ThreadQuota {
+                task: owner,
+                limit: thread_limit,
+            });
+        }
+
         // SAFETY: слот неинициализирован; заполняется до любого разыменования.
         let slot = inner
             .threads

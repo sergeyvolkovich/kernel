@@ -281,6 +281,9 @@ impl CapabilityManager {
             ContainerACCCapability::TaskTCB { task_id } => tasks
                 .target_ref(task_id)
                 .ok_or(CapabilityError::UnknownTaskTarget(*task_id))?,
+            // Мастер-право IOMMU (v0.9): глобальный сервис ядра — цель
+            // «бессмертна», как у устройств; право живёт, пока не отозвано.
+            ContainerACCCapability::IommuAdmin => TargetRef::immortal(),
             ContainerACCCapability::Gate { .. } | ContainerACCCapability::Irq { .. } => {
                 return Err(CapabilityError::Internal);
             }
@@ -908,6 +911,9 @@ impl CapabilityManager {
                 // Цель «бессмертна» на этом слое (см. grant).
                 Ok(None)
             }
+            // Мастер-право IOMMU (v0.9): цель «бессмертна» — отзыв только
+            // revoke самой capability (как у устройств).
+            ContainerACCCapability::IommuAdmin => Ok(None),
             ContainerACCCapability::TaskTCB { .. } => {
                 // Одна проверка: generation задачи и есть живость цели.
                 if !cte.target.alive() {

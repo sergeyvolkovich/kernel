@@ -45,7 +45,10 @@ use crate::capability::{
 pub use scheduler::{BLOCK_QUEUE_NONE, BlockQueueId, CpuId, SchedulerError, SchedulerInterface};
 use thread::ThreadInner;
 pub use thread::ThreadWait;
-pub use types::{TaskError, TaskId, TaskPriority, TaskState, TaskView, ThreadId, ThreadView};
+pub use types::{
+    TaskError, TaskId, TaskLimits, TaskPriority, TaskSecView, TaskState, TaskUsage, TaskView,
+    ThreadId, ThreadView,
+};
 
 /// Слотов на страницу таблицы задач (страница ~600 Б).
 const TASK_PAGE_SLOTS: usize = 8;
@@ -76,6 +79,12 @@ pub(crate) struct TaskObj {
     /// `crate::ipc::ExitPayload` при её завершении. `None` — родитель
     /// не регистрировал (доставка — тихий no-op).
     pub(crate) exit_ep: Option<ObjId>,
+    /// Атрибуты песочницы v0.9: пределы домена + текущее потребление.
+    /// Дефолт — [`TaskLimits::UNLIMITED`] (доверенная задача); лимиты
+    /// назначает держатель TaskTCB-права через `set_limits` (трещотка).
+    pub(crate) limits: TaskLimits,
+    /// Учёт потребления для пределов (точки зарядки — сисколы памяти).
+    pub(crate) usage: TaskUsage,
 }
 
 unsafe impl KernelObj for TaskObj {
@@ -201,6 +210,8 @@ impl TcbManager {
                 priority,
                 caps,
                 exit_ep: None,
+                limits: TaskLimits::UNLIMITED,
+                usage: TaskUsage::default(),
             })
             .map_err(|_| TaskError::OutOfMemory)?;
 
@@ -280,6 +291,103 @@ impl TcbManager {
         let freed = inner.tasks.free(self_idx);
         debug_assert!(freed, "слот объекта обязан быть живым");
         Ok(())
+    }
+
+    // ==== Атрибуты песочницы v0.9 (пределы GTCB + учёт) ====
+
+    /// Назначить пределы задаче (трещотка: новые значения УЖЕСТОЧАЮТ
+    /// текущие — `TaskLimits::tighten`, см. документацию типа). Право
+    /// контролирует хендлер сискола (TaskTCB на цель), менеджер лишь
+    /// хранит и применяет атомарно.
+    pub fn set_limits(&self, task_id: &TaskId, tighten_to: TaskLimits) -> Result<(), TaskError> {
+        let inner = self.inner.borrow_mut();
+        let node = find_task(&inner, task_id).ok_or(TaskError::TaskNotFound(*task_id))?;
+        // SAFETY: эксклюзивный доступ под borrow_mut.
+        let tcb: &mut TaskObj = unsafe { &mut *UnsafeRef::into_raw(node) };
+        tcb.limits = tcb.limits.tighten(&tighten_to);
+        Ok(())
+    }
+
+    /// Снимок атрибутов безопасности задачи (пределы + потребление).
+    pub fn sec_view(&self, task_id: &TaskId) -> Option<TaskSecView> {
+        let inner = self.inner.borrow();
+        let node = find_task(&inner, task_id)?;
+        // SAFETY: только чтение.
+        let tcb: &TaskObj = unsafe { &*UnsafeRef::into_raw(node) };
+        Some(TaskSecView {
+            limits: tcb.limits,
+            usage: tcb.usage,
+        })
+    }
+
+    /// Зарядить домену `pages` страниц (превышение max_pages — отказ
+    /// [`TaskError::PageQuota`]; зарядка атомарна: при отказе счётчик не
+    /// меняется). Вызов ДО фактической аллокации/отображения, откат —
+    /// `refund_pages` при отказе подсистемы.
+    pub fn charge_pages(&self, task_id: &TaskId, pages: usize) -> Result<(), TaskError> {
+        let mut inner = self.inner.borrow_mut();
+        let node = find_task(&inner, task_id).ok_or(TaskError::TaskNotFound(*task_id))?;
+        // SAFETY: эксклюзивный доступ под borrow_mut.
+        let tcb: &mut TaskObj = unsafe { &mut *UnsafeRef::into_raw(node) };
+        let used = tcb.usage.pages;
+        let limit = tcb.limits.max_pages;
+        match used.checked_add(pages) {
+            Some(total) if total <= limit => {
+                tcb.usage.pages = total;
+                Ok(())
+            }
+            _ => Err(TaskError::PageQuota {
+                task: *task_id,
+                used,
+                limit,
+            }),
+        }
+    }
+
+    /// Вернуть `pages` страниц в учёт домена (MEM_FREE, grant-исход,
+    /// откат неудачной зарядки). Счётчик не уходит ниже нуля.
+    pub fn refund_pages(&self, task_id: &TaskId, pages: usize) {
+        let mut inner = self.inner.borrow_mut();
+        if let Some(node) = find_task(&inner, task_id) {
+            // SAFETY: эксклюзивный доступ под borrow_mut.
+            let tcb: &mut TaskObj = unsafe { &mut *UnsafeRef::into_raw(node) };
+            tcb.usage.pages = tcb.usage.pages.saturating_sub(pages);
+        }
+    }
+
+    /// Зарядить домену один SHM-регион (предел max_shm).
+    pub fn charge_shm(&self, task_id: &TaskId) -> Result<(), TaskError> {
+        let mut inner = self.inner.borrow_mut();
+        let node = find_task(&inner, task_id).ok_or(TaskError::TaskNotFound(*task_id))?;
+        // SAFETY: эксклюзивный доступ под borrow_mut.
+        let tcb: &mut TaskObj = unsafe { &mut *UnsafeRef::into_raw(node) };
+        if tcb.usage.shm >= tcb.limits.max_shm {
+            return Err(TaskError::ShmQuota {
+                task: *task_id,
+                limit: tcb.limits.max_shm,
+            });
+        }
+        tcb.usage.shm += 1;
+        Ok(())
+    }
+
+    /// Снять один SHM-регион с учёта домена (SHM_DESTROY).
+    pub fn refund_shm(&self, task_id: &TaskId) {
+        let mut inner = self.inner.borrow_mut();
+        if let Some(node) = find_task(&inner, task_id) {
+            // SAFETY: эксклюзивный доступ под borrow_mut.
+            let tcb: &mut TaskObj = unsafe { &mut *UnsafeRef::into_raw(node) };
+            tcb.usage.shm = tcb.usage.shm.saturating_sub(1);
+        }
+    }
+
+    /// Предел `may_spawn` задачи (право творца; TASK_CREATE-хендлер).
+    pub fn may_spawn(&self, task_id: &TaskId) -> Result<bool, TaskError> {
+        let inner = self.inner.borrow();
+        let node = find_task(&inner, task_id).ok_or(TaskError::TaskNotFound(*task_id))?;
+        // SAFETY: только чтение.
+        let tcb: &TaskObj = unsafe { &*UnsafeRef::into_raw(node) };
+        Ok(tcb.limits.may_spawn)
     }
 
     // ==== Exit-endpoint (протокол завершения дочерних задач) ====
