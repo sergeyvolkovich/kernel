@@ -192,6 +192,23 @@ pub trait KernelGlue: Send + Sync {
     /// Всего живых потоков (idle-цикл: 0 — «все ушли», платформа может
     /// остановить машину или ждать прерываний).
     fn live_thread_count(&self) -> usize;
+
+    /// v0.10, CPU-квоты: поток `thread` уступил CPU, потребив `ticks`
+    /// тиков (вытеснение/уступка — гейт планировщика под BKL). Ядро
+    /// заряжает их домену-владельцу; возврат `true` — домен за
+    /// пределом `cpu_quota`: гейт обязан запарковать поток (троттлинг)
+    /// до границы периода вместо возврата в очередь готовности.
+    ///
+    /// Дефолт — `false` (учёт не поддержан): бекенды без квот продолжают
+    /// работать как раньше.
+    fn on_timeslice_consumed(&self, _thread: ThreadId, _ticks: usize) -> bool {
+        false
+    }
+
+    /// v0.10, CPU-квоты: граница периода — сбросить учёт потребления всех
+    /// доменов (вызывает бекенд планировщика под BKL; потоки из
+    /// троттл-листа в готовность возвращает сам бекенд).
+    fn on_cpu_period(&self) {}
 }
 
 static GLUE: spin::Once<&'static dyn KernelGlue> = spin::Once::new();
@@ -432,6 +449,20 @@ impl<MMAP: MMAPInterface + KMAPInterface + ASIDInterface + 'static> KernelGlue f
 
     fn live_thread_count(&self) -> usize {
         self.gctl.task_manager().total_thread_count()
+    }
+
+    fn on_timeslice_consumed(&self, thread: ThreadId, ticks: usize) -> bool {
+        let tasks = self.gctl.task_manager();
+        let Some(owner) = tasks.thread_task(&thread) else {
+            return false;
+        };
+        // Аудит «cpu quota: ... throttled» печатает сам менеджер при
+        // первом входе домена за предел квоты.
+        tasks.charge_cpu(&owner, ticks).unwrap_or(false)
+    }
+
+    fn on_cpu_period(&self) {
+        self.gctl.task_manager().on_cpu_period();
     }
 }
 

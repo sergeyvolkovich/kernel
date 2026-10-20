@@ -33,7 +33,7 @@ use crate::capability::paged::{KernelObj, ObjHeader, PagedTable};
 use crate::ipc::IpcMessage;
 use crate::task::scheduler::BlockQueueId;
 use crate::task::types::{TaskError, TaskId, TaskPriority, TaskState, ThreadId, ThreadView};
-use crate::task::{TcbInner, TcbManager, find_task};
+use crate::task::{TaskObj, TcbInner, TcbManager, find_task};
 
 /// Слотов на страницу таблицы потоков.
 const THREAD_PAGE_SLOTS: usize = 8;
@@ -125,6 +125,10 @@ pub(crate) struct ThreadInner {
     /// Порядок полей важен для дропа: реестр снимаем раньше таблицы.
     pub(crate) by_uuid: RBTree<ThreadAdapter>,
     pub(crate) threads: PagedTable<ThreadObj, THREAD_PAGE_SLOTS, THREAD_DIR_LEN>,
+    /// Живые (не Dead) потоки ВСЕЙ системы — ленивый счётчик (v0.10):
+    /// инкремент в `create_thread`, декремент в Dead-переходе потока.
+    /// Заменяет O(n)-обход в `total_thread_count` (idle-диагностика).
+    pub(crate) total_live: usize,
 }
 
 impl ThreadInner {
@@ -132,6 +136,7 @@ impl ThreadInner {
         Ok(Self {
             by_uuid: RBTree::new(ThreadAdapter::new()),
             threads: PagedTable::new().map_err(|_| TaskError::OutOfMemory)?,
+            total_live: 0,
         })
     }
 }
@@ -176,15 +181,10 @@ impl TcbManager {
 
         // Песочница v0.9: предел живых потоков домена (атрибут GTCB).
         // Потоки, переведённые в Dead, не считаются — каскад смерти
-        // уже погасил их.
-        let live_threads = inner
-            .threads
-            .by_uuid
-            .iter()
-            .filter(|t| t.owner == owner && t.state != TaskState::Dead)
-            .count();
+        // уже погасил их. v0.10: ленивый счётчик GTCB `live_threads`
+        // вместо O(n)-обхода реестра (спавн/флуд — горячий путь атак).
         let thread_limit = owner_tcb.limits.max_threads;
-        if live_threads >= thread_limit {
+        if owner_tcb.live_threads >= thread_limit {
             return Err(TaskError::ThreadQuota {
                 task: owner,
                 limit: thread_limit,
@@ -234,6 +234,15 @@ impl TcbManager {
                 return Err(TaskError::Scheduler(e));
             }
         }
+        // Успех: ленивые счётчики живых потоков (домен + система).
+        // Свежая находка узла: первая (проверка квоты) уже отдала
+        // UnsafeRef в into_raw — consuming-семантика.
+        if let Some(owner_node) = find_task(&inner, &owner) {
+            // SAFETY: эксклюзивный доступ под borrow_mut; узел жив.
+            let owner_tcb: &mut TaskObj = unsafe { &mut *UnsafeRef::into_raw(owner_node) };
+            owner_tcb.live_threads += 1;
+        }
+        inner.threads.total_live += 1;
         Ok(())
     }
 
@@ -302,25 +311,24 @@ impl TcbManager {
     }
 
     /// Число живых (не Dead) потоков задачи.
+    ///
+    /// v0.10: O(1) — ленивый счётчик GTCB `live_threads` (точки его
+    /// ведения: `create_thread` и Dead-переход потока).
     pub fn thread_count(&self, owner: &TaskId) -> usize {
         let inner = self.inner.borrow();
-        inner
-            .threads
-            .by_uuid
-            .iter()
-            .filter(|t| &t.owner == owner && t.state != TaskState::Dead)
-            .count()
+        match find_task(&inner, owner) {
+            // SAFETY: только чтение под borrow.
+            Some(node) => unsafe { (*UnsafeRef::into_raw(node)).live_threads },
+            None => 0,
+        }
     }
 
     /// Суммарное число живых потоков (аудит).
+    ///
+    /// v0.10: O(1) — ленивый системный счётчик `ThreadInner::total_live`.
     pub fn total_thread_count(&self) -> usize {
         let inner = self.inner.borrow();
-        inner
-            .threads
-            .by_uuid
-            .iter()
-            .filter(|t| t.state != TaskState::Dead)
-            .count()
+        inner.threads.total_live
     }
 
     /// Перевести поток в `to` по автомату состояний (+ хуки планировщика).
@@ -334,7 +342,7 @@ impl TcbManager {
         thread_id: &ThreadId,
         to: TaskState,
     ) -> Result<TaskState, TaskError> {
-        let inner = self.inner.borrow_mut();
+        let mut inner = self.inner.borrow_mut();
 
         let node = find_thread(&inner, thread_id).ok_or(TaskError::ThreadNotFound(*thread_id))?;
         // SAFETY: эксклюзивный доступ под borrow_mut.
@@ -368,6 +376,17 @@ impl TcbManager {
             t.blocked_msg = None;
             t.parked.clear();
             t.syscall_ret = None;
+            // v0.10: ленивые счётчики живых потоков (домен + система).
+            // Каскад смерти задачи и одиночные завершения сходятся здесь.
+            if from != TaskState::Dead {
+                if let Some(owner_node) = find_task(&inner, &t.owner) {
+                    // SAFETY: эксклюзивный доступ под borrow_mut.
+                    let owner_tcb: &mut crate::task::TaskObj =
+                        unsafe { &mut *UnsafeRef::into_raw(owner_node) };
+                    owner_tcb.live_threads = owner_tcb.live_threads.saturating_sub(1);
+                }
+                inner.threads.total_live = inner.threads.total_live.saturating_sub(1);
+            }
         }
         t.state = to;
         Ok(from)

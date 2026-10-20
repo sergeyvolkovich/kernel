@@ -40,7 +40,10 @@ USERLIB=$OUT/x86_64-unknown-none/release/libuserlib.a
 
 echo "== [3/6] rogue (дочерний образ песочницы v0.9, ELF @ 0x40000000) =="
 cargo build -p rogue --target x86_64-unknown-none $R
-ROGUE=$OUT/x86_64-unknown-none/release/rogue
+# Абсолютный путь: build-скрипт init'а исполняется с CWD=crates/init —
+# относительный target/... оттуда не виден, и при standalone-пересборке
+# init демо-песочницы молча получали пустой child.bin (баг v0.9).
+ROGUE=$WS/$OUT/x86_64-unknown-none/release/rogue
 
 echo "== [4/6] init (static user ELF @ 0x40000000; вшитый образ rogue) =="
 # ROGUE_ELF: build-скрипт init копирует бинарь rogue в OUT_DIR/child.bin,

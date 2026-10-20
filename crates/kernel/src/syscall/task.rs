@@ -156,7 +156,8 @@ impl SyscallFacade<'_> {
 
     /// Само-выход задачи `task` с кодом (полный маршрут):
     /// 1. доставить [`ExitPayload::Exit`] на exit-endpoint (если
-    ///    зарегистрирован); буфер endpoint'а переживает смерть домена;
+    ///    зарегистрирован; в слова — код + CPU-статистика домена — v0.10,
+    ///    вердикт песочницы без гонок с reaper'ом);
     /// 2. отпустить локи устройств задачи (claim-подсистема);
     /// 3. перевести задачу в `Dead` — каскад гасит все потоки.
     ///
@@ -168,7 +169,22 @@ impl SyscallFacade<'_> {
         task: TaskId,
         code: usize,
     ) -> SyscallRet {
-        self.task_exit_of(ipc, task, ExitPayload::Exit { code })
+        // CPU-снимок ДО смерти домена (deliver раньше каскада — статистика
+        // ещё живого GTCB; после — TCB уже разрушен).
+        let (cpu_used, cpu_throttle_events) = self
+            .tasks
+            .sec_view(&task)
+            .map(|sec| (sec.usage.cpu_used, sec.usage.cpu_throttle_events))
+            .unwrap_or((0, 0));
+        self.task_exit_of(
+            ipc,
+            task,
+            ExitPayload::Exit {
+                code,
+                cpu_used,
+                cpu_throttle_events,
+            },
+        )
     }
 
     /// Аварийное завершение по исключению (вызывает arch-глюй из
@@ -447,9 +463,24 @@ impl SyscallHandler for TaskExitHandler {
     fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
         let code = args.arg(1);
         // 1. Exit-доставка (требует IPC-подсистему; без неё — тихо без
-        //    уведомлений, домен всё равно умирает).
+        //    уведомлений, домен всё равно умирает). CPU-статистика домена
+        //    (v0.10) уходит в словах w4/w5 — вердикт песочницы у родителя.
         if let Some(ipc) = ctx.ipc {
-            ipc.deliver_exit(ctx.tasks, ctx.caps, ctx.task, ExitPayload::Exit { code })?;
+            let (cpu_used, cpu_throttle_events) = ctx
+                .tasks
+                .sec_view(&ctx.task)
+                .map(|sec| (sec.usage.cpu_used, sec.usage.cpu_throttle_events))
+                .unwrap_or((0, 0));
+            ipc.deliver_exit(
+                ctx.tasks,
+                ctx.caps,
+                ctx.task,
+                ExitPayload::Exit {
+                    code,
+                    cpu_used,
+                    cpu_throttle_events,
+                },
+            )?;
         }
         // 2. Локи устройств + привязки IRQ.
         if let Some(devices) = ctx.devices {
@@ -546,7 +577,11 @@ impl SyscallHandler for TaskCreateHandler {
 /// ABI: arg1 = хендл TaskTCB цели, arg2 = max_pages,
 /// arg3 = max_threads | (max_endpoints << 32),
 /// arg4 = max_shm | (max_caps << 32),
-/// arg5 = max_prio (u8) | (may_spawn ? 0x100 : 0).
+/// arg5 = max_prio (u8) | (may_spawn ? 0x100 : 0)
+///       | (cpu_quota << 16) — квота CPU в тиках за период (v0.10);
+///       биты 63:16 = 0 — квоту НЕ ТРОГАТЬ (наследие v0.9: нулевое
+///       поле старых вызовов не замораживает домен), все единицы —
+///       кандидат «без лимита» (трещотка не ослабит), 1 — замороз.
 pub struct TaskSetLimitsHandler;
 
 impl TaskSetLimitsHandler {
@@ -561,6 +596,15 @@ impl SyscallHandler for TaskSetLimitsHandler {
             return Err(SyscallError::MissingRight);
         };
         let w32 = |w: usize| (w & 0xFFFF_FFFF) as usize;
+        // CPU-квота (v0.10): старшие 48 бит arg5. 0 — «не трогать»
+        // (наследие v0.9: нулевое поле старых вызовов не душит домен),
+        // «все единицы» — кандидат usize::MAX (трещотка не ослабит).
+        let cpu_quota_raw = args.arg(5) >> 16;
+        let cpu_quota = if cpu_quota_raw == 0 || cpu_quota_raw == 0xFFFF_FFFF_FFFF {
+            usize::MAX
+        } else {
+            cpu_quota_raw
+        };
         let limits = crate::task::TaskLimits {
             max_pages: args.arg(2),
             max_threads: w32(args.arg(3)),
@@ -569,6 +613,7 @@ impl SyscallHandler for TaskSetLimitsHandler {
             max_caps: args.arg(4) >> 32,
             max_prio: (args.arg(5) & 0xFF) as u8,
             may_spawn: args.arg(5) & 0x100 != 0,
+            cpu_quota,
         };
         ctx.tasks.set_limits(&task_id, limits)?;
         sandbox_audit("limits tightened for child domain");
@@ -576,12 +621,17 @@ impl SyscallHandler for TaskSetLimitsHandler {
     }
 }
 
-/// Снимок атрибутов безопасности задачи (v0.9). ПРАВО: TaskTCB на цель
-/// (аудит песочницы — привилегия родителя/самого домена).
+/// Снимок атрибутов безопасности задачи (v0.9; v0.10 — слова 6..8 — CPU).
+/// ПРАВО: TaskTCB на цель (аудит песочницы — привилегия родителя/самого
+/// домена).
 ///
 /// Слова по индексу: 0 = max_pages, 1 = usage pages, 2 = usage shm,
 /// 3 = max_threads | (max_endpoints << 32), 4 = max_shm |
-/// (max_caps << 32), 5 = max_prio | (may_spawn ? 0x100 : 0).
+/// (max_caps << 32), 5 = max_prio | (may_spawn ? 0x100 : 0),
+/// 6 = cpu_quota (usize::MAX = без лимита; v0.10),
+/// 7 = cpu_used — тики текущего периода (v0.10),
+/// 8 = cpu_throttle_events | (cpu_throttled ? 0x1_0000_0000 : 0) —
+///     счётчик входов за предел квоты + текущий флаг троттлинга (v0.10).
 /// ABI: arg1 = хендл TaskTCB цели, arg2 = индекс слова.
 pub struct TaskLimitsInfoHandler;
 
@@ -604,6 +654,14 @@ impl SyscallHandler for TaskLimitsInfoHandler {
             (sec.limits.max_threads & 0xFFFF_FFFF) | (sec.limits.max_endpoints << 32),
             (sec.limits.max_shm & 0xFFFF_FFFF) | (sec.limits.max_caps << 32),
             (sec.limits.max_prio as usize) | if sec.limits.may_spawn { 0x100 } else { 0 },
+            sec.limits.cpu_quota,
+            sec.usage.cpu_used,
+            sec.usage.cpu_throttle_events
+                | if sec.usage.cpu_throttled {
+                    0x1_0000_0000
+                } else {
+                    0
+                },
         ];
         let idx = args.arg(2);
         words.get(idx).copied().ok_or(SyscallError::InvalidArgument)
@@ -717,6 +775,18 @@ impl SyscallHandler for TaskSpawnImageHandler {
             return Err(SyscallError::InvalidArgument);
         }
         let w32 = |w: u64| (w & 0xFFFF_FFFF) as usize;
+        // CPU-квота ребёнка (v0.10): u32 @ 0x6C хвоста заголовка.
+        // 0 — БЕЗ лимита (исторический нулевой паддинг дескрипторов v0.9:
+        // старые сборщики спавна не знали поля — ребёнок не должен
+        // замереть), 0xFFFF_FFFF — без лимита явно, 1..=0xFFFF_FFFE —
+        // квота в тиках за период. Заморозить ребёнка намертво — квота 1
+        // (или TASK_SET_LIMITS с нулём после спавна).
+        let cpu_quota_raw = u32_at(0x6C);
+        let cpu_quota = if cpu_quota_raw == 0 || cpu_quota_raw == 0xFFFF_FFFF {
+            usize::MAX
+        } else {
+            cpu_quota_raw as usize
+        };
         let limits = TaskLimits {
             max_pages: word(9) as usize,
             max_threads: w32(word(10)),
@@ -725,6 +795,7 @@ impl SyscallHandler for TaskSpawnImageHandler {
             max_caps: (word(11) >> 32) as usize,
             max_prio: (word(12) & 0xFF) as u8,
             may_spawn: word(12) & 0x100 != 0,
+            cpu_quota,
         };
 
         // 3. Домен + пространство + ПЕСОЧНИЦА (лимиты до первого потока).
@@ -1155,15 +1226,11 @@ pub(crate) fn gate_cap_count(ctx: &SyscallCtx<'_>) -> usize {
 }
 
 /// Аудит песочницы: строка в консоль отладки ядра (каждая блокировка
-/// операции домена-песочницы видна оператору — v0.9).
-pub(crate) fn sandbox_audit(line: &str) {
-    use alloc::fmt::Write;
-    if let Some(sink) = crate::syscall::debug::debug_sink() {
-        let mut s = alloc::string::String::with_capacity(line.len() + 24);
-        let _ = write!(s, "\r\n[kernel: sandbox] {line}\r\n");
-        sink.write(s.as_bytes());
-    }
-}
+/// операции домена-песочницы видна оператору — v0.9). Реализация
+/// переехала в подсистему задач (`crate::task::sandbox_audit`: её
+/// использует и CPU-троттлинг v0.10) — здесь остаётся реэкспорт,
+/// чтобы существующие вызовы сискол-фасада не менялись.
+pub(crate) use crate::task::sandbox_audit;
 
 // ==== Передача прав capability (map/grant-наследники L4) ====
 
@@ -1545,8 +1612,17 @@ mod tests {
 
         // 6. Ребёнок само-выходит с кодом 42: exit-endpoint получает
         //    первый вид данных (код выхода), потоки гаснут каскадом.
-        ipc.deliver_exit(tasks, caps, child, ExitPayload::Exit { code: 42 })
-            .unwrap();
+        ipc.deliver_exit(
+            tasks,
+            caps,
+            child,
+            ExitPayload::Exit {
+                code: 42,
+                cpu_used: 0,
+                cpu_throttle_events: 0,
+            },
+        )
+        .unwrap();
         tasks.set_state(&child, TaskState::Dead).unwrap();
         assert_eq!(
             tasks.thread_view(&main_thread).unwrap().state,
@@ -1569,7 +1645,13 @@ mod tests {
         assert_eq!(msg.word(0), 1); // тег Exit
         assert_eq!(msg.word(3), 42); // код
         let back = ExitPayload::from_message(&msg).unwrap();
-        assert_eq!(back, ExitPayload::Exit { code: 42 });
+        assert!(
+            back == ExitPayload::Exit {
+                code: 42,
+                cpu_used: 0,
+                cpu_throttle_events: 0,
+            }
+        );
 
         // 8. Второй и третий виды: исключение (regs+fault) и кем убита.
         let child2 = uuid_next();
@@ -1869,6 +1951,67 @@ mod tests {
     }
 
     #[test]
+    fn cpu_quota_abi_packing_and_info_words() {
+        let (reg, tasks, caps) = default_table_world();
+        let parent = uuid_next();
+        tasks.create(parent, TaskPriority::DEFAULT).unwrap();
+        let child = uuid_next();
+        tasks.create(child, TaskPriority(80)).unwrap();
+        let h_child = grant_tcb(caps, tasks, parent, child);
+        let mut ctx = crate::syscall::SyscallCtx::core(0, parent, tasks, caps);
+
+        // v0.9-вызов с нулевым полем квоты (arg5=100) — домен НЕ
+        // заморожен: квота остаётся безлимитной (наследие ABI).
+        let args = SyscallArgs::new([0, h_child.bits() as usize, 100, 0, 0, 100]);
+        assert_eq!(
+            reg.dispatch_number(nums::TASK_SET_LIMITS, &mut ctx, &args),
+            Ok(0)
+        );
+        assert_eq!(
+            tasks.sec_view(&child).unwrap().limits.cpu_quota,
+            usize::MAX,
+            "нулевое поле = квоту не трогать"
+        );
+
+        // Слово за пределами таблицы — InvalidArgument.
+        let args = SyscallArgs::new([0, h_child.bits() as usize, 9, 0, 0, 0]);
+        assert_eq!(
+            reg.dispatch_number(nums::TASK_LIMITS_INFO, &mut ctx, &args),
+            Err(SyscallError::InvalidArgument)
+        );
+
+        // Явная квота: arg5 = prio | (cpu_quota << 16).
+        let args = SyscallArgs::new([0, h_child.bits() as usize, 0, 0, 0, 100 | (12 << 16)]);
+        assert_eq!(
+            reg.dispatch_number(nums::TASK_SET_LIMITS, &mut ctx, &args),
+            Ok(0)
+        );
+
+        // Слова 6..8 — зеркало GTCB (чтение через сискол).
+        let mut word = |i: usize| {
+            let args = SyscallArgs::new([0, h_child.bits() as usize, i, 0, 0, 0]);
+            reg.dispatch_number(nums::TASK_LIMITS_INFO, &mut ctx, &args)
+                .unwrap()
+        };
+        assert_eq!(word(6), 12, "квота назначена через arg5");
+        assert_eq!(word(7), 0, "до зарядки — пусто");
+        assert_eq!(word(8), 0);
+
+        // Заряд/троттл — через менеджер (путь гейта); слова 7/8 — зеркало.
+        assert!(!tasks.charge_cpu(&child, 8).unwrap());
+        assert!(tasks.charge_cpu(&child, 8).unwrap());
+        assert_eq!(word(7), 12, "кламп в квоту");
+        assert_eq!(word(8), 1 | (1 << 32), "ивент + флаг троттлинга");
+        assert_eq!(word(8) >> 32, 1, "флаг «троттлится сейчас»");
+
+        // Граница периода: заряды сброшены, история — нет.
+        assert_eq!(tasks.on_cpu_period(), 1);
+        assert_eq!(word(7), 0);
+        assert_eq!(word(8), 1, "история ивентов переживает refill");
+        assert_eq!(word(8) >> 32, 0);
+    }
+
+    #[test]
     fn thread_terminate_requires_domain_right() {
         let (reg, tasks, caps) = default_table_world();
         let attacker = uuid_next();
@@ -2076,7 +2219,10 @@ mod tests {
         push64(&mut d, 2u64); // limits[1]: max_threads = 2
         push64(&mut d, 4u64); // limits[2]: max_shm = 4
         push64(&mut d, 100u64); // limits[3]: max_prio = 100, may_spawn = 0
-        d.push(90); // priority
+        d.push(90); // priority @ 0x68
+        d.extend_from_slice(&[0u8; 3]); // паддинг 0x69..0x6B
+        // v0.10: CPU-квота — u32 @ 0x6C (хвост заголовка).
+        d.extend_from_slice(&12u32.to_le_bytes());
         while d.len() < SPAWN_DESC_HEADER_BYTES {
             d.push(0);
         }
@@ -2118,6 +2264,9 @@ mod tests {
         assert_eq!(sec.limits.max_pages, 8);
         assert_eq!(sec.limits.max_threads, 2);
         assert!(!sec.limits.may_spawn);
+        // v0.10: квота из дескриптора применена ДО первого потока —
+        // ребёнок рождается сразу в CPU-песочнице.
+        assert_eq!(sec.limits.cpu_quota, 12, "cpu_quota из u32 @ 0x6C");
         assert_eq!(sec.usage.pages, 3, "сегмент (2) + argv (1)");
 
         // Главный поток: Ready с линк-точкой входа; стартовое IPC —

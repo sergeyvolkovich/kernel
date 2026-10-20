@@ -484,7 +484,10 @@ impl KillSource {
 /// ```text
 ///  w0 = тег: 1 = Exit, 2 = Exception, 3 = Killed
 ///  w1..2 = TaskId (lo, hi) завершённой задачи
-///  Exit:      w3 = код выхода
+///  Exit:      w3 = код выхода,
+///             w4 = cpu_used — тики CPU последнего периода (v0.10),
+///             w5 = cpu_throttle_events — сколько раз домен входил
+///                  за предел CPU-квоты (вердикт песочницы)
 ///  Exception: w3 = fault_addr, w4 = ip, w5 = kind (FaultKind::as_word),
 ///             payload = снимок регистров (RegisterSnapshot)
 ///  Killed:    w3..5 = KillSource::to_words()
@@ -492,8 +495,13 @@ impl KillSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ExitPayload {
-    /// 1) Обычный выход: код возврата.
-    Exit { code: usize },
+    /// 1) Обычный выход: код возврата + CPU-статистика домена (v0.10:
+    ///    вердикт песочницы — квота держала домен, пока он не сдался).
+    Exit {
+        code: usize,
+        cpu_used: usize,
+        cpu_throttle_events: usize,
+    },
     /// 2) Исключение: снимок регистров процесса + указатели фолта.
     Exception {
         snapshot: RegisterSnapshot,
@@ -521,8 +529,14 @@ impl ExitPayload {
         let _ = m.words.push(v as u64);
         let _ = m.words.push((v >> 64) as u64);
         match self {
-            Self::Exit { code } => {
+            Self::Exit {
+                code,
+                cpu_used,
+                cpu_throttle_events,
+            } => {
                 let _ = m.words.push(code as u64);
+                let _ = m.words.push(cpu_used as u64);
+                let _ = m.words.push(cpu_throttle_events as u64);
             }
             Self::Exception { snapshot, fault } => {
                 let _ = m.words.push(fault.fault_addr as u64);
@@ -547,6 +561,8 @@ impl ExitPayload {
         match tag {
             1 => Some(Self::Exit {
                 code: msg.word(3) as usize,
+                cpu_used: msg.word(4) as usize,
+                cpu_throttle_events: msg.word(5) as usize,
             }),
             2 => Some(Self::Exception {
                 snapshot: RegisterSnapshot(Box::from(msg.payload().unwrap_or(&[]))),
@@ -1349,10 +1365,21 @@ mod tests {
         let task = Uuid::from_u128(0xABCD_1234_5678);
 
         // 1. Код выхода.
-        let msg = ExitPayload::Exit { code: 7 }.into_message(task);
+        let msg = ExitPayload::Exit {
+            code: 7,
+            cpu_used: 3,
+            cpu_throttle_events: 1,
+        }
+        .into_message(task);
         assert_eq!(msg.word(0), 1);
         let back = ExitPayload::from_message(&msg).unwrap();
-        assert_eq!(back, ExitPayload::Exit { code: 7 });
+        assert!(
+            back == ExitPayload::Exit {
+                code: 7,
+                cpu_used: 3,
+                cpu_throttle_events: 1,
+            }
+        );
 
         // 2. Исключение: снимок регистров + указатели фолта.
         let payload = ExitPayload::Exception {

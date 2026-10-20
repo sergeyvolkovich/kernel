@@ -83,8 +83,13 @@ pub(crate) struct TaskObj {
     /// Дефолт — [`TaskLimits::UNLIMITED`] (доверенная задача); лимиты
     /// назначает держатель TaskTCB-права через `set_limits` (трещотка).
     pub(crate) limits: TaskLimits,
-    /// Учёт потребления для пределов (точки зарядки — сисколы памяти).
+    /// Учёт потребления для пределов (точки зарядки — сисколы памяти;
+    /// CPU — гейт планировщика при вытеснении, v0.10).
     pub(crate) usage: TaskUsage,
+    /// Живые (не Dead) потоки домена — ленивый счётчик GTCB (v0.10):
+    /// инкремент в `create_thread`, декремент в Dead-переходе потока.
+    /// Заменяет O(n)-обход реестра в проверке `max_threads` спавна.
+    pub(crate) live_threads: usize,
 }
 
 unsafe impl KernelObj for TaskObj {
@@ -212,6 +217,7 @@ impl TcbManager {
                 exit_ep: None,
                 limits: TaskLimits::UNLIMITED,
                 usage: TaskUsage::default(),
+                live_threads: 0,
             })
             .map_err(|_| TaskError::OutOfMemory)?;
 
@@ -256,7 +262,7 @@ impl TcbManager {
         let mut inner = self.inner.borrow_mut();
 
         let node = find_task(&inner, &task_id).ok_or(TaskError::TaskNotFound(task_id))?;
-        let self_idx = {
+        let (self_idx, live) = {
             // SAFETY: под borrow_mut менеджера доступ к объекту эксклюзивен.
             let tcb: &TaskObj = unsafe { &*UnsafeRef::into_raw(node) };
             if tcb.state != TaskState::Dead {
@@ -268,15 +274,10 @@ impl TcbManager {
                     caps: tcb.caps.live_count(),
                 });
             }
-            tcb.self_idx
+            (tcb.self_idx, tcb.live_threads)
         };
         // Осиротевшие живые потоки — отказ (каскад должен был погасить).
-        let live = inner
-            .threads
-            .by_uuid
-            .iter()
-            .filter(|t| t.owner == task_id && t.state != TaskState::Dead)
-            .count();
+        // v0.10: ленивый счётчик GTCB вместо O(n)-обхода реестра.
         if live != 0 {
             return Err(TaskError::TaskHasThreads {
                 task: task_id,
@@ -379,6 +380,76 @@ impl TcbManager {
             let tcb: &mut TaskObj = unsafe { &mut *UnsafeRef::into_raw(node) };
             tcb.usage.shm = tcb.usage.shm.saturating_sub(1);
         }
+    }
+
+    // ==== CPU-квоты v0.10 (учёт троттлинга песочницы) ====
+
+    /// Зарядить домену `ticks` тиков CPU (вытеснение потока гейтом
+    /// планировщика; минимум 1 за проход — анти-спин для yield-циклов).
+    ///
+    /// Потреблённое не отказываем — счётчик клампится в квоту. Возврат
+    /// `Ok(true)` — домен за пределом `cpu_quota`: планировщик обязан
+    /// запарковать вытеснённый поток до границы периода (троттлинг).
+    /// Первый вход за предел (и каждый после сброса периода) — аудит
+    /// песочницы + `cpu_throttle_events += 1`. Квота `usize::MAX`
+    /// (доверенный домен) — быстрый путь без бухгалтерии.
+    pub fn charge_cpu(&self, task_id: &TaskId, ticks: usize) -> Result<bool, TaskError> {
+        if ticks == 0 {
+            return Ok(false);
+        }
+        let mut inner = self.inner.borrow_mut();
+        let node = find_task(&inner, task_id).ok_or(TaskError::TaskNotFound(*task_id))?;
+        // SAFETY: эксклюзивный доступ под borrow_mut.
+        let tcb: &mut TaskObj = unsafe { &mut *UnsafeRef::into_raw(node) };
+        let quota = tcb.limits.cpu_quota;
+        if quota == usize::MAX {
+            return Ok(false);
+        }
+        let total = tcb.usage.cpu_used.saturating_add(ticks);
+        if total < quota {
+            tcb.usage.cpu_used = total;
+            return Ok(false);
+        }
+        // За пределом: счётчик клампится, флаг один раз логируется.
+        tcb.usage.cpu_used = quota;
+        if !tcb.usage.cpu_throttled {
+            tcb.usage.cpu_throttled = true;
+            tcb.usage.cpu_throttle_events = tcb.usage.cpu_throttle_events.saturating_add(1);
+            sandbox_audit(&alloc::format!(
+                "cpu quota: domain {} throttled (charged {} ticks, limit {} per period)",
+                tcb.task_id,
+                total,
+                quota
+            ));
+        }
+        Ok(true)
+    }
+
+    /// Граница CPU-периода: сбросить учёт всех доменов (вызывает бекенд
+    /// планировщика через glue; потоки из троттл-листа возвращает в
+    /// готовность сам бекенд). Возврат — число доменов, которые
+    /// находились в троттлинге (аудит границы периода).
+    pub fn on_cpu_period(&self) -> usize {
+        let mut inner = self.inner.borrow_mut();
+        // Реестр (KeyAdapter-RBTree) даёт только &TaskObj — два прохода:
+        // снимок идентификаторов, затем точечные мутации через find_task
+        // (свежая UnsafeRef; consuming-into_raw — без переиспользования).
+        // Период редкий (~100 мс) — цена мала.
+        let ids: alloc::vec::Vec<TaskId> = inner.by_uuid.iter().map(|t| t.task_id).collect();
+        let mut unthrottled = 0;
+        for id in ids {
+            let Some(node) = find_task(&inner, &id) else {
+                continue;
+            };
+            // SAFETY: эксклюзивный доступ под borrow_mut; узел жив в реестре.
+            let t: &mut TaskObj = unsafe { &mut *UnsafeRef::into_raw(node) };
+            if t.usage.cpu_throttled {
+                unthrottled += 1;
+                t.usage.cpu_throttled = false;
+            }
+            t.usage.cpu_used = 0;
+        }
+        unthrottled
     }
 
     /// Предел `may_spawn` задачи (право творца; TASK_CREATE-хендлер).
@@ -678,10 +749,147 @@ impl Drop for TcbManager {
 
 // ==== Служебные ====
 
+/// Аудит песочницы: строка в консоль отладки ядра (каждая блокировка
+/// операции домена-песочницы видна оператору; v0.9 — сисколы, v0.10 —
+/// CPU-троттлинг). Живёт здесь, чтобы и подсистема задач (учёт квот),
+/// и сискол-фасад печатали единым префиксом «[kernel: sandbox] ».
+pub(crate) fn sandbox_audit(line: &str) {
+    use alloc::fmt::Write;
+    if let Some(sink) = crate::syscall::debug::debug_sink() {
+        let mut s = alloc::string::String::with_capacity(line.len() + 24);
+        let _ = write!(s, "\r\n[kernel: sandbox] {line}\r\n");
+        sink.write(s.as_bytes());
+    }
+}
+
 /// Поиск TaskObj по Uuid (редкий путь — дерево). Возвращает невладеющую
 /// ссылку: валидность гарантируется менеджером (узел жив, пока в реестре).
 pub(crate) fn find_task(inner: &TcbInner, task_id: &TaskId) -> Option<UnsafeRef<TaskObj>> {
     let ptr = inner.by_uuid.find(task_id).get_ptr()?;
     // SAFETY: указатель на живой узел реестра.
     Some(unsafe { UnsafeRef::from_raw(ptr.as_ptr()) })
+}
+
+// ==== Тесты (host) ====
+
+#[cfg(test)]
+mod tests {
+    use crate::task::{TaskLimits, TaskPriority, TcbManager};
+
+    fn uuid_next() -> uuid::Uuid {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0x3000);
+        uuid::Uuid::from_u128(NEXT.fetch_add(1, Ordering::Relaxed) as u128)
+    }
+
+    #[test]
+    fn cpu_quota_charge_throttle_and_period_refill() {
+        let tasks = TcbManager::new().unwrap();
+        let dom = uuid_next();
+        tasks.create(dom, TaskPriority::DEFAULT).unwrap();
+
+        // Доверенный домен (UNLIMITED): зарядка — без бухгалтерии.
+        assert!(!tasks.charge_cpu(&dom, 10_000).unwrap());
+        assert_eq!(tasks.sec_view(&dom).unwrap().usage.cpu_used, 0);
+
+        // Квота 10 тиков; трещотка не даёт её расширить.
+        tasks
+            .set_limits(
+                &dom,
+                TaskLimits {
+                    cpu_quota: 10,
+                    ..TaskLimits::UNLIMITED
+                },
+            )
+            .unwrap();
+        tasks.set_limits(&dom, TaskLimits::UNLIMITED).unwrap();
+        assert_eq!(tasks.sec_view(&dom).unwrap().limits.cpu_quota, 10);
+
+        // В пределах — копится, троттлинга нет.
+        assert!(!tasks.charge_cpu(&dom, 4).unwrap());
+        assert!(!tasks.charge_cpu(&dom, 5).unwrap());
+        let sec = tasks.sec_view(&dom).unwrap();
+        assert_eq!(sec.usage.cpu_used, 9);
+        assert!(!sec.usage.cpu_throttled);
+
+        // Перебор: троттл (кламп счётчика + один ивент на вход).
+        assert!(tasks.charge_cpu(&dom, 5).unwrap());
+        let sec = tasks.sec_view(&dom).unwrap();
+        assert_eq!(sec.usage.cpu_used, 10, "счётчик клампится в квоту");
+        assert!(sec.usage.cpu_throttled);
+        assert_eq!(sec.usage.cpu_throttle_events, 1);
+
+        // Повторные заряды внутри троттлинга — ивент не растёт.
+        assert!(tasks.charge_cpu(&dom, 7).unwrap());
+        assert_eq!(tasks.sec_view(&dom).unwrap().usage.cpu_throttle_events, 1);
+
+        // Нулевой заряд — no-op.
+        assert!(!tasks.charge_cpu(&dom, 0).unwrap());
+
+        // Граница периода: сброс всем, счётчик ивентов — живёт.
+        assert_eq!(tasks.on_cpu_period(), 1);
+        let sec = tasks.sec_view(&dom).unwrap();
+        assert_eq!(sec.usage.cpu_used, 0);
+        assert!(!sec.usage.cpu_throttled);
+        assert_eq!(sec.usage.cpu_throttle_events, 1, "история не стирается");
+
+        // Новый период: снова троттл — второй ивент.
+        assert!(!tasks.charge_cpu(&dom, 9).unwrap());
+        assert!(tasks.charge_cpu(&dom, 9).unwrap());
+        assert_eq!(tasks.sec_view(&dom).unwrap().usage.cpu_throttle_events, 2);
+
+        // Несуществующий домен — ошибка, а не false.
+        let ghost = uuid_next();
+        assert!(tasks.charge_cpu(&ghost, 1).is_err());
+    }
+
+    #[test]
+    fn lazy_thread_counters_match_reality() {
+        let tasks = TcbManager::new().unwrap();
+        let a = uuid_next();
+        let b = uuid_next();
+        tasks.create(a, TaskPriority::DEFAULT).unwrap();
+        tasks.create(b, TaskPriority::DEFAULT).unwrap();
+
+        // Пять живых потоков в двух доменах: счётчики O(1) обязаны
+        // совпадать с фактическим состоянием реестра.
+        let mut ids = alloc::vec::Vec::new();
+        for i in 0..3 {
+            let t = uuid_next();
+            tasks
+                .create_thread(t, a, TaskPriority(1), 0x1000, 0x9000)
+                .unwrap();
+            ids.push(t);
+            let _ = i;
+        }
+        let tb = uuid_next();
+        tasks
+            .create_thread(tb, b, TaskPriority(1), 0x1000, 0x9000)
+            .unwrap();
+        let tb2 = uuid_next();
+        tasks
+            .create_thread(tb2, b, TaskPriority(1), 0x1000, 0x9000)
+            .unwrap();
+
+        assert_eq!(tasks.thread_count(&a), 3);
+        assert_eq!(tasks.thread_count(&b), 2);
+        assert_eq!(tasks.total_thread_count(), 5);
+
+        // Гасим по одному: декременты идут и в домен, и в систему.
+        tasks
+            .thread_set_state(&ids[0], crate::task::types::TaskState::Running)
+            .unwrap();
+        tasks
+            .thread_set_state(&ids[0], crate::task::types::TaskState::Dead)
+            .unwrap();
+        assert_eq!(tasks.thread_count(&a), 2);
+        assert_eq!(tasks.total_thread_count(), 4);
+
+        // Каскад смерти домена: все его потоки — в один Dead-переход.
+        tasks
+            .set_state(&b, crate::task::types::TaskState::Dead)
+            .unwrap();
+        assert_eq!(tasks.thread_count(&b), 0, "каскад обнулил счётчик домена");
+        assert_eq!(tasks.total_thread_count(), 2);
+    }
 }

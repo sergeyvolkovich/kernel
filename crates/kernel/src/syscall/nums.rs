@@ -120,19 +120,28 @@ pub const THREAD_YIELD: SyscallNumber = SyscallNumber(0x1B);
 /// Требует TaskTCB домена потока.
 pub const THREAD_EX_REGS: SyscallNumber = SyscallNumber(0x1C);
 
-/// Назначить пределы песочницы задаче (атрибуты GTCB, v0.9).
+/// Назначить пределы песочницы задаче (атрибуты GTCB, v0.9; v0.10 —
+/// CPU-квота).
 /// ПРАВО: capability TaskTCB на ЦЕЛЬ. Семантика — трещотка: новые
 /// значения только УЖЕСТОЧАЮТ текущие (`TaskLimits::tighten`).
 /// ABI: arg1 = хендл TaskTCB цели, arg2 = max_pages,
 /// arg3 = max_threads | (max_endpoints << 32),
 /// arg4 = max_shm | (max_caps << 32),
-/// arg5 = max_prio (u8) | (may_spawn ? 0x100 : 0).
+/// arg5 = max_prio (u8) | (may_spawn ? 0x100 : 0)
+///       | (cpu_quota << 16) — квота CPU в тиках за период (v0.10);
+///       биты 63:16 = 0 — квоту НЕ ТРОГАТЬ (наследие v0.9: нулевое
+///       поле старых вызовов не замораживает домен), все единицы —
+///       кандидат «без лимита» (трещотка не ослабит), 1 — замороз.
 pub const TASK_SET_LIMITS: SyscallNumber = SyscallNumber(0x1D);
 
-/// Снимок атрибутов безопасности задачи (v0.9). ПРАВО: TaskTCB на цель.
+/// Снимок атрибутов безопасности задачи (v0.9; v0.10 — слова 6..8 CPU).
+/// ПРАВО: TaskTCB на цель.
 /// Слова по индексу: 0 = max_pages, 1 = usage pages, 2 = usage shm,
 /// 3 = max_threads | (max_endpoints << 32), 4 = max_shm |
-/// (max_caps << 32), 5 = max_prio | (may_spawn ? 0x100 : 0).
+/// (max_caps << 32), 5 = max_prio | (may_spawn ? 0x100 : 0),
+/// 6 = cpu_quota (usize::MAX = без лимита), 7 = cpu_used (тики
+/// текущего периода), 8 = cpu_throttle_events |
+/// (cpu_throttled ? 0x1_0000_0000 : 0).
 /// ABI: arg1 = хендл TaskTCB цели, arg2 = индекс слова.
 pub const TASK_LIMITS_INFO: SyscallNumber = SyscallNumber(0x1E);
 
@@ -160,6 +169,10 @@ pub const TASK_LIMITS_INFO: SyscallNumber = SyscallNumber(0x1E);
 ///   +0x58 u64 limits[2]     max_shm | (max_caps << 32)
 ///   +0x60 u64 limits[3]     max_prio | (may_spawn ? 0x100 : 0)
 ///   +0x68 u8  priority      приоритет домена/потока
+///   +0x6C u32 cpu_quota     квота CPU в тиках за период (v0.10):
+///                          0 = без лимита (паддинг дескрипторов v0.9),
+///                          0xFFFF_FFFF = без лимита явно,
+///                          1..=0xFFFF_FFFE = квота
 ///   +0x70 сегменты, 32 байта каждый:
 ///        u64 src   адрес сегмента у РОДИТЕЛЯ (MEM_ALLOC-регион)
 ///        u64 dst   линк-адрес сегмента у РЕБЁНКА (4K-выровнен)

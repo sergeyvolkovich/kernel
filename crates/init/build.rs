@@ -23,6 +23,9 @@ fn main() {
     // v0.9: образ rogue -> OUT_DIR/child.bin (нет env — пустой файл:
     // init печатает «no embedded child image» и пропускает демо;
     // host-сборки cargo test образ не требуют).
+    // Пересборка при смене ROGUE_ELF: без этой директивы cargo кэширует
+    // результат build-скрипта и не замечает переключение образа (v0.10).
+    println!("cargo::rerun-if-env-changed=ROGUE_ELF");
     let out = Path::new(&std::env::var("OUT_DIR").unwrap()).join("child.bin");
     match std::env::var("ROGUE_ELF") {
         Ok(p) if !p.is_empty() && Path::new(&p).exists() => {

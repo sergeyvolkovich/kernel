@@ -1,4 +1,4 @@
-// ==== Планировщик-бекенд x86_64 (v0.6: SMP, глобальная очередь + per-CPU) ====
+// ==== Планировщик-бекенд x86_64 (v0.6: SMP, глобальная очередь + per-CPU; v0.10: CPU-квоты) ====
 //
 // Реализация контракта `SchedulerInterface` ядра + собственные структуры
 // диспетчеризации (контексты пользовательских потоков, очередь готовности,
@@ -13,13 +13,28 @@
 //   * eager FPU: fxsave/fxrstor на каждом переключении (без CR0.TS);
 //   * контексты/block-очереди — глобальные (BKL сериализует доступ).
 //
+// CPU-квоты v0.10 (троттлинг песочницы):
+//   * учёт — в GTCB доменов (kernel-крейт: `TaskLimits::cpu_quota` в
+//     тиках за период, `TaskUsage::cpu_used/throttle_events`), решение
+//     принимает ядро через glue (`on_timeslice_consumed`), бекенд только
+//     исполняет: паркует поток в троттл-лист вместо очереди готовности;
+//   * период — ГЛОБАЛЬНЫЙ счётчик тиков `CPU_TICKS` (все CPU, включая
+//     ядровые/idle-тики — таймер не даёт троттл-листу зависнуть навечно:
+//     даже полностью «замороженный» планировщиками период истечёт);
+//   * граница периода: атомарный флаг `CPU_PERIOD_WRAP` снимает любой
+//     из preempt-путей под BKL → glue `on_cpu_period` (сброс учёта в
+//     ядре) → дренаж троттл-листа в готовность (+ resched-IPI всем);
+//   * заряд — при каждом вытеснении: max(1, slice_used) тиков
+//     (per-CPU GS-счётчик), так yield-цикл не дешевле честного кванта.
+//
 // Инвариант BKL (klock.rs): все методы ядра выполняются держателем BKL;
-// быстрые per-CPU пути (тик, флаги) в атомиках/GS — без BKL.
+// быстрые per-CPU пути (тик, флаги) — в атомиках/GS — без BKL.
 
 use alloc::{
     boxed::Box,
     collections::{BTreeMap, VecDeque},
 };
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 
 use pkg_generic_interface::hal::traits::kmap::IsolationPolicy;
@@ -122,6 +137,10 @@ impl UserCtx {
 struct Inner {
     /// Готовность (FIFO, RR) — глобальная, все CPU под BKL.
     ready: VecDeque<ThreadId>,
+    /// Троттл-лист CPU-квот (v0.10): потоки доменов, перебравших
+    /// `cpu_quota`, — до границы периода. Контексты — в `contexts`
+    /// (парковка как у Blocked), из готовности исключены.
+    throttled: VecDeque<ThreadId>,
     /// Контексты живых потоков (создаются при первом входе / сохраняются
     /// при переключении).
     contexts: BTreeMap<u128, Box<UserCtx>>,
@@ -139,12 +158,29 @@ pub struct X86Sched {
 static SCHED: X86Sched = X86Sched {
     inner: Mutex::new(Inner {
         ready: VecDeque::new(),
+        throttled: VecDeque::new(),
         contexts: BTreeMap::new(),
         block_queues: BTreeMap::new(),
         next_queue_id: 1,
         policy: IsolationPolicy::conservative(),
     }),
 };
+
+// ───────────────────── CPU-квоты v0.10: период и троттлинг ─────────────────────
+
+/// Длина CPU-периода — ГЛОБАЛЬНЫХ тиков всех CPU (тик = 1/SCHED_HZ с).
+/// 2 CPU ≈ 100 тиков/с суммарно → период ≈ 1 с стена; квота домена —
+/// доля от этого бюджета (12 из 100 ≈ 12% CPU).
+pub const CPU_PERIOD_TICKS: u64 = 100;
+
+/// Глобальный счётчик тиков периода (инкремент — `note_wall_tick`,
+/// вызывается из timer_c на КАЖДОМ тике: пользовательском, ядровом,
+/// idle — иначе троттл-лист зависнет без будящего источника).
+static CPU_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Флаг «период завершился — нужен refill». Ставит `note_wall_tick`,
+/// снимает (once) preempt-путь/idle-будка под BKL.
+static CPU_PERIOD_WRAP: AtomicBool = AtomicBool::new(false);
 
 /// Ссылка на планировщик (установка в TcbManager::install_scheduler).
 pub fn scheduler() -> &'static X86Sched {
@@ -196,8 +232,11 @@ impl X86Sched {
     /// (mark_running) — здесь только очередь + пер-процессорные поля.
     pub fn pick_next(&self) -> Option<ThreadId> {
         let next = self.inner.lock().ready.pop_front()?;
-        // Квант СВОЕМУ CPU (GS); SCHED_HZ/10 тиков ~ 100 мс.
+        // Квант СВОЕМУ CPU (GS); SCHED_HZ/10 тиков ~ 100 мс. v0.10:
+        // и счётчик потреблённых тиков в ноль — заряд домену с чистого
+        // листа (см. preempt_step: max(1, slice_used) за вытеснение).
         arch::percpu::set_quantum(arch::boot::SCHED_HZ / 10);
+        arch::percpu::set_slice_used(0);
         Some(next)
     }
 
@@ -207,6 +246,66 @@ impl X86Sched {
             let mut inner = self.inner.lock();
             inner.ready.push_back(t);
         }
+    }
+
+    // ==== CPU-квоты v0.10 (троттлинг песочницы) ====
+
+    /// Отметить глобальный тик периода (timer_c — КАЖДЫЙ тик ЛЮБОГО CPU,
+    /// ДО развилки user/kernel/idle: иначе троттл-лист зависнет без
+    /// будящего источника). Возврат `true` — период завершился:
+    /// вызывающий ставит need_resched/refill-обработку.
+    pub fn note_wall_tick(&self) -> bool {
+        let t = CPU_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+        if t % CPU_PERIOD_TICKS == 0 {
+            CPU_PERIOD_WRAP.store(true, Ordering::Release);
+            return true;
+        }
+        false
+    }
+
+    /// Есть ли незакрытая граница периода? (idle-будка — дешёвый peek
+    /// без BKL; once-снятие — `take_period_wrap` под BKL.)
+    pub fn period_wrap_pending(&self) -> bool {
+        CPU_PERIOD_WRAP.load(Ordering::Acquire)
+    }
+
+    /// Снять флаг границы периода (кто снял — тот и делает refill).
+    pub fn take_period_wrap(&self) -> bool {
+        CPU_PERIOD_WRAP.swap(false, Ordering::AcqRel)
+    }
+
+    /// Тики, потреблённые текущим потоком с диспетчеризации, — снять
+    /// (сам заряд домену — в preempt-шаге через glue; минимум 1 — там).
+    pub fn take_slice_used(&self) -> u64 {
+        let v = arch::percpu::slice_used();
+        arch::percpu::set_slice_used(0);
+        v
+    }
+
+    /// Запарковать текущий поток в троттл-лист (домен за пределом
+    /// cpu_quota): НЕ возвращается в готовность до границы периода.
+    /// Контекст уже сохранён в `contexts` парком preempt-шага.
+    pub fn throttle_current(&self) {
+        if let Some(t) = self.current_thread() {
+            self.inner.lock().throttled.push_back(t);
+        }
+    }
+
+    /// Граница периода: дренаж троттл-листа в готовность (FIFO-порядок
+    /// сохранён). Возврат — число возвращённых потоков; гейт по >0
+    /// рассылает resched-IPI (будим idle-CPU).
+    pub fn unthrottle_all(&self) -> usize {
+        let mut inner = self.inner.lock();
+        let n = inner.throttled.len();
+        while let Some(t) = inner.throttled.pop_front() {
+            inner.ready.push_back(t);
+        }
+        n
+    }
+
+    /// Число потоков в троттл-листе (диагностика/аудит).
+    pub fn throttled_count(&self) -> usize {
+        self.inner.lock().throttled.len()
     }
 
     /// Контекст потока (первый вход — построить из start_info).
@@ -305,6 +404,11 @@ impl SchedulerInterface for X86Sched {
         if let Some(pos) = inner.ready.iter().position(|&t| t == task) {
             inner.ready.remove(pos);
         }
+        // v0.10: троттл-лист тоже — поток мог быть припаркован квотой,
+        // когда его погасили (Dead-каскад) или родитель приостановил.
+        if let Some(pos) = inner.throttled.iter().position(|&t| t == task) {
+            inner.throttled.remove(pos);
+        }
         Ok(())
     }
 
@@ -399,8 +503,11 @@ impl SchedulerInterface for X86Sched {
 
     /// Тик планировщика: уменьшить квант СВОЕГО CPU (per-CPU, без BKL —
     //  вызывается timer_c на быстром пути); при нуле — флаг resched.
+    /// v0.10: копит и `slice_used` — потреблённые тики текущего потока
+    /// (заряд домену — при вытеснении в preempt-шаге, уже под BKL).
     fn perform_tick(&self, delta: u64) {
         let _ = delta; // квант считаем тиками (см. gs:QUANTUM)
+        arch::percpu::set_slice_used(arch::percpu::slice_used() + 1);
         let q = arch::percpu::quantum();
         if q > 0 {
             let q = q - 1;
@@ -413,6 +520,67 @@ impl SchedulerInterface for X86Sched {
 }
 
 // ───────────────────── Диспетчеризация (гейт вызывает) ─────────────────────
+
+/// Граница CPU-периода (v0.10): сбросить учёт квот в ядре + вернуть
+/// троттл-лист в готовность. ТОЛЬКО ПОД BKL (кто снял флаг — тот и
+/// выполнил; один раз на границу). Возврат — был ли refill.
+///
+/// Вызывается: preempt-шагом (timer_c/выход из сискола), idle-будкой —
+/// до разбора очередей готовности.
+pub fn cpu_period_refill_if_due() -> bool {
+    if !SCHED.take_period_wrap() {
+        return false;
+    }
+    if let Some(glue) = startup::glue() {
+        glue.on_cpu_period();
+        let n = SCHED.unthrottle_all();
+        if n > 0 {
+            // Разбудить прочие CPU: в готовности появились потоки
+            // (как enqueue — шторм IPI на всплесках принят ценой простоты).
+            if crate::smp::online_mask() & !1 != 0 {
+                crate::lapic::broadcast_others(arch::boot::VEC_IPI_RESCHED);
+            }
+        }
+    }
+    true
+}
+
+/// Вытеснение текущего потока с учётом CPU-квот (v0.10).
+///
+/// Единый preempt-шаг гейта (под BKL; вызывается и из timer_c, и из
+/// выхода из сискола — то есть при квант-истечении, IPI-resched и
+/// THREAD_YIELD):
+///   1. закрыть границу CPU-периода (refill квот — до заряда: свежий
+///      период начинает счёт с нуля, заряд в старый невозможен);
+///   2. зарядить домену владельца max(1, slice_used) тиков через glue
+///      (ядро решает: троттлить домен или ещё можно исполняться);
+///   3. rotate (как прежде) или паркинг в троттл-лист;
+///   4. park + schedule_next (контекст сохранён, BKL отпустит вход).
+///
+/// Замечание о гранулярности: домен, чей квот перебран, может иметь
+/// второй поток в готовности — он отработает до одного вытеснения
+/// (ограниченный перерасход ≤ живые_потоки × квант на границу).
+pub fn preempt_step(ctx: Box<UserCtx>) -> ! {
+    cpu_period_refill_if_due();
+    if let Some(glue) = startup::glue() {
+        if let Some(cur) = SCHED.current_thread() {
+            // Минимум 1 тик за проход диспетчеризации: yield-цикл не
+            // дешевле честного кванта (анти-спин-лазейка для квот).
+            let used = SCHED.take_slice_used().max(1) as usize;
+            if glue.on_timeslice_consumed(cur, used) {
+                SCHED.throttle_current();
+            } else {
+                SCHED.rotate_current();
+            }
+        } else {
+            SCHED.rotate_current();
+        }
+    } else {
+        // До kinit (idle-холостой путь) — квот нет, просто rotate.
+        SCHED.rotate_current();
+    }
+    park_current(ctx)
+}
 
 /// Выбрать следующий поток и уйти в него (не возвращается).
 ///

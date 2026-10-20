@@ -48,6 +48,10 @@ pub const OFF_FRAME: usize = 0x50; // u64
 pub const OFF_NEED_RESCHED: usize = 0x58; // u64
 /// Квант текущего потока в тиках (u64; v0.6 — дописано в конец).
 pub const OFF_QUANTUM: usize = 0x60; // u64
+/// Тики, потреблённые текущим потоком с последней зарядки CPU-квоты
+/// домена (u64; v0.10): инкремент в `perform_tick`, сброс при диспет-
+/// чизации; гейт читает+гасит при вытеснении — заряд в GTCB домена.
+pub const OFF_SLICE_USED: usize = 0x68; // u64
 
 // ───────────────────── Сырой gs-доступ ─────────────────────
 
@@ -260,6 +264,19 @@ pub fn quantum() -> u64 {
 #[inline]
 pub fn set_quantum(q: u64) {
     unsafe { write_u64(OFF_QUANTUM, q) }
+}
+
+/// Тики, потреблённые текущим потоком с последней зарядки CPU-квоты
+/// (v0.10; см. `OFF_SLICE_USED`).
+#[inline]
+pub fn slice_used() -> u64 {
+    unsafe { read_u64(OFF_SLICE_USED) }
+}
+
+/// Установить счётчик потреблённых тиков текущего потока.
+#[inline]
+pub fn set_slice_used(v: u64) {
+    unsafe { write_u64(OFF_SLICE_USED, v) }
 }
 
 // ───────────────────── Настройка GS ─────────────────────

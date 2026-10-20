@@ -466,6 +466,14 @@ const CHILD_MAX_SHM: u64 = 2;
 const CHILD_MAX_CAPS: u64 = 8;
 const CHILD_MAX_PRIO: u8 = 100;
 const CHILD_PRIORITY: u8 = 90;
+/// CPU-квота ребёнка (v0.10, тики за период): rogue — болтливый IPC-задач
+/// (GO/READY/PING x3/ATTACK/REPORT = ~5-6 парков), каждая парковка —
+/// минимум 1 тик заряда; квота 3 трипается в середине пинг-понга —
+/// ядро включает троттлинг (аудит «[kernel: sandbox] cpu quota»), но
+/// протокол продолжает идти (парковки IPC не ждут refill) — квота не
+/// душит насмерть, а дисциплинирует. Период бекенда: 100 глобальных
+/// тиков; sustained-спиннер парковался бы вовсе до границы периода.
+const CHILD_CPU_QUOTA: u32 = 3;
 
 // Протокол (слова IPC; см. crates/rogue).
 const CMD_GO: u64 = 0x474F;
@@ -735,6 +743,13 @@ unsafe fn sandbox_demo() {
         for i in 0..b.len() {
             desc.add(0x68 + i).write_volatile(b[i]);
         }
+        // v0.10: CPU-квота ребёнка — u32 @ 0x6C хвоста заголовка. Без
+        // неё yield-флуд воркеров и mem-флуд кружили бы CPU безнаказанно;
+        // с ней домен регулярно уходит в троттлинг до границы периода.
+        let q = CHILD_CPU_QUOTA.to_le_bytes();
+        for i in 0..4 {
+            desc.add(0x6C + i).write_volatile(q[i]);
+        }
         // Сегменты: образ (по плану) + стек.
         for i in 0..n_segs {
             let base = SPAWN_HDR + i * SPAWN_SEG;
@@ -768,6 +783,10 @@ unsafe fn sandbox_demo() {
         }
         let tcb_child = r as u64;
         debug_word_line("init: sandbox: child TaskTCB handle = ", tcb_child);
+        // v0.10: подтверждение квоты — слово 6 (cpu_quota) сразу после
+        // спавна: ребёнок родился в CPU-песочнице (дескриптор, u32 @ 0x6C).
+        let qw = syscall6(SYS_TASK_LIMITS_INFO, tcb_child, 6, 0, 0, 0, 0);
+        debug_word_line("init: sandbox: child cpu_quota word = ", qw as u64);
 
         // ---- (4) Порты и права ----
         let gate = syscall6(SYS_EP_CREATE, 4, 0, 0, 0, 0, 0);
@@ -893,7 +912,18 @@ unsafe fn sandbox_demo() {
         debug_word_line("init: sandbox: exit notification tag = ", exit_tag as u64);
         let exit_code = msg_word(3);
         debug_word_line("init: sandbox: child exit code = ", exit_code as u64);
+        // v0.10: CPU-статистика домена в exit-уведомлении (w4/w5) —
+        // вердикт квоты без гонок с reaper'ом (ядро разрушает GTCB до
+        // того, как init успел бы опросить TASK_LIMITS_INFO мёртвого).
+        let cpu_used = msg_word(4);
+        let throttle_events = msg_word(5);
+        debug_word_line("init: sandbox: child cpu_used (ticks) = ", cpu_used as u64);
+        debug_word_line(
+            "init: sandbox: child cpu throttle events = ",
+            throttle_events as u64,
+        );
         let clean_exit = exit_tag == 1 && exit_code == 0x5A;
+        let cpu_held = throttle_events > 0;
 
         // Приманка отработала: уничтожаем СВОЙ регион (владелец — init).
         let bait_gone = syscall6(0x65, shm_bait as u64, 0, 0, 0, 0, 0);
@@ -915,8 +945,9 @@ unsafe fn sandbox_demo() {
         let usage = syscall6(SYS_TASK_LIMITS_INFO, tcb_self, 1, 0, 0, 0, 0);
         debug_word_line("init: sandbox: init page usage now = ", usage as u64);
 
-        if reported && blocked >= 8 && ping_ok == 3 && clean_exit {
+        if reported && blocked >= 8 && ping_ok == 3 && clean_exit && cpu_held {
             puts("init: sandbox VERDICT: sandbox HELD — all escape/DoS attempts blocked");
+            puts("init: sandbox VERDICT: cpu quota HELD — child throttled by GTCB budget");
         } else {
             puts("init: sandbox VERDICT: demo finished with anomalies (see above)");
         }

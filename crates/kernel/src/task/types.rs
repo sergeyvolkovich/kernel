@@ -127,6 +127,16 @@ pub struct TaskLimits {
     pub max_prio: u8,
     /// Право творца: разрешено ли TASK_CREATE (создание новых доменов).
     pub may_spawn: bool,
+    /// CPU: максимум тиков планировщика за период (v0.10).
+    ///
+    /// Период — политика бекенда планировщика (x86_64: `CPU_PERIOD_TICKS`
+    /// глобальных тиков всех CPU; тик = 1/SCHED_HZ сек). Тики зарядуются
+    /// домену на КАЖДОМ конце отрезка исполнения потока — вытеснение
+    /// (квант/yield/IPI) и блокировка (IPC/claim): минимум 1 тик за
+    /// проход (анти-спин: yield-цикл и «вычислить-и-заблокироваться»
+    /// не дешевле честного кванта) плюс фактически потреблённые тики.
+    /// `usize::MAX` — без лимита.
+    pub cpu_quota: usize,
 }
 
 impl TaskLimits {
@@ -139,6 +149,7 @@ impl TaskLimits {
         max_caps: usize::MAX,
         max_prio: u8::MAX,
         may_spawn: true,
+        cpu_quota: usize::MAX,
     };
 
     /// Ужесточение (трещотка): каждое числовое поле — минимум из пары,
@@ -175,6 +186,11 @@ impl TaskLimits {
             } else {
                 self.max_prio
             },
+            cpu_quota: if other.cpu_quota < self.cpu_quota {
+                other.cpu_quota
+            } else {
+                self.cpu_quota
+            },
             may_spawn: self.may_spawn && other.may_spawn,
         }
     }
@@ -182,16 +198,25 @@ impl TaskLimits {
 
 /// Текущее потребление задачи (учёт для пределов; копия-снимок для аудита).
 ///
-/// Поля-счётчики ведёт ядро в точках зарядки (сисколы памяти/IPC);
-/// категория «endpoints» не хранится — она вычисляется по живым
-/// Gate-capability cspace (cчётчик разошёлся бы с реальностью при
-/// CAP_DELETE/CAP_REVOKE гейта).
+/// Поля-счётчики ведёт ядро в точках зарядки (сисколы памяти/IPC; CPU —
+/// гейт планировщика при вытеснении); категория «endpoints» не хранится —
+/// она вычисляется по живым Gate-capability cspace (cчётчик разошёлся бы
+/// с реальностью при CAP_DELETE/CAP_REVOKE гейта).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TaskUsage {
     /// Заряжено страниц (MEM_ALLOC + входящие окна map/transfer/SHM).
     pub pages: usize,
     /// Живые SHM-регионы (SHM_CREATE − SHM_DESTROY).
     pub shm: usize,
+    /// CPU: тики, потреблённые доменом в текущем периоде (v0.10).
+    /// На границе периода счётчик сбрасывает `TcbManager::on_cpu_period`.
+    pub cpu_used: usize,
+    /// CPU: домен сейчас за пределом квоты (потоки паркует планировщик
+    /// до границы периода) — зеркало решения `charge_cpu`.
+    pub cpu_throttled: bool,
+    /// CPU: сколько раз домен входил за предел квоты (каждое повторное
+    /// включение троттлинга — +1; аудит песочницы).
+    pub cpu_throttle_events: usize,
 }
 
 /// Снимок атрибутов безопасности задачи (аудит песочницы, TASK_LIMITS_INFO).

@@ -89,6 +89,14 @@ extern "C" fn syscall_c(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6
 
     // Блокировка (IPC/claim): фрейм -> контекст, дальше без возврата.
     if glue.thread_blocked(thread) {
+        // v0.10: блокировка — тоже конец отрезка исполнения: зарядить
+        // домену потреблённые тики (минимум 1 за проход, как у preempt-
+        // шага — иначе «вычислить-и-заблокироваться» жил бы вне квот;
+        // решением троттлить пренебрегаем: поток уже паркуется сам).
+        if let Some(cur) = sched::scheduler().current_thread() {
+            let used = sched::scheduler().take_slice_used().max(1) as usize;
+            let _ = glue.on_timeslice_consumed(cur, used);
+        }
         let frame =
             unsafe { &*(arch::percpu::read_u64(arch::percpu::OFF_FRAME) as *const SysFrame) };
         let user_rsp = unsafe { arch::percpu::read_u64(arch::percpu::OFF_USER_RSP) };
@@ -96,8 +104,9 @@ extern "C" fn syscall_c(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6
         sched::park_current(Box::new(ctx));
     }
 
-    // Вытеснение (квант истёк/yield): текущий — в хвост, дальше без
-    // возврата... но возврат значения уже записан в ctx.rax.
+    // Вытеснение (квант истёк/yield/wrap-периода): единый preempt-шаг
+    // v0.10 — refill CPU-периода, заряд квоты домену, rotate или
+    // троттл-парк; не возвращается (BKL отпустит вход следующего).
     if sched::scheduler().take_need_resched() {
         let frame =
             unsafe { &*(arch::percpu::read_u64(arch::percpu::OFF_FRAME) as *const SysFrame) };
@@ -108,9 +117,8 @@ extern "C" fn syscall_c(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6
         // здесь делали rip += 2 — двойное продвижение отправляло поток в
         // середину инструкции (SMP-вытеснение проявило: декод мусора,
         // #PF на запись в RX). rcx-семантика уже выставлена frame_to_ctx.
-        sched::scheduler().rotate_current();
         let boxed: Box<UserCtx> = Box::new(ctx);
-        sched::park_current(boxed); // BKL держится до enter_user
+        sched::preempt_step(boxed); // не возвращается
     }
 
     // Возврат в пользователя: отпустить BKL ДО sysret (IF восстановит
@@ -188,13 +196,24 @@ struct TickFrame {
 extern "C" fn timer_c(frame: *mut TickFrame) {
     let f = unsafe { &mut *frame };
     lapic::eoi();
+
+    // v0.10: глобальный тик CPU-периода — ДО развилки user/kernel:
+    // idle/ядровые тики тоже двигают период (иначе троттл-лист зависнет
+    // без будящего источника). Граница — плюс флаг перепланировки себе:
+    // preempt-путь закроет её под BKL (refill), idle — на будке.
+    if sched::scheduler().note_wall_tick() {
+        arch::percpu::set_need_resched();
+    }
+
     let from_user = (f.cs & 3) == 3;
 
     if !from_user {
         // Прервано ядро: idle/hlt (готовность могла прибавиться — idle
         // сам перепроверит) ИЛИ BKL-спин чужого захвата (SMP: вложение
         // одного таймера в ядровый стек — дисциплина см. gate.rs шапка;
-        // здесь возврат без BKL). Быстрый путь без замка.
+        // здесь возврат без BKL). Быстрый путь без замка. Флаг
+        // need_resched от wrap останется — его снимет следующий вход
+        // в пользователя (выход из сискола/пользовательский тик).
         return;
     }
 
@@ -214,7 +233,6 @@ extern "C" fn timer_c(frame: *mut TickFrame) {
     // IF=1-спином: конкурент может держать ядро, наш IPI/EOI уже
     // отработали (EOI в начале обработчика).
     crate::klock::acquire();
-    let glue = kernel_glue();
     let thread = cpu::current_thread();
     if thread.as_u128() == 0 {
         // Тик до первого входа в пользователя (kinit) — невозможно
@@ -222,44 +240,39 @@ extern "C" fn timer_c(frame: *mut TickFrame) {
         crate::klock::release();
         return;
     }
-    if glue.live_thread_count() > 1 {
-        // Вытеснение: фрейм -> контекст, rotate, дальше без возврата
-        // (BKL отпустит finalize_and_enter).
-        let ctx = UserCtx {
-            rip: f.rip,
-            rflags: f.rflags,
-            rsp: f.rsp,
-            rax: f.rax,
-            rbx: f.rbx,
-            rcx: f.rcx,
-            rdx: f.rdx,
-            rsi: f.rsi,
-            rdi: f.rdi,
-            rbp: f.rbp,
-            r8: f.r8,
-            r9: f.r9,
-            r10: f.r10,
-            r11: f.r11,
-            r12: f.r12,
-            r13: f.r13,
-            r14: f.r14,
-            r15: f.r15,
-            fx: [0; 512],
-        };
-        let mut boxed: Box<UserCtx> = Box::new(ctx);
-        unsafe {
-            core::arch::asm!(
-                "fxsave64 [{fx}]",
-                fx = in(reg) boxed.fx.as_mut_ptr(),
-                options(nostack)
-            );
-        }
-        sched::scheduler().rotate_current();
-        sched::park_current(boxed);
+    // v0.10: единый preempt-шаг работает и для ЕДИНСТВЕННОГО потока —
+    // квота обязана парковать и его (старый выход «вытеснение
+    // бессмысленно» кормил бы одиночного спиннера-DoS бессрочно).
+    let ctx = UserCtx {
+        rip: f.rip,
+        rflags: f.rflags,
+        rsp: f.rsp,
+        rax: f.rax,
+        rbx: f.rbx,
+        rcx: f.rcx,
+        rdx: f.rdx,
+        rsi: f.rsi,
+        rdi: f.rdi,
+        rbp: f.rbp,
+        r8: f.r8,
+        r9: f.r9,
+        r10: f.r10,
+        r11: f.r11,
+        r12: f.r12,
+        r13: f.r13,
+        r14: f.r14,
+        r15: f.r15,
+        fx: [0; 512],
+    };
+    let mut boxed: Box<UserCtx> = Box::new(ctx);
+    unsafe {
+        core::arch::asm!(
+            "fxsave64 [{fx}]",
+            fx = in(reg) boxed.fx.as_mut_ptr(),
+            options(nostack)
+        );
     }
-    // Единственный поток: вытеснение бессмысленно — вернуть управление
-    // (need_resched уже снят take_need_resched выше).
-    crate::klock::release();
+    sched::preempt_step(boxed);
 }
 
 // ───────────────────── Фолты ─────────────────────
@@ -394,6 +407,18 @@ pub fn idle_loop() -> ! {
     crate::klock::release();
     loop {
         x86_64::instructions::interrupts::enable_and_hlt();
+        // v0.10: границу CPU-периода закрывает и idle — его тики
+        // двигают период (note_wall_tick без from_user), а preempt-пути
+        // в idle нет: троттл-лист разбудим сами, иначе замороженные
+        // домены проспали бы до чужого пользовательского входа.
+        if sched::scheduler().period_wrap_pending() {
+            crate::klock::acquire();
+            sched::cpu_period_refill_if_due();
+            if sched::scheduler().has_ready() {
+                sched::schedule_next(); // не возвращается (BKL отпустит вход)
+            }
+            crate::klock::release();
+        }
         // Проснулись (тик/IPI): если появились готовые — вернуться в
         // диспетчеризацию (повторная проверка под BKL: между hlt и
         // захватом поток могли разобрать).
