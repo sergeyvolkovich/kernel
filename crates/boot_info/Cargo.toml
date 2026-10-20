@@ -1,0 +1,11 @@
+[package]
+name = "boot_info"
+version.workspace = true
+edition.workspace = true
+description = "Portable boot protocol: fixed-layout BootInfo handed from the boot stub to the kernel (firmware-agnostic)"
+
+[features]
+# Хост-тесты и утилиты (упаковка/разбор на хосте) — std.
+std = []
+
+[dependencies]

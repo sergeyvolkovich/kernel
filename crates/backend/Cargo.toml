@@ -1,0 +1,30 @@
+[package]
+name = "backend"
+version.workspace = true
+edition.workspace = true
+description = "x86_64 platform crate: HAL contract implementations (UserTables, console), CPU/GDT/TSS/IDT, LAPIC timer, scheduler backend, syscall gate, head.S + kernel image binary"
+
+[lib]
+name = "backend"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kernel"
+path = "src/bin/kernel.rs"
+
+[dependencies]
+pkg_generic_interface = { workspace = true }
+arch = { workspace = true }
+boot_info = { workspace = true }
+startup = { path = "../startup" }
+x86_64 = { workspace = true }
+raw-cpuid = { workspace = true }
+llfree = { git = "https://github.com/luhsra/llfree-rs.git" }
+bitflags = { workspace = true }
+spin = { workspace = true }
+uuid = { version = "1.28.0", default-features = false }
+# Intel VT-d: форматы таблиц/регистров (MMIO/последовательности — наши).
+intel-iommu = { workspace = true }
+
+[build-dependencies]
+cc = "1"

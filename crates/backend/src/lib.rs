@@ -1,0 +1,45 @@
+// ==== BACKEND: платформенный крейт x86_64 ====
+//
+// Исполнитель контрактов ядра (`pkg_generic_interface::hal::traits`,
+// `task::SchedulerInterface`, `startup::Platform`) на x86_64-железе:
+//
+//   * console  — COM1 (DebugSink + kprint!; SMP-спин лок с v0.6);
+//   * memory   — UserTables (MMAP/KMAP/ASID: страницы задач, перенос
+//     ядра MapFullKernel, CR3-активация), physmap-хелперы;
+//   * cpu      — GDT/TSS/IDT, per-CPU (GS), syscall-MSR (SMP: массивы);
+//   * lapic    — xAPIC + периодический таймер (PIT-калибровка) + часы
+//     + IPI (INIT-SIPI-SIPI / resched / shootdown / halt);
+//   * sched    — планировщик-бекенд (глобальная очередь + per-CPU
+//     текущий/квант/флаг, block-очереди, контексты);
+//   * ctxswitch — asm-граница режимов (syscall/tick/faults/enter/IPI);
+//   * gate     — rust-часть границы (диспетчеризация сисколов, тик,
+//     фолты, idle) — точки входа/выхода BKL;
+//   * klock    — big kernel lock (SMP v0.6: сериализация входов в ядро);
+//   * smp      — топология (MADT), SIPI-трамплин, bring-up AP, IPI,
+//     TLB shootdown, halt-all;
+//   * vtd      — Intel VT-d (DMAR/DRHD, QI, second-stage, IommuService);
+//   * platform — X86Platform (startup::Platform);
+//   * bin/kernel.rs — образ ядра: head.S -> kmain -> startup::kinit.
+//
+// Порядок от startup (kinit): head.S уже построил ядерные таблицы
+// (high-half + physmap) и переключил CR3; kmain делает платформенную
+// инициализацию (включая SMP bring-up до kinit — без кучи) и зовёт
+// арх-НЕЗАВИСИМУЮ startup::kinit; X86Platform::run отпускает APы в
+// планировщик и стартует VT-d.
+#![no_std]
+
+extern crate alloc;
+
+pub mod console;
+pub mod cpu;
+pub mod ctxswitch;
+pub mod gate;
+pub mod klock;
+pub mod lapic;
+pub mod memory;
+pub mod platform;
+pub mod sched;
+pub mod smp;
+pub mod vtd;
+
+pub use platform::X86Platform;

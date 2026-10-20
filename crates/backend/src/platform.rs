@@ -1,0 +1,198 @@
+// ==== X86Platform: реализация startup::Platform на x86_64 ====
+//
+// Вся арх-специфика загрузки в одном месте: консоль/время/планировщик —
+// модули бекенда; регионы ядра для KMAP — из линк-символов образа
+// (head.S/kernel.ld); изоляция — RDCL_NO-проверка (raw-cpuid); стек и
+// окно пользователя — константы ABI из arch::boot.
+
+use alloc::vec;
+use alloc::vec::Vec;
+
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use pkg_generic_interface::hal::traits::kmap::{IsolationPolicy, KernelRegion};
+use pkg_generic_interface::hal::traits::mmap::{MMAPMemoryFlags, MemErrorCode, VirtualADDR};
+use pkg_generic_interface::syscall::debug::DebugSink;
+use pkg_generic_interface::syscall::system::TimeSource;
+
+use arch::boot;
+
+use crate::console;
+use crate::lapic;
+use crate::memory::UserTables;
+use crate::sched;
+
+/// Размер окна фасада: 1 GiB (MEM_ALLOC-сисколы пользователя).
+const USER_WINDOW_PAGES: usize = (1 << 30) / 4096;
+/// Стек init: 16 страниц (64 KiB).
+const USER_STACK_PAGES: usize = 16;
+/// Вершина стека: на 16 MiB ниже базы фасадного окна (не пересекается).
+pub const USER_STACK_TOP: u64 = boot::USER_ALLOC_BASE - (16 << 20);
+
+// Линк-символы образа ядра (kernel.ld): границы образа.
+unsafe extern "C" {
+    static __kernel_start: u8;
+    static __kernel_end: u8;
+}
+
+/// Явное «meltdown=allow» из командной строки (boot_cfg.xml → cmdline
+/// ядра): принял риск — получай единственную возможную в v0.5 политику
+/// (MapFullKernel; KPTI не реализован — conservative ГАРАНТИРОВАННО
+/// уронит ядро на первом переключении в пользователя: верхняя половина
+/// пользовательских таблиц пуста).
+static MELTDOWN_ALLOW: AtomicBool = AtomicBool::new(false);
+
+/// Зафиксировать согласие на загрузку без RDCL_NO (вызывает kmain
+/// при meltdown=allow — до kinit/изоляции).
+pub fn set_meltdown_allow() {
+    MELTDOWN_ALLOW.store(true, Ordering::Release);
+}
+
+/// Платформа x86_64 (BSP, v0.5).
+pub struct X86Platform;
+
+impl X86Platform {
+    /// Размер образа ядра, байт.
+    fn kernel_image_len() -> u64 {
+        // SAFETY: линк-символы валидны всегда.
+        unsafe { (&raw const __kernel_end) as u64 - (&raw const __kernel_start) as u64 }
+    }
+
+    /// Политика изоляции по CPUID: RDCL_NO (Meltdown закрыт) — полное
+    /// supervisor-only ядро; иначе — консервативная изоляция (KPTI-класс
+    /// не реализован в v0.5 → честный отказ загрузки, см. kmain).
+    /// meltdown=allow (эмуляторы) — MapFullKernel: без RDCL_NO эмулятор
+    /// не имеет и самой спекулятивной утечки, а альтернатив нет.
+    fn probe_isolation() -> IsolationPolicy {
+        let p = if crate::cpu::has_rdcl_no() || MELTDOWN_ALLOW.load(Ordering::Acquire) {
+            IsolationPolicy::MapFullKernel
+        } else {
+            IsolationPolicy::conservative()
+        };
+        crate::kprintln!(
+            "platform: isolation policy = {} (rdcl_no={}, allow={})",
+            if matches!(p, IsolationPolicy::MapFullKernel) {
+                "MapFullKernel"
+            } else {
+                "conservative"
+            },
+            crate::cpu::has_rdcl_no(),
+            MELTDOWN_ALLOW.load(Ordering::Acquire)
+        );
+        p
+    }
+}
+
+impl startup::Platform for X86Platform {
+    type Mmap = UserTables;
+
+    fn console_write(&self, s: &str) {
+        console::kprint_str(s);
+    }
+
+    fn debug_sink(&self) -> Option<&'static dyn DebugSink> {
+        Some(&console::CONSOLE_SINK)
+    }
+
+    fn time_source(&self) -> Option<&'static dyn TimeSource> {
+        Some(&lapic::TIME_SOURCE)
+    }
+
+    fn scheduler(&self) -> &'static dyn pkg_generic_interface::task::SchedulerInterface {
+        sched::scheduler()
+    }
+
+    fn isolation_policy(&self) -> IsolationPolicy {
+        Self::probe_isolation()
+    }
+
+    fn kernel_regions(&self) -> Vec<KernelRegion> {
+        // Ядро в пользовательских таблицах: high-half образ, supervisor RWX
+        // (флаги уже в ядерных PML4-записях — копируем их как есть).
+        let pages = (Self::kernel_image_len() as usize + 4095) / 4096;
+        let mut regions = vec![
+            KernelRegion::kernel(
+                "kernel-image",
+                VirtualADDR(boot::KERNEL_LINK_BASE as usize),
+                pages,
+                MMAPMemoryFlags::RW, // фактические права — в копируемых записях
+            )
+            .expect("kernel region geometry is valid by construction"),
+        ];
+
+        // Physmap (PML4[256], 4 GiB): ОБЯЗАТЕЛЕН в пользовательских
+        // таблицах — ядро трогает phys_ptr (таблицы страниц, MMIO LAPIC,
+        // кадры пользователя) и при АКТИВНОМ пользовательском CR3
+        // (переключение контекста, сисколы фасада памяти). Supervisor-only
+        // по построению ядерных записей. Без него — #PF в ядре.
+        regions.push(
+            KernelRegion::kernel(
+                "physmap",
+                VirtualADDR(boot::PHYSMAP_BASE as usize),
+                (boot::PHYSMAP_COVERAGE as usize) / 4096,
+                MMAPMemoryFlags::RW,
+            )
+            .expect("physmap region geometry is valid by construction"),
+        );
+        regions
+    }
+
+    fn make_mmap(&self) -> Result<UserTables, MemErrorCode> {
+        UserTables::new()
+    }
+
+    fn phys_slice(&self, phys: u64, len: usize) -> &[u8] {
+        // SAFETY: контракт вызова — валидная физика на время жизни образа.
+        unsafe { core::slice::from_raw_parts(crate::memory::phys_ptr::<u8>(phys), len) }
+    }
+
+    fn physmap_base(&self) -> u64 {
+        boot::PHYSMAP_BASE
+    }
+
+    fn phys_slice_mut(&self, phys: u64, len: usize) -> &mut [u8] {
+        // SAFETY: контракт вызова — кадры принадлежат вызывающему.
+        unsafe { core::slice::from_raw_parts_mut(crate::memory::phys_ptr::<u8>(phys), len) }
+    }
+
+    fn user_alloc_base(&self) -> VirtualADDR {
+        VirtualADDR(boot::USER_ALLOC_BASE as usize)
+    }
+
+    fn user_window_pages(&self) -> usize {
+        USER_WINDOW_PAGES
+    }
+
+    fn user_stack_top(&self) -> u64 {
+        USER_STACK_TOP
+    }
+
+    fn user_stack_pages(&self) -> usize {
+        USER_STACK_PAGES
+    }
+
+    fn cpu_count(&self) -> usize {
+        crate::smp::cpu_count() // v0.6: топология MADT (BSP + поднятые AP)
+    }
+
+    fn run(&self) -> ! {
+        // kinit завершён (пулы/куча/GCTL/glue) — но fatal-пути тоже
+        // попадают сюда ДО готовности: VT-d ставится только при живом
+        // пуле кадров, APы отпускаются только при живом glue.
+        if pkg_generic_interface::mem::gallocator::frames().is_some() {
+            // Число CPU — в SELF_INFO (слово 5).
+            pkg_generic_interface::syscall::system::install_cpu_count(crate::smp::cpu_count());
+            // IOMMU (Intel VT-d): DMAR -> DRHD -> драйвер + сервис
+            // сисколов. До release_aps — конкуренции нет.
+            crate::vtd::init_and_install();
+        }
+        if startup::glue().is_some() {
+            // APы из парковки в планировщик (resched-IPI будит hlt).
+            crate::smp::release_aps();
+        }
+        // Первый вход BSP в диспетчеризацию — под BKL (инвариант
+        // schedule_next; см. ap_entry64).
+        crate::klock::acquire();
+        sched::schedule_next()
+    }
+}

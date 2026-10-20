@@ -1,0 +1,14 @@
+[package]
+name = "uefi_stub"
+version.workspace = true
+edition.workspace = true
+description = "UEFI boot stub (kernel.efi): reads ./boot_cfg.xml next to the image, loads servers, builds BootInfo v2, ExitBootServices, handoff"
+
+[dependencies]
+uefi = { workspace = true, features = ["alloc", "global_allocator"] }
+boot_info = { workspace = true }
+bootcfg = { workspace = true }
+
+[[bin]]
+name = "uefi_stub"
+path = "src/main.rs"

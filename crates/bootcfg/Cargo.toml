@@ -1,0 +1,8 @@
+[package]
+name = "bootcfg"
+version.workspace = true
+edition.workspace = true
+description = "boot_cfg.xml model + parser (used by the UEFI stub and host tools; the kernel never sees XML)"
+
+[dependencies]
+boot_info = { workspace = true }

@@ -1,0 +1,10 @@
+[package]
+name = "init"
+version.workspace = true
+edition.workspace = true
+description = "Init server: first user task (static ELF @ 0x40000000) — receives start-IPC (argc/argv + boot_state), prints configuration, exits via TASK_EXIT"
+
+[[bin]]
+name = "init"
+path = "src/main.rs"
+

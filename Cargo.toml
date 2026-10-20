@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/boot_info",
+    "crates/bootcfg",
+    "crates/kernel",
+    "crates/arch",
+    "crates/backend",
+    "crates/startup",
+    "crates/uefi_stub",
+    "crates/init",
+]
+
+# Хост-сборка (cargo build / cargo test без --target) — только
+# переносимые библиотеки; образы (kernel/init/uefi_stub) собираются
+# scripts/build_image.sh под свои цели: freestanding/UEFI бинари для
+# хоста не линкуются (no_main + собственные линк-скрипты).
+#
+# startup НЕ входит: его host-тестовый бинарь ссылается на ядро в
+# обычной (не test) конфигурации — #[global_allocator] talc требует
+# llfree, поднятого платформой ДО первой аллокации, и тестовый
+# рантайм падает до входа в тесты. startup проверяется сборкой
+# образа (build_image.sh) и будущими интеграционными тестами.
+default-members = [
+    "crates/boot_info",
+    "crates/bootcfg",
+    "crates/kernel",
+    "crates/arch",
+]
+
+# Общие настройки зависимостей для крейтов платформы.
+[workspace.package]
+version = "0.5.0"
+edition = "2024"
+
+[workspace.dependencies]
+pkg_generic_interface = { path = "crates/kernel" }
+boot_info = { path = "crates/boot_info" }
+bootcfg = { path = "crates/bootcfg" }
+arch = { path = "crates/arch" }
+backend = { path = "crates/backend" }
+
+# Готовые крейты «по краям» (прошивка/форматы/железо): политика ядра — наша.
+# xmas-elf: zero-copy ELF64 (загрузчик init в startup).
+xmas-elf = "0.10"
+# x86_64: таблицы страниц, GDT/TSS, адреса, порт I/O (backend).
+x86_64 = "0.15"
+# raw-cpuid: CPUID-декодинг (RDCL_NO/PCID/TSC-deadline, backend).
+raw-cpuid = "11"
+# uefi: EFI-биндинги заглушки (протоколы, FS, ExitBootServices).
+uefi = "0.41"
+
+# iommu-rs (VT-d / AMD-Vi): форматы таблиц + карта регистров, no_std.
+# Драйвер (MMIO, последовательности включения, QI) — наш бекенд.
+intel-iommu = { git = "https://github.com/sergeyvolkovich/iommu-rs.git" }
+amd-iommu = { git = "https://github.com/sergeyvolkovich/iommu-rs.git" }
+
+bitflags = "2.13.2"
+spin = { version = "0.12.3", features = ["portable-atomic", "lock_api"] }
+zerocopy = { version = "0.8", default-features = false }
+
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1

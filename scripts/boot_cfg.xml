@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<boot>
+  <servers>
+    <!-- init: первый сервер (обязателен, модуль [0] протокола). -->
+    <server name="init" path="init">
+      <arg>--demo</arg>
+      <arg>stage0</arg>
+    </server>
+  </servers>
+  <boot_state>
+    <!-- Переменные загрузки: транзитом init через стартовый IPC. -->
+    <var name="console" value="com1"/>
+    <var name="root" value="nvme0"/>
+    <var name="boot_mode" value="normal"/>
+    <var name="splash" value="off"/>
+  </boot_state>
+</boot>

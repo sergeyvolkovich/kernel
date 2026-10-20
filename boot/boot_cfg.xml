@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- boot_cfg.xml: конфигурация загрузки rust-l4 (читает UEFI-заглушка).
+     cmdline корня — командная строка ЯДРА (BootInfo.cmdline):
+     meltdown=allow нужен под QEMU/TCG (эмулятор не сообщает RDCL_NO
+     и не имеет спекулятивной утечки); на реальном железе БЕЗ KPTI
+     ядро обязано отказывать в загрузке — не ставьте этот флаг.
+     Серверы грузятся в порядке перечисления; [0] — init-сервер.
+     boot_state транзитом уходит init стартовым IPC (argc/argv). -->
+<boot cmdline="arch=x86_64 console=com1 meltdown=allow">
+  <servers>
+    <server name="init" path="init.elf">
+      <arg>stage=boot-chain</arg>
+      <arg>log=full</arg>
+    </server>
+  </servers>
+  <boot_state>
+    <var name="console" value="com1"/>
+    <var name="test_mode" value="qemu"/>
+    <var name="build" value="v0.5"/>
+    <var name="arch" value="x86_64"/>
+  </boot_state>
+</boot>
