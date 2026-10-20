@@ -25,6 +25,8 @@ spin = { workspace = true }
 uuid = { version = "1.28.0", default-features = false }
 # Intel VT-d: форматы таблиц/регистров (MMIO/последовательности — наши).
 intel-iommu = { workspace = true }
+# AMD-Vi (AMD IOMMU): форматы DTE/IVRS/команд/событий (наш драйвер — amd.rs).
+amd-iommu = { workspace = true }
 
 [build-dependencies]
 cc = "1"

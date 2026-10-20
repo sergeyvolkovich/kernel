@@ -27,9 +27,10 @@
 //   * RAM-ограничение: все таблицы из ядрового LLFree-пула, физика
 //     < 4 GiB (physmap; QEMU-масштаб), кадры возвращаются при detach.
 //
-// AMD-Vi (IVRS) — детект по DMAR-отсутствию; поддержка не в v0.6
-// (честный NotSupported). IRQ-ремаппинг (IRTE/IRTA) — следующая итерация:
-// включаем ТОЛЬКО DMA-часть (TE), IRE не трогаем.
+// AMD-Vi (IVRS) — драйвер-собрат `backend/amd.rs`; выбор вендора и
+// установка сервиса сисколов — агрегатор `crate::iommu`. IRQ-ремаппинг
+// (IRTE/IRTA) — следующая итерация: включаем ТОЛЬКО DMA-часть (TE),
+// IRE не трогаем.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -47,54 +48,8 @@ use pkg_generic_interface::hal::traits::iommu::{
 use pkg_generic_interface::hal::types::{Bdf, DevicePath, IommuProt};
 use pkg_generic_interface::syscall::iommu::IommuService;
 
+use crate::iommu::{Mmio, free_page, zero_page};
 use crate::memory::phys_ptr;
-
-// ───────────────────── MMIO (physmap, volatile) ─────────────────────
-
-/// Блок регистров DRHD.
-#[derive(Clone, Copy)]
-struct Mmio {
-    base: u64,
-}
-
-impl Mmio {
-    fn read32(&self, off: u64) -> u32 {
-        // SAFETY: physmap покрывает MMIO DRHD (< 4 GiB), выравнивание 4.
-        unsafe { phys_ptr::<u32>(self.base + off).read_volatile() }
-    }
-    fn read64(&self, off: u64) -> u64 {
-        // SAFETY: как read32, выравнивание 8.
-        unsafe { phys_ptr::<u64>(self.base + off).read_volatile() }
-    }
-    fn write32(&self, off: u64, v: u32) {
-        // SAFETY: как read32.
-        unsafe { phys_ptr::<u32>(self.base + off).write_volatile(v) };
-    }
-    fn write64(&self, off: u64, v: u64) {
-        // SAFETY: как read64.
-        unsafe { phys_ptr::<u64>(self.base + off).write_volatile(v) };
-    }
-}
-
-// ───────────────────── Кадры (ядровый LLFree) ─────────────────────
-
-/// Выделить обнулённую страницу (физика). None — пул не поднят/кончился.
-fn zero_page() -> Option<u64> {
-    let frames = pkg_generic_interface::mem::gallocator::frames()?;
-    let (_, fid) = frames.alloc(0, llfree::Class(0), None).ok()?;
-    let phys = fid.0 as u64 * 4096;
-    // SAFETY: кадр наш, physmap покрывает.
-    unsafe { core::ptr::write_bytes(phys_ptr::<u8>(phys), 0, 4096) };
-    Some(phys)
-}
-
-/// Вернуть страницу в пул.
-fn free_page(phys: u64) {
-    if let Some(frames) = pkg_generic_interface::mem::gallocator::frames() {
-        let fid = llfree::FrameId((phys / 4096) as usize);
-        frames.free(fid, 0, llfree::Class(0), None);
-    }
-}
 
 // ───────────────────── Second-stage таблицы (EPT-подобные, 4 уровня) ─────────────────────
 
@@ -302,9 +257,7 @@ impl Vtd {
 
     /// Инициализация по DRHD: MMIO-декод, таблицы, QI, включение TE.
     fn init(drhd: &Drhd) -> Result<Self, IommuError> {
-        let mmio = Mmio {
-            base: drhd.register_base(),
-        };
+        let mmio = Mmio::new(drhd.register_base());
         if drhd.register_base() >= 0x1_0000_0000 {
             return Err(IommuError::InvalidConfig); // вне physmap (v0.6)
         }
@@ -637,9 +590,14 @@ impl VtdDriver {
         }
     }
 
-    /// Пометить готовым (init_and_install после успешного Vtd::init).
+    /// Пометить готовым (try_init после успешного Vtd::init).
     fn mark_ready(&self) {
         self.ready.store(true, AtomicOrdering::Release);
+    }
+
+    /// Готовность контроллера (для агрегатора `crate::iommu`).
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(AtomicOrdering::Acquire)
     }
 }
 
@@ -832,21 +790,23 @@ impl IommuService for VtdDriver {
     }
 }
 
-// ───────────────────── Запуск (X86Platform::run) ─────────────────────
+// ───────────────────── Запуск (через iommu::init_and_install) ─────────────────────
 
-/// Поиск DMAR -> первый пригодный DRHD -> init драйвера -> установка
-/// сервиса сисколов. Вызывается ПОСЛЕ kinit (пулы/куча подняты), ДО
-/// release_aps (конкуренции ещё нет — APы припаркованы).
-pub fn init_and_install() {
+/// Поиск DMAR -> первый пригодный DRHD -> init драйвера -> пометка
+/// готовности. Вызывается ПОСЛЕ kinit (пулы/куча подняты), ДО release_aps
+/// (конкуренции ещё нет). Возврат — готовность (сервис ставит агрегатор
+/// `crate::iommu`; DMAR и IVRS не встречаются на одном железе, порядок
+/// — Intel первым — только для индексации ENUM).
+pub fn try_init() -> bool {
     // Пул не поднят (ранний fatal-путь run()) — тихо уходим: сисколы
     // ответят ENOSYS.
     if pkg_generic_interface::mem::gallocator::frames().is_none() {
-        return;
+        return false;
     }
     let rsdp = crate::smp::topology().rsdp_phys;
     if rsdp == 0 {
         crate::kprintln!("vtd: no RSDP — IOMMU unavailable");
-        return;
+        return false;
     }
     let found = crate::smp::find_table(rsdp, b"DMAR", |p, n| {
         let mut out = [0u8; 8];
@@ -858,8 +818,8 @@ pub fn init_and_install() {
     let (phys, len) = match found {
         Ok(x) => x,
         Err(_) => {
-            crate::kprintln!("vtd: no DMAR table — IOMMU unavailable (QEMU: -device intel-iommu)");
-            return;
+            crate::kprintln!("vtd: no DMAR table (QEMU: -device intel-iommu)");
+            return false;
         }
     };
     // SAFETY: таблица прошивки живёт всю сессию.
@@ -868,7 +828,7 @@ pub fn init_and_install() {
         Ok(d) => d,
         Err(e) => {
             crate::kprintln!("vtd: DMAR parse failed: {:?}", e);
-            return;
+            return false;
         }
     };
     // Предпочитаем INCLUDE_PCI_ALL DRHD; иначе первый.
@@ -889,23 +849,20 @@ pub fn init_and_install() {
         Some(d) => *d,
         None => {
             crate::kprintln!("vtd: DMAR without DRHD units");
-            return;
+            return false;
         }
     };
     match Vtd::init(&drhd) {
         Ok(v) => {
             *VTD0.inner.lock() = Some(v);
-            // Готовность сервиса: помечаем ПОСЛЕ заполнения (release_aps
-            // ещё не было — конкурентов нет).
+            // Готовность: помечаем ПОСЛЕ заполнения (release_aps ещё
+            // не было — конкурентов нет).
             VTD0.mark_ready();
-            // Связка с syscall-слоем: без этого SERVICE=None и все
-            // IOMMU_* отвечают ENOSYS (баг v0.6.1: печатали «syscalls
-            // live», но Once не заполняли — init видел «no controllers»).
-            pkg_generic_interface::syscall::iommu::install_iommu_service(&VTD0);
-            crate::kprintln!("vtd: IommuService installed (IOMMU_* syscalls live)");
+            true
         }
         Err(e) => {
             crate::kprintln!("vtd: init failed: {:?} (IOMMU syscalls -> ENOSYS)", e);
+            false
         }
     }
 }

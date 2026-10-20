@@ -1,5 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<boot>
+<!-- cmdline корня — командная строка ЯДРА (BootInfo.cmdline):
+     meltdown=allow нужен под QEMU/TCG (эмулятор не сообщает RDCL_NO
+     и не имеет спекулятивной утечки); на реальном железе БЕЗ KPTI
+     ядро обязано отказывать в загрузке — не ставьте этот флаг. -->
+<boot cmdline="arch=x86_64 console=com1 meltdown=allow">
   <servers>
     <!-- init: первый сервер (обязателен, модуль [0] протокола). -->
     <server name="init" path="init">

@@ -65,3 +65,10 @@ panic = "abort"
 panic = "abort"
 lto = true
 codegen-units = 1
+
+# ВРЕМЕННО (локальная верификация): iommu-rs с фиксом IVRS BLOCKS_OFFSET
+# (44 -> 48); патч для https://github.com/sergeyvolkovich/iommu-rs приложен
+# отдельно — после его применения секцию [patch] удалить.
+[patch."https://github.com/sergeyvolkovich/iommu-rs"]
+amd-iommu = { path = "../../iommu-rs/amd-iommu" }
+intel-iommu = { path = "../../iommu-rs/intel-iommu" }

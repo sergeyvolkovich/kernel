@@ -29,6 +29,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c880a97d28a3681c0267bd29cff89621202715b065127cd445fa0f0fe0aa2880"
 
 [[package]]
+name = "amd-iommu"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "log",
+ "thiserror",
+ "tock-registers",
+ "zerocopy",
+]
+
+[[package]]
 name = "arch"
 version = "0.5.0"
 dependencies = [
@@ -47,6 +58,7 @@ dependencies = [
 name = "backend"
 version = "0.5.0"
 dependencies = [
+ "amd-iommu",
  "arch",
  "bitflags",
  "boot_info",
@@ -162,7 +174,6 @@ version = "0.5.0"
 [[package]]
 name = "intel-iommu"
 version = "0.1.0"
-source = "git+https://github.com/sergeyvolkovich/iommu-rs.git#555561c80b5f96a5a56d9642d6c1bcdd62515edc"
 dependencies = [
  "bitflags",
  "log",

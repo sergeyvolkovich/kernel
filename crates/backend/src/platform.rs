@@ -182,9 +182,9 @@ impl startup::Platform for X86Platform {
         if pkg_generic_interface::mem::gallocator::frames().is_some() {
             // Число CPU — в SELF_INFO (слово 5).
             pkg_generic_interface::syscall::system::install_cpu_count(crate::smp::cpu_count());
-            // IOMMU (Intel VT-d): DMAR -> DRHD -> драйвер + сервис
-            // сисколов. До release_aps — конкуренции нет.
-            crate::vtd::init_and_install();
+            // IOMMU (Intel VT-d / AMD-Vi): DMAR/IVRS -> драйверы + сервис
+            // сисколов (агрегатор). До release_aps — конкуренции нет.
+            crate::iommu::init_and_install();
         }
         if startup::glue().is_some() {
             // APы из парковки в планировщик (resched-IPI будит hlt).

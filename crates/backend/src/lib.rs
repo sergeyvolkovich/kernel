@@ -18,6 +18,8 @@
 //   * smp      — топология (MADT), SIPI-трамплин, bring-up AP, IPI,
 //     TLB shootdown, halt-all;
 //   * vtd      — Intel VT-d (DMAR/DRHD, QI, second-stage, IommuService);
+//   * amd      — AMD-Vi (IVRS/IVHD, Device Table, командный буфер, v1);
+//   * iommu    — общие хелперы (MMIO/кадры) + агрегатор сервиса vtd|amd;
 //   * platform — X86Platform (startup::Platform);
 //   * bin/kernel.rs — образ ядра: head.S -> kmain -> startup::kinit.
 //
@@ -30,10 +32,12 @@
 
 extern crate alloc;
 
+pub mod amd;
 pub mod console;
 pub mod cpu;
 pub mod ctxswitch;
 pub mod gate;
+pub mod iommu;
 pub mod klock;
 pub mod lapic;
 pub mod memory;

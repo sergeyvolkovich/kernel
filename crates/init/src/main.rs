@@ -10,11 +10,12 @@
 //      переменные («имя=значение») — конфигурация транзитом из XML;
 //   3. печать всего через DEBUG_WRITE (по 40 байт за вызов).
 //
-// Демонстрация v0.6 (SMP + VT-d):
+// Демонстрация v0.7 (SMP + VT-d/AMD-Vi):
 //
 //   S1. SELF_INFO(5) — cpu_count; печать топологии пользователя.
-//   S2. IOMMU smoke: ENUM -> ATTACH(00:01.0) -> MAP(2 стр) -> UNMAP ->
-//       DETACH — реальный проход через DMAR/DRHD/QI/SSPT ядра.
+//   S2. IOMMU smoke: ENUM -> ATTACH(00:1f.2) -> MAP(2 стр) -> UNMAP ->
+//       DETACH — реальный проход через DMAR/DRHD/QI/SSPT (Intel) либо
+//       IVRS/IVHD/DTE/командный буфер/v1-таблицы (AMD-Vi) ядра.
 //   S3. SMP-стресс: по потоку на CPU (THREAD_CREATE по TaskTCB-гранту
 //       из kinit): разделяемый счётчик (MEM_ALLOC-страница, volatile),
 //       каждый поток гоняет инкременты + THREAD_YIELD; гистограмма
@@ -126,13 +127,13 @@ unsafe fn sys_exit(code: u64) -> ! {
 
 // ───────────────────────── Демонстрация IOMMU ─────────────────────────
 
-/// S2: сквозной проход IOMMU (контроллер — QEMU intel-iommu; без него
-/// ENUM вернёт 0 и демо честно пропускается).
+/// S2: сквозной проход IOMMU (контроллер — QEMU intel-iommu ИЛИ
+/// amd-iommu; без них ENUM вернёт 0 и демо честно пропускается).
 unsafe fn iommu_smoke() {
     unsafe {
         let n = syscall6(SYS_IOMMU_ENUM, 0xFFFF_FFFF, 0, 0, 0, 0, 0);
         if n <= 0 {
-            puts("init: iommu: no controllers (run QEMU with -device intel-iommu)");
+            puts("init: iommu: no controllers (run QEMU with -device intel-iommu|amd-iommu)");
             return;
         }
         let flags = syscall6(SYS_IOMMU_ENUM, 0, 0, 0, 0, 0, 0);
@@ -141,9 +142,11 @@ unsafe fn iommu_smoke() {
         debug_word_line("init: iommu flags  = ", flags as u64);
         debug_word_line("init: iommu version= ", ver as u64);
 
-        // Attach BDF 00:01.0 (под INCLUDE_PCI_ALL; реального устройства
-        // может не быть — строим таблицы контекста/домена честно).
-        let dev = syscall6(SYS_IOMMU_ATTACH, 0, 0, 1, 0, 0, 0);
+        // Attach BDF 00:1f.2 (встроенный ICH9 AHCI q35): устройство реально
+        // присутствует на шине — есть и в IVHD-записях AMD-Vi (QEMU
+        // генерирует Select-записи), и под INCLUDE_PCI_ALL Intel. После
+        // загрузки контроллер не DMA-ит — строим таблицы честно.
+        let dev = syscall6(SYS_IOMMU_ATTACH, 0, 0, 0x1f, 2, 0, 0);
         if dev < 0 {
             puts("init: iommu: ATTACH failed");
             debug_word_line("init: iommu: ATTACH errno = ", dev as u64);

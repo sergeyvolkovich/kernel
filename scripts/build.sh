@@ -6,39 +6,44 @@
 #
 # Release обязателен для загрузки: debug-ядро ~14 MiB, и заглушка
 # (с встроенным образом) накрывает фиксированный KERNEL_PHYS_BASE=16 MiB.
+#
+# Инструменты (mtools из user-space-префикса tools/qemu-usr) ставятся
+# scripts/fetch_qemu.sh; rust-objcopy — cargo install cargo-binutils.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+# Корень workspace — от расположения скрипта (портируемость свежих клонов).
+WS="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$WS"
 export PATH="$HOME/.cargo/bin:$PATH"
 
-WS=work/kernel_ws
+TOOLS=${TOOLS:-/home/z/my-project/tools}
 OUT=target
 ESP_DIR=$OUT/esp
 R=--release
 
 echo "== [1/4] kernel (x86_64-unknown-none, release) =="
-(cd $WS && cargo build -p backend --bin kernel --target x86_64-unknown-none $R)
-KERNEL=$WS/target/x86_64-unknown-none/release/kernel
+cargo build -p backend --bin kernel --target x86_64-unknown-none $R
+KERNEL=$OUT/x86_64-unknown-none/release/kernel
 # Symbols — рядом для отладки; в заглушку — stripped-образ.
 cp -f "$KERNEL" "$OUT/kernel.sym"
 rust-objcopy --strip-all "$KERNEL" "$WS/crates/uefi_stub/kernel.bin"
 
 echo "== [2/4] init (static user ELF @ 0x40000000) =="
-(cd $WS && cargo build -p init --target x86_64-unknown-none $R)
+cargo build -p init --target x86_64-unknown-none $R
 
 echo "== [3/4] uefi_stub (kernel.efi: stub + встроенный образ ядра) =="
-(cd $WS && cargo build -p uefi_stub --target x86_64-unknown-uefi $R)
+cargo build -p uefi_stub --target x86_64-unknown-uefi $R
 
 echo "== [4/4] ESP =="
 rm -rf "$ESP_DIR"
 mkdir -p "$ESP_DIR/EFI/BOOT"
-cp -f $WS/target/x86_64-unknown-uefi/release/uefi_stub.efi "$ESP_DIR/EFI/BOOT/BOOTX64.EFI"
-cp -f $WS/target/x86_64-unknown-none/release/init "$ESP_DIR/init"
+cp -f $OUT/x86_64-unknown-uefi/release/uefi_stub.efi "$ESP_DIR/EFI/BOOT/BOOTX64.EFI"
+cp -f $OUT/x86_64-unknown-none/release/init "$ESP_DIR/init"
 cp -f scripts/boot_cfg.xml "$ESP_DIR/boot_cfg.xml"
 
 # FAT-образ с MBR-разделом (OVMF требует таблицу разделов).
 # Порядок: (1) plain FAT на fs.img; (2) склейка MBR-заголовок + FS.
-export LD_LIBRARY_PATH=/home/z/my-project/tools/qroot/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
-MTOOLS=/home/z/my-project/tools/qroot/usr/bin
+export LD_LIBRARY_PATH=$TOOLS/qemu-usr/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+MTOOLS=$TOOLS/qemu-usr/usr/bin
 PART_START_LBA=2048          # 1 MiB gap
 PART_SECTORS=32768           # 16 MiB
 FS_IMG="$OUT/esp_fs.img"
