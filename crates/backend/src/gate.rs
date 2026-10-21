@@ -71,11 +71,13 @@ extern "C" fn syscall_c(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6
 
     // Раскладка SyscallArgs — конвенция ядра (`syscall::types`, см.
     // `number_from_args`): слот 0 = НОМЕР (для registry::dispatch),
-    // слоты 1..5 = аргументы пользователя a1..a5. Баг v0.5.2: гейт
+    // слоты 1..6 = аргументы пользователя a1..a6. Баг v0.5.2: гейт
     // клал [a1..a6] -> хендлеры читали arg(1)=rsi (сдвиг на регистр:
     // rdi-аргумент терялся, DEBUG_WRITE ронял первое слово, IPC_MSG_WORD
-    // получал чужой индекс). Шестой регистр пользователя (r9/a6) в ABI
-    // не участвует: SYSCALL_ARG_COUNT=6 = номер + 5 аргументов.
+    // получал чужой индекс). v0.15: шестой регистр пользователя (r9/a6)
+    // ПОДКЛЮЧЁН к ABI (SYSCALL_ARG_COUNT=7): первый потребитель —
+    // CAP_MINT_RANGE(0x27), arg6 = new_len. Прежние сисколлы получают
+    // arg(6)=0 — их ABI не меняется.
     let args = SyscallArgs::new([
         nr as usize,
         a1 as usize,
@@ -83,6 +85,7 @@ extern "C" fn syscall_c(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6
         a3 as usize,
         a4 as usize,
         a5 as usize,
+        a6 as usize,
     ]);
 
     // SMP v0.12: КОНТЕКСТ-ВХОД — до диспетчера, безусловно.

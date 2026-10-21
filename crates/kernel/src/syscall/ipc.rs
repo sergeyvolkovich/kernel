@@ -513,7 +513,9 @@ mod tests {
     }
 
     fn args(words: [usize; 6]) -> SyscallArgs {
-        SyscallArgs::new(words)
+        // v0.15: SYSCALL_ARG_COUNT=7 — добавляем arg6=0 (слот 0 = номер).
+        let [nr, a1, a2, a3, a4, a5] = words;
+        SyscallArgs::new([nr, a1, a2, a3, a4, a5, 0])
     }
 
     #[test]

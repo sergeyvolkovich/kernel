@@ -276,6 +276,7 @@ mod tests {
             9,
             0,
             0,
+            0,
         ]);
         let caller = uuid_next();
         let ret = gctl.syscall_facade().dispatch(0, caller, caller, &args);
@@ -309,7 +310,7 @@ mod tests {
             caller,
             caller,
             crate::syscall::nums::SELF_INFO,
-            &SyscallArgs::new([0, 0, 0, 0, 0, 0]),
+            &SyscallArgs::new([0, 0, 0, 0, 0, 0, 0]),
         );
         assert_eq!(ret, Ok(v as usize));
 

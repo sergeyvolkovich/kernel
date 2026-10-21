@@ -45,8 +45,13 @@ impl fmt::Display for SyscallNumber {
     }
 }
 
-/// Число аргументов сискола (регистры a0..a5 у RISC-V/ARM, rdi..r9 у x86-64).
-pub const SYSCALL_ARG_COUNT: usize = 6;
+/// Число слотов сисколл-аргументов: слот 0 — НОМЕР (для registry),
+/// слоты 1..6 — аргументы a1..a6. Седьмой слот (a6 = шестой регистр
+/// пользователя r9) подключён в v0.15: asm-стаб передавал его всегда,
+/// гейт отбрасывал. Первый потребитель — CAP_MINT_RANGE(0x27):
+/// arg5 = new_base, arg6 = new_len. Прежние сисколлы читают arg(i)
+/// вне диапазона как 0 — ABI-совместимость сохранена.
+pub const SYSCALL_ARG_COUNT: usize = 7;
 
 /// Аргументы сискола: до [`SYSCALL_ARG_COUNT`] машинных слов.
 ///
@@ -408,7 +413,7 @@ mod tests {
 
     #[test]
     fn args_bounds_and_defaults() {
-        let args = SyscallArgs::new([1, 2, 3, 4, 5, 6]);
+        let args = SyscallArgs::new([1, 2, 3, 4, 5, 6, 0]);
         assert_eq!(args.arg(0), 1);
         assert_eq!(args.arg(5), 6);
         // Вне диапазона — детерминированный 0, не чужая память.

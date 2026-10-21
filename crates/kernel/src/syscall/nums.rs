@@ -220,6 +220,20 @@ pub const CAP_LIST: SyscallNumber = SyscallNumber(0x25);
 /// ABI: arg1 = хендл, arg2 = индекс слова.
 pub const CAP_INFO: SyscallNumber = SyscallNumber(0x26);
 
+/// Mint с сужением ПОДДИАПАЗОНА IoResource (v0.15): производная
+/// capability получает диапазон `base..base+len`, строго вложенный в
+/// родительский той же разновидности (Mmio/IoPort/Irq). Инварианты
+/// (вложение, len > 0, совпадение вида, checked-арифметика, отказ
+/// RangeNotSubset без побочных эффектов) проверяет менеджер.
+/// Источник обязан быть IoResource; получатель — как у CAP_MINT.
+/// badge не сужается (для IoResource не применяется; гейты 0x40 его
+/// не читают) — производная наследует badge родителя.
+/// ABI: arg1 = хендл IoResource-источника, arg2..3 = TaskId получателя
+/// (lo, hi), arg4 = perms, arg5 = new_base, arg6 = new_len
+/// (ШЕСТОЙ аргумент — впервые; SYSCALL_ARG_COUNT = 7 с v0.15).
+/// Возврат: хендл производной у получателя.
+pub const CAP_MINT_RANGE: SyscallNumber = SyscallNumber(0x27);
+
 // ==== 0x30: IPC ====
 
 /// Создать endpoint. ABI: arg1 = ёмкость буфера (0 = строгий

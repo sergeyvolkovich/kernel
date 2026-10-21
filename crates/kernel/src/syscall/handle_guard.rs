@@ -266,6 +266,7 @@ mod tests {
         let spec = MintSpec {
             perms: ActionPermissions::Send,
             badge: CapabilityBadge::from_bits(0xFF),
+            range: None,
         };
 
         let guard = HandleGuard::mint_transient(caps, tasks, task, handle, &spec).unwrap();
@@ -296,6 +297,7 @@ mod tests {
         let spec = MintSpec {
             perms: ActionPermissions::Send,
             badge: CapabilityBadge::FULL,
+            range: None,
         };
         let guard = HandleGuard::mint_transient(caps, tasks, task, handle, &spec).unwrap();
         let transient = guard.handle().unwrap();

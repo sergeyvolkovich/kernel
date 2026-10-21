@@ -534,8 +534,9 @@ mod tests {
     }
 
     fn a(num: SyscallNumber, rest: [usize; 5]) -> SyscallArgs {
-        let mut words = [num.as_u64() as usize, 0, 0, 0, 0, 0];
-        words[1..].copy_from_slice(&rest);
+        // v0.15: SYSCALL_ARG_COUNT=7 — arg6 (слот 6) остаётся нулём.
+        let mut words = [num.as_u64() as usize, 0, 0, 0, 0, 0, 0];
+        words[1..6].copy_from_slice(&rest);
         SyscallArgs::new(words)
     }
 
@@ -883,7 +884,7 @@ mod tests {
         let mut c = SyscallCtx::core(0, f.peer, f.tasks, f.caps)
             .with_shm(f.shm)
             .with_memory(&router);
-        let args = SyscallArgs::new([0, id as usize, 0, 0, 0, 0]);
+        let args = SyscallArgs::new([0, id as usize, 0, 0, 0, 0, 0]);
         assert_eq!(
             f.reg
                 .dispatch_number(ShmDestroyHandler::SYSCALL, &mut c, &args),

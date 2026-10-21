@@ -144,7 +144,8 @@ SELF_INFO-слова: `0` task_id.lo, `1` task_id.hi, `2` thread_id.lo,
 
 | № | Сискол | ABI | Прим. |
 |---|--------|-----|-------|
-| 0x21 | CAP_MINT | src, TaskId(lo,hi), perms, badge | производная |
+| 0x21 | CAP_MINT | src, TaskId(lo,hi), perms, badge | производная (полный диапазон IoResource) |
+| 0x27 | CAP_MINT_RANGE | src, TaskId(lo,hi), perms, new_base, new_len | v0.15: производная IoResource со СУЖЕННЫМ поддиапазоном (⊆ родителя; иначе RangeNotSubset); шестой аргумент ABI |
 | 0x22 | CAP_SEND | src, TaskId(lo,hi) | передача |
 | 0x23 | CAP_REVOKE | src | поддерево; возврат = погашено |
 | 0x24 | CAP_DELETE | src | один хендл |
@@ -452,11 +453,13 @@ IommuAdmin: её выдает ядро доверенным задачам (kini
 - окно перерасхода квоты у IPC-пробуждений — до одного вытесненного
   отрезка (см. [cpu-quotas.md §7](cpu-quotas.md)).
 
-Следующие шаги (roadmap v0.15+): enqueue-проверка квоты
-IPC-пробуждённых (закрытие окна перерасхода); частичный unmap с
-расщеплением huge; device-iotlb (AWT/ATC); PASID (крейты iommu-rs
-уже несут строители); исключения-фолты как IPC (pager-протокол
-demand-paging).
+Следующие шаги (roadmap v0.16+): enqueue-проверка квоты
+IPC-пробуждённых (закрытие окна перерасхода); pcid — PCI-перечислитель
+в юзерспейсе через CF8/CFC за IoPort-cap (суженные гранты
+CAP_MINT_RANGE — прямое применение сужения поддиапазонов v0.15);
+частичный unmap с расщеплением huge; device-iotlb (AWT/ATC); PASID
+(крейты iommu-rs уже несут строители); исключения-фолты как IPC
+(pager-протокол demand-paging).
 
 ## 10. v0.9: спавн доменов (TASK_SPAWN_IMAGE) и песочница GTCB
 
@@ -535,7 +538,8 @@ THREAD_CREATE → IPC_SEND_THREAD (стартовое IPC) → TASK_SET_LIMITS.
 Дополнительно к лимитам, песочница — это ОТСУТСТВИЕ capability:
 ребёнок не получает IommuAdmin (гейт всей группы 0x80), TaskTCB на
 другие домены, DeviceReference. Права появляются только передачей
-от родителя (CAP_MINT — копия, CAP_SEND — переезд хендла!).
+от родителя (CAP_MINT — копия, CAP_MINT_RANGE — копия со суженным
+поддиапазоном IoResource, CAP_SEND — переезд хендла!).
 
 Каждая блокировка печатается ядром: «[kernel: sandbox] …» — аудит
 атаки виден в консоли вживую. TASK_LIMITS_INFO (0x1E) — чтение
@@ -634,7 +638,11 @@ init (S4) спавнит ОДИН образ на ДВУХ базах (0x4000000
 acpid, а не ядро. Роль — модель seL4 root-task для железа: init
 спавнит образ (static-PIE) с argv ["acpid", "rsdp=0x…"] и копиями
 ТРЁХ корневых IoResource-грантов (CAP_MINT: физика 0..4 GiB, порты
-0..64 KiB, линии 0..256).
+0..64 KiB, линии 0..256). Начиная с v0.15 Irq-грант acpid —
+СУЖЕННЫЙ (CAP_MINT_RANGE 0..256 → 9..10: менеджеру нужна только
+SCI-линия кнопки питания) — живая демонстрация минимальных
+привилегий; полный контур: CAP_MINT_RANGE → IRQ_ATTACH(SCI 9) →
+PWRBTN_EN → S5.
 
 Поток работы (демо S6):
 

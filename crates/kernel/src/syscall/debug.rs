@@ -245,6 +245,7 @@ mod tests {
             0,
             0,
             0,
+            0,
         ]);
         assert_eq!(DebugWriteHandler.invoke(&mut ctx, &args), Ok(0));
         let written = CAPTURE.lock();
@@ -259,7 +260,7 @@ mod tests {
         set_trace(true);
         assert!(trace_enabled());
         CAPTURE.lock().clear();
-        let args = SyscallArgs::new([0x1234, 1, 2, 3, 4, 5]);
+        let args = SyscallArgs::new([0x1234, 1, 2, 3, 4, 5, 0]);
         trace_dispatch(SyscallNumber(0x1234), &args);
         let lines = CAPTURE.lock().clone();
         // Трасса могла быть перекрыта параллельным тестом — ищем строку.
@@ -289,16 +290,16 @@ mod tests {
         let mut ctx = crate::syscall::SyscallCtx::core(0, task, &tasks, &caps);
         // Слово 0 — число задач.
         let n = DebugDumpTasksHandler
-            .invoke(&mut ctx, &SyscallArgs::new([0, 0, 0, 0, 0, 0]))
+            .invoke(&mut ctx, &SyscallArgs::new([0, 0, 0, 0, 0, 0, 0]))
             .unwrap();
         assert_eq!(n, 1);
         // Слова 1..4 — id lo/hi, state, priority.
         let state = DebugDumpTasksHandler
-            .invoke(&mut ctx, &SyscallArgs::new([0, 3, 0, 0, 0, 0]))
+            .invoke(&mut ctx, &SyscallArgs::new([0, 3, 0, 0, 0, 0, 0]))
             .unwrap();
         assert_eq!(state, 1); // Ready
         let prio = DebugDumpTasksHandler
-            .invoke(&mut ctx, &SyscallArgs::new([0, 4, 0, 0, 0, 0]))
+            .invoke(&mut ctx, &SyscallArgs::new([0, 4, 0, 0, 0, 0, 0]))
             .unwrap();
         assert_eq!(prio, 77);
 
@@ -307,21 +308,21 @@ mod tests {
         let tn = DebugDumpThreadsHandler
             .invoke(
                 &mut ctx,
-                &SyscallArgs::new([0, ta as usize, (ta >> 64) as usize, 0, 0, 0]),
+                &SyscallArgs::new([0, ta as usize, (ta >> 64) as usize, 0, 0, 0, 0]),
             )
             .unwrap();
         assert_eq!(tn, 1);
         let th_state = DebugDumpThreadsHandler
             .invoke(
                 &mut ctx,
-                &SyscallArgs::new([0, ta as usize, (ta >> 64) as usize, 5, 0, 0]),
+                &SyscallArgs::new([0, ta as usize, (ta >> 64) as usize, 5, 0, 0, 0]),
             )
             .unwrap();
         assert_eq!(th_state, 1); // Ready
         let th_prio = DebugDumpThreadsHandler
             .invoke(
                 &mut ctx,
-                &SyscallArgs::new([0, ta as usize, (ta >> 64) as usize, 6, 0, 0]),
+                &SyscallArgs::new([0, ta as usize, (ta >> 64) as usize, 6, 0, 0, 0]),
             )
             .unwrap();
         assert_eq!(th_prio, 88);

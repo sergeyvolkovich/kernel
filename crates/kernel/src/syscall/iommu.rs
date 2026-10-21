@@ -580,7 +580,7 @@ mod tests {
             r.dispatch_number(
                 IommuEnumHandler::SYSCALL,
                 &mut ctx,
-                &SyscallArgs::new([0, 0xFFFF_FFFF, 0, 0, 0, 0])
+                &SyscallArgs::new([0, 0xFFFF_FFFF, 0, 0, 0, 0, 0])
             ),
             Ok(1)
         );
@@ -590,7 +590,7 @@ mod tests {
             r.dispatch_number(
                 IommuEnumHandler::SYSCALL,
                 &mut ctx,
-                &SyscallArgs::new([0, 0, 0, 0, 0, 0])
+                &SyscallArgs::new([0, 0, 0, 0, 0, 0, 0])
             ),
             Ok(0x303B)
         );
@@ -598,7 +598,7 @@ mod tests {
             r.dispatch_number(
                 IommuEnumHandler::SYSCALL,
                 &mut ctx,
-                &SyscallArgs::new([0, 0, 1, 0, 0, 0])
+                &SyscallArgs::new([0, 0, 1, 0, 0, 0, 0])
             ),
             Ok(0x0105)
         );
@@ -606,7 +606,7 @@ mod tests {
             r.dispatch_number(
                 IommuEnumHandler::SYSCALL,
                 &mut ctx,
-                &SyscallArgs::new([0, 1, 0, 0, 0, 0])
+                &SyscallArgs::new([0, 1, 0, 0, 0, 0, 0])
             ),
             Err(SyscallError::InvalidArgument) // InvalidIndex -> InvalidArgument
         );
@@ -627,7 +627,7 @@ mod tests {
             .dispatch_number(
                 IommuAttachHandler::SYSCALL,
                 &mut ctx,
-                &SyscallArgs::new([0, 0, 2, 0, 1, 0]),
+                &SyscallArgs::new([0, 0, 2, 0, 1, 0, 0]),
             )
             .expect("attach");
         assert!(dev > 0);
@@ -636,7 +636,7 @@ mod tests {
             r.dispatch_number(
                 IommuAttachHandler::SYSCALL,
                 &mut ctx,
-                &SyscallArgs::new([0, 0, 0, 0, 0, 0])
+                &SyscallArgs::new([0, 0, 0, 0, 0, 0, 0])
             ),
             Err(SyscallError::NotFound)
         );
@@ -647,7 +647,7 @@ mod tests {
             r.dispatch_number(
                 IommuMapHandler::SYSCALL,
                 &mut ctx,
-                &SyscallArgs::new([0, 0, dev, 0x1_0000, 0x20_0000, packed as usize])
+                &SyscallArgs::new([0, 0, dev, 0x1_0000, 0x20_0000, packed as usize, 0])
             ),
             Ok(0)
         );
@@ -656,7 +656,7 @@ mod tests {
             r.dispatch_number(
                 IommuMapHandler::SYSCALL,
                 &mut ctx,
-                &SyscallArgs::new([0, 0, dev, 0x1_0001, 0x20_0000, packed as usize])
+                &SyscallArgs::new([0, 0, dev, 0x1_0001, 0x20_0000, packed as usize, 0])
             ),
             Err(SyscallError::InvalidArgument)
         );
@@ -666,7 +666,7 @@ mod tests {
             r.dispatch_number(
                 IommuMapHandler::SYSCALL,
                 &mut ctx,
-                &SyscallArgs::new([0, 0, dev, 0x2_0000, 0x20_0000, packed3 as usize])
+                &SyscallArgs::new([0, 0, dev, 0x2_0000, 0x20_0000, packed3 as usize, 0])
             ),
             Err(SyscallError::AlreadyExists)
         );
@@ -674,7 +674,7 @@ mod tests {
             r.dispatch_number(
                 IommuUnmapHandler::SYSCALL,
                 &mut ctx,
-                &SyscallArgs::new([0, 0, dev, 0x1_0000, 2, 0])
+                &SyscallArgs::new([0, 0, dev, 0x1_0000, 2, 0, 0])
             ),
             Ok(0)
         );
@@ -682,7 +682,7 @@ mod tests {
             r.dispatch_number(
                 IommuDetachHandler::SYSCALL,
                 &mut ctx,
-                &SyscallArgs::new([0, 0, dev, 0, 0, 0])
+                &SyscallArgs::new([0, 0, dev, 0, 0, 0, 0])
             ),
             Ok(0)
         );
@@ -690,7 +690,7 @@ mod tests {
             r.dispatch_number(
                 IommuUnmapHandler::SYSCALL,
                 &mut ctx,
-                &SyscallArgs::new([0, 0, dev, 0x1_0000, 1, 0])
+                &SyscallArgs::new([0, 0, dev, 0x1_0000, 1, 0, 0])
             ),
             Err(SyscallError::NotFound)
         );
@@ -711,7 +711,7 @@ mod tests {
             .dispatch_number(
                 IommuAttachHandler::SYSCALL,
                 &mut ctx,
-                &SyscallArgs::new([0, 0, 3, 0, 0, 0]),
+                &SyscallArgs::new([0, 0, 3, 0, 0, 0, 0]),
             )
             .expect("attach");
         // IRQ_MAP: vector 0x41 -> handle > 0 (0 = «нет»).
@@ -719,7 +719,7 @@ mod tests {
             .dispatch_number(
                 IommuIrqMapHandler::SYSCALL,
                 &mut ctx,
-                &SyscallArgs::new([0, 0, dev, 0x41, 0, 0]),
+                &SyscallArgs::new([0, 0, dev, 0x41, 0, 0, 0]),
             )
             .expect("irq_map");
         assert!(handle > 0);
@@ -728,7 +728,7 @@ mod tests {
             r.dispatch_number(
                 IommuIrqMapHandler::SYSCALL,
                 &mut ctx,
-                &SyscallArgs::new([0, 0, dev, 0x05, 0, 0])
+                &SyscallArgs::new([0, 0, dev, 0x05, 0, 0, 0])
             ),
             Err(SyscallError::InvalidArgument)
         );
@@ -737,7 +737,7 @@ mod tests {
             r.dispatch_number(
                 IommuIrqMapHandler::SYSCALL,
                 &mut ctx,
-                &SyscallArgs::new([0, 0, 0, 0x41, 0, 0])
+                &SyscallArgs::new([0, 0, 0, 0x41, 0, 0, 0])
             ),
             Err(SyscallError::NotFound)
         );
@@ -745,7 +745,7 @@ mod tests {
             r.dispatch_number(
                 IommuIrqUnmapHandler::SYSCALL,
                 &mut ctx,
-                &SyscallArgs::new([0, 0, dev, handle, 0, 0])
+                &SyscallArgs::new([0, 0, dev, handle, 0, 0, 0])
             ),
             Ok(0)
         );
@@ -754,7 +754,7 @@ mod tests {
             r.dispatch_number(
                 IommuIrqUnmapHandler::SYSCALL,
                 &mut ctx,
-                &SyscallArgs::new([0, 0, dev, 0, 0, 0])
+                &SyscallArgs::new([0, 0, dev, 0, 0, 0, 0])
             ),
             Err(SyscallError::InvalidArgument)
         );
@@ -777,7 +777,7 @@ mod tests {
         let ret = r.dispatch_number(
             IommuEnumHandler::SYSCALL,
             &mut ctx,
-            &SyscallArgs::new([0, 0xFFFF_FFFF, 0, 0, 0, 0]),
+            &SyscallArgs::new([0, 0xFFFF_FFFF, 0, 0, 0, 0, 0]),
         );
         assert_eq!(ret, Ok(1));
         // Номера — плотная группа 0x80..0x86.

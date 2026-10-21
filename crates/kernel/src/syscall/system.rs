@@ -167,7 +167,7 @@ mod tests {
 
         let mut word = |i: usize| {
             SelfInfoHandler
-                .invoke(&mut ctx, &SyscallArgs::new([0, i, 0, 0, 0, 0]))
+                .invoke(&mut ctx, &SyscallArgs::new([0, i, 0, 0, 0, 0, 0]))
                 .unwrap()
         };
         assert_eq!(word(0), task.as_u128() as usize);
@@ -180,7 +180,7 @@ mod tests {
         assert_eq!(word(5), crate::syscall::system::cpu_count());
         // Вне диапазона — EINVAL, не паника.
         assert_eq!(
-            SelfInfoHandler.invoke(&mut ctx, &SyscallArgs::new([0, 6, 0, 0, 0, 0])),
+            SelfInfoHandler.invoke(&mut ctx, &SyscallArgs::new([0, 6, 0, 0, 0, 0, 0])),
             Err(SyscallError::InvalidArgument)
         );
     }
@@ -240,7 +240,7 @@ mod tests {
             .dispatch_number(
                 SelfInfoHandler::SYSCALL,
                 &mut ctx,
-                &SyscallArgs::new([0, 0, 0, 0, 0, 0]),
+                &SyscallArgs::new([0, 0, 0, 0, 0, 0, 0]),
             )
             .unwrap();
         assert_eq!(ret, id.as_u128() as usize);

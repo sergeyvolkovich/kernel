@@ -7,6 +7,12 @@
 Lock (fine-grained + lock-free) и полный стек IOMMU (Intel VT-d и
 AMD-Vi: DMA- и IRQ-ремаппинг, мульти-IOMMU, 2 МиБ-страницы).
 
+v0.15: контракты HAL — отдельный крейт `kernel-hal` (не зависит ни
+от одного крейта workspace — экспозиция архитектуры не проникает
+между крейтами), деривация IoResource сужает ПОДИАПАЗОНЫ
+(`CAP_MINT_RANGE` 0x27: бар устройства вместо всей физики, SCI-
+линия вместо всего GSI-space — минимальные привилегии).
+
 v0.14: в ядре НЕТ устройств — как в seL4. Перечисление ACPI (AML-
 интерпретатор), PCI и драйверы — юзерспейс; ядро лишь медитирует
 сырые ресурсы (физика/порты/линии) за IoResource-capability.
@@ -55,7 +61,8 @@ OVMF -> BOOTX64.EFI (uefi_stub + встроенный kernel.bin)
 | **Планировщик** | SMP, RR-кванты, ленивый deschedule, resched-IPI, троттлинг доменов по CPU-квоте, вытеснение LAPIC TSC-deadline (суб-тик, фолбэк — периодический тик) |
 | **Песочница GTCB** | rlimit-пределы в TCB: страницы/потоки/endpoint'ы/SHM/capability/приоритет/may_spawn/CPU-квота; семантика трещотки (только ужесточение); аудит `[kernel: sandbox]` |
 | **Спавн доменов** | `TASK_SPAWN_IMAGE`: образ готовит юзерспейс-родитель (ядро — только указатели); PIE-образы (R_X86_64_RELATIVE, крейт `pie`), ET_EXEC-легаси как StaticFixed |
-| **Сырые ресурсы + IRQ** | Устройств в ядре НЕТ (v0.14): перечисление ACPI/AML/PCI и драйверы — юзерспейс (acpid); ядро медитирует диапазоны за IoResource-cap: `MMIO_MAP` (физика), `IOP_IN/OUT` (порты, исполнение в ядре, IOPL=0), `IRQ_ATTACH` по Irq-cap (IOAPIC: линия — L4-signal без переключения контекста) |
+| **Сырые ресурсы + IRQ** | Устройств в ядре НЕТ (v0.14): перечисление ACPI/AML/PCI и драйверы — юзерспейс (acpid); ядро медитирует диапазоны за IoResource-cap: `MMIO_MAP` (физика), `IOP_IN/OUT` (порты, исполнение в ядре, IOPL=0), `IRQ_ATTACH` по Irq-cap (IOAPIC: линия — L4-signal без переключения контекста); `CAP_MINT_RANGE` (v0.15) — сужение поддиапазонов при деривации |
+| **Изоляция крейтов (v0.15)** | HAL-контракты — отдельный крейт `kernel-hal` без зависимостей на workspace: ядро/бекенд видят контракты, контрактный слой не видит никого (граница проверяется cargo); `cargo build -p kernel-hal` — автономный гейт |
 | **IOMMU** | Intel VT-d (DMAR/DRHD, QI-инвалидации) и AMD-Vi (IVRS/IVHD, командный буфер): DMA-ремаппинг, IRQ-ремаппинг (IRTE/IntTab), мульти-IOMMU, 2 МиБ-листья |
 | **Загрузка** | UEFI-заглушка с динамическим размещением ядра, boot_cfg.xml, argv-протокол, SIPI-bring-up AP |
 | **Юзерспейс** | `userlib` (C-ABI `_start` + `l4_*` для C и Rust), эталонные серверы: `init` (Rust) и `capp` (C) |
@@ -108,28 +115,36 @@ arch + x86_64 (крейты)            механика ISA: per-CPU (GS), COM1
 crates/
   boot_info/    ABI страница BootInfo (заглушка -> ядро): память, модули, RSDP
   bootcfg/      mini-XML парсер boot_cfg.xml (+ host-тесты)
-  kernel/       ядро-крейт pkg_generic_interface: GCTL, менеджеры, HAL,
-                сисколы, sync-примитивы; 131 host-тест
+  kernel-hal/   HAL-КОНТРАКТЫ (v0.15): типы (PhysAddr, Bdf, DevicePath)
+                + трейты ASID/KMAP/MMAP/DMA/IOMMU/IRQ/IOPORT — не зависит
+                ни от одного крейта workspace (изоляция архитектуры)
+  kernel/       ядро-крейт pkg_generic_interface: GCTL, менеджеры,
+                сисколы, sync-примитивы + IrqRouter (hal = re-export
+                kernel-hal); 136 host-тестов
   arch/         механика x86_64: per-CPU (GS), COM1 16550, константы ABI
   backend/      платформенный крейт: гейт, планировщик, SMP, LAPIC/IOAPIC,
-                память, VT-d (vtd.rs), AMD-Vi (amd.rs), IOMMU-агрегатор
+                память, VT-d (vtd.rs), AMD-Vi (amd.rs), IOMMU-агрегатор;
+                реализует контракты kernel-hal (единственное место
+                экспозиции архитектуры)
   startup/      kinit: политика запуска (Platform/KernelGlue), elfload, пулы
   uefi_stub/    BOOTX64.EFI: boot_cfg, модули, ExitBootServices, прыжок в ядро
   init/         первый сервер (Rust, сырые сисколы): топология, IOMMU smoke,
                 SMP-стресс, песочница (спавн rogue + вердикт), спавн acpid
-                (IoResource-гранты + argv-транзит rsdp=)
+                (IoResource-гранты + argv-транзит rsdp=; Irq-грант acpid —
+                суженный 9..10 через CAP_MINT_RANGE, v0.15)
   rogue/        дочерний образ песочницы (static-PIE, ET_DYN + RELA)
   acpid/        ACPI-менеджер ЮЗЕРСПЕЙСА (v0.14, static-PIE): AML-
                 интерпретатор (крейт acpi) вне ядра, namespace-walk,
                 кнопка питания (SCI) и выключение ПК (S5, PM1a_CNT)
   pie/          юзерспейс-парсер PIE-образов: PT_LOAD W^X, R_X86_64_RELATIVE
-  userlib/      C-ABI: _start + l4_* (статическая бибилиотека, заголовок l4.h)
+  userlib/      C-ABI: _start + l4_* (статическая бибилиотека, заголовок l4.h;
+                l4_cap_mint_range — v0.15)
 scripts/        build.sh (полная цепочка), run_qemu.sh (OVMF+q35),
                 fetch_qemu.sh (user-space префикс QEMU/OVMF/mtools), esp_mbr.py
 boot/           эталонный boot_cfg.xml
 examples/       capp.c — сервер на чистом C
 docs/           документация (см. ниже)
-CHANGES.md      история версий v0.6..v0.13 (подробно)
+CHANGES.md      история версий v0.6..v0.15 (подробно)
 ```
 
 ## Требования
@@ -273,6 +288,7 @@ cargo test                       # host-портящиеся крейты (defau
 | v0.12 | Демонтаж Big Kernel Lock: fine-grained локи, lock-free планировщик, IF-дисциплина |
 | v0.13 | Точность квот (заряд циклами TSC, TSC-deadline), per-CPU кэш контекстов, демонтаж легаси task-level enqueue |
 | v0.14 | Устройств в ядре НЕТ: AML/перечисление → юзерспейс (acpid), IoResource-capability (MMIO/порты/GSI), выключение ПК из юзерспейса (S5) |
+| v0.15 | kernel-hal: HAL-контракты — отдельный крейт без зависимостей на workspace (изоляция архитектуры силами cargo); CAP_MINT_RANGE 0x27 — сужение поддиапазонов IoResource при деривации; шестой аргумент сисколл-ABI (a6) |
 
 ## Известные ограничения
 
@@ -293,11 +309,12 @@ cargo test                       # host-портящиеся крейты (defau
 - **Квант пробуждённых**: пробуждённый IPC-поток домена за пределом
   квоты отрабатывает до одного вытеснения (документированное окно
   перерасхода; спиннеры паркуются немедленно).
-- **Устройства (v0.14)**: в ядре НЕТ перечисления — только сырые
+- **Устройства (v0.14/v0.15)**: в ядре НЕТ перечисления — только сырые
   ресурсы за IoResource-cap. acpid перечисляет ACPI/AML; PCI-драйверы
-  (pcid через IOP CF8/CFC) — roadmap; поддиапазоны IoResource при
-  CAP_MINT не сужаются (копия целого диапазона); песочницы IoResource
-  не получают вовсе.
-- **Кнопка питания**: SCI подписан (IRQ_ATTACH + PWRBTN_EN), но демо
-  не «нажимает» её — после окна ожидания acpid выключает ПК сам (S5);
-  интерактивное выключение через QEMU monitor — roadmap.
+  (pcid через IOP CF8/CFC — roadmap, прямое применение суженных
+  грантов CAP_MINT_RANGE); песочницы IoResource не получают вовсе
+  (сужение поддиапазонов v0.15 — для доверенных менеджеров/драйверов).
+- **Кнопка питания**: SCI подписан (IRQ_ATTACH + PWRBTN_EN; Irq-грант
+  acpid сужен до GSI 9 — v0.15), но демо не «нажимает» её — после
+  окна ожидания acpid выключает ПК сам (S5); интерактивное
+  выключение через QEMU monitor — roadmap.

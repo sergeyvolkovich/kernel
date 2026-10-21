@@ -524,11 +524,11 @@ impl SyscallRegistry {
         };
         use crate::syscall::system::{SelfInfoHandler, SysTimeHandler};
         use crate::syscall::task::{
-            CapDeleteHandler, CapInfoHandler, CapListHandler, CapMintHandler, CapRevokeHandler,
-            CapSendHandler, TaskCreateHandler, TaskExitExceptionHandler, TaskExitHandler,
-            TaskKillHandler, TaskLimitsInfoHandler, TaskSetExitEpHandler, TaskSetLimitsHandler,
-            TaskSpawnImageHandler, ThreadCreateHandler, ThreadDestroyHandler, ThreadExRegsHandler,
-            ThreadResumeHandler, ThreadSetPrioHandler, ThreadSuspendHandler,
+            CapDeleteHandler, CapInfoHandler, CapListHandler, CapMintHandler, CapMintRangeHandler,
+            CapRevokeHandler, CapSendHandler, TaskCreateHandler, TaskExitExceptionHandler,
+            TaskExitHandler, TaskKillHandler, TaskLimitsInfoHandler, TaskSetExitEpHandler,
+            TaskSetLimitsHandler, TaskSpawnImageHandler, ThreadCreateHandler, ThreadDestroyHandler,
+            ThreadExRegsHandler, ThreadResumeHandler, ThreadSetPrioHandler, ThreadSuspendHandler,
             ThreadTerminateHandler, ThreadYieldHandler,
         };
 
@@ -562,6 +562,7 @@ impl SyscallRegistry {
 
         // 0x20: capability.
         slot!(nums::CAP_MINT, CapMintHandler);
+        slot!(nums::CAP_MINT_RANGE, CapMintRangeHandler);
         slot!(nums::CAP_SEND, CapSendHandler);
         slot!(nums::CAP_REVOKE, CapRevokeHandler);
         slot!(nums::CAP_DELETE, CapDeleteHandler);
@@ -933,7 +934,7 @@ mod tests {
 
     fn arg0(n: u64) -> SyscallArgs {
         // Конвенция current_number: номер — нулевой аргумент.
-        SyscallArgs::new([n as usize, 0, 0, 0, 0, 0])
+        SyscallArgs::new([n as usize, 0, 0, 0, 0, 0, 0])
     }
 
     #[test]
@@ -968,7 +969,7 @@ mod tests {
             .dispatch_number(
                 SyscallNumber(0x81),
                 &mut ctx,
-                &SyscallArgs::new([0x81, 5, 0, 0, 0, 0]),
+                &SyscallArgs::new([0x81, 5, 0, 0, 0, 0, 0]),
             )
             .unwrap();
         assert_eq!(ret, 100 + 0x81 + 3 + 5);
@@ -1099,7 +1100,7 @@ mod tests {
                 task,
                 task,
                 SyscallNumber(0x81),
-                &SyscallArgs::new([0x81, 4, 0, 0, 0, 0]),
+                &SyscallArgs::new([0x81, 4, 0, 0, 0, 0, 0]),
             )
             .unwrap();
         assert_eq!(ret, 100 + 0x81 + 4);

@@ -1228,6 +1228,40 @@ impl SyscallHandler for CapMintHandler {
         let spec = MintSpec {
             perms: crate::capability::ActionPermissions::from_bits_retain(args.arg(4) as u8),
             badge: crate::capability::CapabilityBadge::from_bits(args.arg(5) as u64),
+            // Диапазон не запрошен: IoResource клонируется целиком
+            // (прежняя семантика, ABI-совместимость).
+            range: None,
+        };
+        let handle = ctx.caps.mint(ctx.tasks, ctx.task, src, dst, &spec)?;
+        Ok(handle.bits() as usize)
+    }
+}
+
+/// Mint с сужением ПОДДИАПАЗОНА IoResource (v0.15): CAP_MINT, где вместо
+/// badge запрошен диапазон `new_base..new_base+new_len`, строго вложенный
+/// в родительский той же разновидности. Проверки: право Mint у источника,
+/// получатель — свой домен ИЛИ TaskTCB (плюс max_caps — как у CAP_MINT),
+/// затем инварианты сужения в менеджере (RangeNotSubset — чистый отказ).
+///
+/// badge не сужается: гейты 0x40 (MMIO_MAP/IOP/IRQ_ATTACH) его не читают,
+/// производная наследует badge родителя.
+/// ABI: arg1 = хендл источника, arg2..3 = TaskId получателя, arg4 = perms,
+/// arg5 = new_base, arg6 = new_len (шестой регистр, v0.15).
+pub struct CapMintRangeHandler;
+
+impl CapMintRangeHandler {
+    pub const SYSCALL: SyscallNumber = nums::CAP_MINT_RANGE;
+}
+
+impl SyscallHandler for CapMintRangeHandler {
+    fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+        let src = CapHandle(args.arg(1) as u64);
+        let dst = task_id_from_args(args.arg(2), args.arg(3));
+        require_dst_capable(ctx, &dst)?;
+        let spec = MintSpec {
+            perms: crate::capability::ActionPermissions::from_bits_retain(args.arg(4) as u8),
+            badge: crate::capability::CapabilityBadge::FULL,
+            range: Some((args.arg(5) as u64, args.arg(6) as u64)),
         };
         let handle = ctx.caps.mint(ctx.tasks, ctx.task, src, dst, &spec)?;
         Ok(handle.bits() as usize)
@@ -1412,6 +1446,7 @@ mod tests {
         let spec = MintSpec {
             perms: ActionPermissions::FOR_SEND,
             badge: CapabilityBadge::from_bits(0xF),
+            range: None,
         };
         let child = facade.cap_mint(task, h, stranger, &spec).unwrap();
 
@@ -1446,6 +1481,7 @@ mod tests {
             lo,
             hi,
             55,
+            0,
             0,
             0,
         ]);
@@ -1519,7 +1555,7 @@ mod tests {
         let exit_ep = reg
             .dispatch(
                 &mut pctx,
-                &SyscallArgs::new([nums::EP_CREATE.as_u64() as usize, 4, 0, 0, 0, 0]),
+                &SyscallArgs::new([nums::EP_CREATE.as_u64() as usize, 4, 0, 0, 0, 0, 0]),
             )
             .unwrap() as u64;
         let exit_gate = caps
@@ -1538,7 +1574,7 @@ mod tests {
         let out = reg
             .dispatch(
                 &mut cctx,
-                &SyscallArgs::new([nums::IPC_RECV_ANY.as_u64() as usize, 0, 0, 0, 0, 0]),
+                &SyscallArgs::new([nums::IPC_RECV_ANY.as_u64() as usize, 0, 0, 0, 0, 0, 0]),
             )
             .unwrap();
         assert_eq!(out, 0);
@@ -1560,6 +1596,7 @@ mod tests {
                 3, // argc
                 argv_word,
                 2,
+                0,
             ]),
         )
         .unwrap();
@@ -1574,6 +1611,7 @@ mod tests {
                 &mut cctx,
                 &SyscallArgs::new([
                     crate::syscall::nums::IPC_MSG_WORD.as_u64() as usize,
+                    0,
                     0,
                     0,
                     0,
@@ -1757,7 +1795,7 @@ mod tests {
         // Без права (хендл битый) — EBADF.
         let new_id = uuid_next();
         let v = new_id.as_u128();
-        let args = SyscallArgs::new([0, 0xDEAD, v as usize, (v >> 64) as usize, 5, 0]);
+        let args = SyscallArgs::new([0, 0xDEAD, v as usize, (v >> 64) as usize, 5, 0, 0]);
         assert_eq!(
             reg.dispatch_number(nums::TASK_CREATE, &mut ctx, &args),
             Err(SyscallError::InvalidHandle)
@@ -1773,6 +1811,7 @@ mod tests {
             v as usize,
             (v >> 64) as usize,
             5,
+            0,
             0,
         ]);
         assert_eq!(
@@ -1790,6 +1829,7 @@ mod tests {
             v as usize,
             (v >> 64) as usize,
             5,
+            0,
             0,
         ]);
         let ret = reg.dispatch_number(nums::TASK_CREATE, &mut ctx, &args);
@@ -1835,6 +1875,7 @@ mod tests {
             (v >> 64) as usize,
             5,
             0,
+            0,
         ]);
         assert_eq!(
             reg.dispatch_number(nums::TASK_CREATE, &mut ctx, &args),
@@ -1864,6 +1905,7 @@ mod tests {
             pack(2, 1),
             pack(usize::MAX, usize::MAX),
             100,
+            0,
         ]);
         assert_eq!(
             reg.dispatch_number(nums::TASK_SET_LIMITS, &mut ctx, &args),
@@ -1879,6 +1921,7 @@ mod tests {
             pack(usize::MAX, usize::MAX),
             pack(usize::MAX, usize::MAX),
             255 | 0x100,
+            0,
         ]);
         assert_eq!(
             reg.dispatch_number(nums::TASK_SET_LIMITS, &mut ctx, &args),
@@ -1914,7 +1957,7 @@ mod tests {
 
         // TASK_LIMITS_INFO: слова читаются по праву TaskTCB.
         let mut word = |i: usize| {
-            let args = SyscallArgs::new([0, h_child.bits() as usize, i, 0, 0, 0]);
+            let args = SyscallArgs::new([0, h_child.bits() as usize, i, 0, 0, 0, 0]);
             reg.dispatch_number(nums::TASK_LIMITS_INFO, &mut ctx, &args)
                 .unwrap()
         };
@@ -1936,7 +1979,7 @@ mod tests {
 
         // v0.9-вызов с нулевым полем квоты (arg5=100) — домен НЕ
         // заморожен: квота остаётся безлимитной (наследие ABI).
-        let args = SyscallArgs::new([0, h_child.bits() as usize, 100, 0, 0, 100]);
+        let args = SyscallArgs::new([0, h_child.bits() as usize, 100, 0, 0, 100, 0]);
         assert_eq!(
             reg.dispatch_number(nums::TASK_SET_LIMITS, &mut ctx, &args),
             Ok(0)
@@ -1948,14 +1991,14 @@ mod tests {
         );
 
         // Слово за пределами таблицы — InvalidArgument.
-        let args = SyscallArgs::new([0, h_child.bits() as usize, 9, 0, 0, 0]);
+        let args = SyscallArgs::new([0, h_child.bits() as usize, 9, 0, 0, 0, 0]);
         assert_eq!(
             reg.dispatch_number(nums::TASK_LIMITS_INFO, &mut ctx, &args),
             Err(SyscallError::InvalidArgument)
         );
 
         // Явная квота: arg5 = prio | (cpu_quota << 16).
-        let args = SyscallArgs::new([0, h_child.bits() as usize, 0, 0, 0, 100 | (12 << 16)]);
+        let args = SyscallArgs::new([0, h_child.bits() as usize, 0, 0, 0, 100 | (12 << 16), 0]);
         assert_eq!(
             reg.dispatch_number(nums::TASK_SET_LIMITS, &mut ctx, &args),
             Ok(0)
@@ -1963,7 +2006,7 @@ mod tests {
 
         // Слова 6..8 — зеркало GTCB (чтение через сискол).
         let mut word = |i: usize| {
-            let args = SyscallArgs::new([0, h_child.bits() as usize, i, 0, 0, 0]);
+            let args = SyscallArgs::new([0, h_child.bits() as usize, i, 0, 0, 0, 0]);
             reg.dispatch_number(nums::TASK_LIMITS_INFO, &mut ctx, &args)
                 .unwrap()
         };
@@ -2001,7 +2044,7 @@ mod tests {
         // гашение по голому ThreadId).
         let mut ctx = crate::syscall::SyscallCtx::core(0, attacker, tasks, caps);
         let v = victim_thread.as_u128();
-        let args = SyscallArgs::new([0, v as usize, (v >> 64) as usize, 0, 0, 0]);
+        let args = SyscallArgs::new([0, v as usize, (v >> 64) as usize, 0, 0, 0, 0]);
         assert_eq!(
             reg.dispatch_number(nums::THREAD_TERMINATE, &mut ctx, &args),
             Err(SyscallError::MissingRight)
@@ -2049,13 +2092,13 @@ mod tests {
         let _h_self = grant_tcb(caps, tasks, rogue, rogue);
         let mut ctx = crate::syscall::SyscallCtx::core(0, rogue, tasks, caps);
         let v = rogue_thread.as_u128();
-        let args = SyscallArgs::new([0, v as usize, (v >> 64) as usize, 255, 0, 0]);
+        let args = SyscallArgs::new([0, v as usize, (v >> 64) as usize, 255, 0, 0, 0]);
         assert_eq!(
             reg.dispatch_number(nums::THREAD_SET_PRIO, &mut ctx, &args),
             Err(SyscallError::QuotaExceeded)
         );
         // Внутри потолка — разрешено.
-        let args = SyscallArgs::new([0, v as usize, (v >> 64) as usize, 80, 0, 0]);
+        let args = SyscallArgs::new([0, v as usize, (v >> 64) as usize, 80, 0, 0, 0]);
         assert_eq!(
             reg.dispatch_number(nums::THREAD_SET_PRIO, &mut ctx, &args),
             Ok(0)
@@ -2159,7 +2202,7 @@ mod tests {
         let seg_src = crate::syscall::SyscallHandler::invoke(
             &crate::syscall::mem::MemAllocHandler,
             &mut ctx,
-            &SyscallArgs::new([0, 2, MMAPMemoryFlags::RW.bits() as usize, 0, 0, 0]),
+            &SyscallArgs::new([0, 2, MMAPMemoryFlags::RW.bits() as usize, 0, 0, 0, 0]),
         )
         .unwrap();
 
@@ -2168,7 +2211,7 @@ mod tests {
         let argv_src = crate::syscall::SyscallHandler::invoke(
             &crate::syscall::mem::MemAllocHandler,
             &mut ctx,
-            &SyscallArgs::new([0, 1, MMAPMemoryFlags::RW.bits() as usize, 0, 0, 0]),
+            &SyscallArgs::new([0, 1, MMAPMemoryFlags::RW.bits() as usize, 0, 0, 0, 0]),
         )
         .unwrap();
 
@@ -2221,6 +2264,7 @@ mod tests {
             (cv >> 64) as usize,
             0x1000_0000, // указатель на дескриптор (TestCopy отдаёт байты)
             d.len(),
+            0,
         ]);
         let ret = crate::syscall::SyscallHandler::invoke(&TaskSpawnImageHandler, &mut ctx, &args)
             .expect("spawn по готовому образу");
@@ -2266,6 +2310,7 @@ mod tests {
             (gv >> 64) as usize,
             0x1000_0000,
             SPAWN_DESC_HEADER_BYTES - 8,
+            0,
         ]);
         assert_eq!(
             crate::syscall::SyscallHandler::invoke(&TaskSpawnImageHandler, &mut ctx, &args),
@@ -2313,6 +2358,7 @@ mod tests {
             (vv >> 64) as usize,
             0,
             0,
+            0,
         ]);
         assert_eq!(
             reg.dispatch_number(nums::CAP_SEND, &mut ctx, &args),
@@ -2347,14 +2393,14 @@ mod tests {
             .dispatch_number(
                 nums::EP_CREATE,
                 &mut kctx,
-                &SyscallArgs::new([0, 4, 0, 0, 0, 0]),
+                &SyscallArgs::new([0, 4, 0, 0, 0, 0, 0]),
             )
             .unwrap() as u64;
         let gate = caps.endpoint_of(tasks, killer, CapHandle(exit_ep)).unwrap();
         tasks.set_exit_endpoint(&victim, gate).unwrap();
 
         // KILL: Killed{source=killer} + каскад (поток жертвы погашен).
-        let args = SyscallArgs::new([0, h_victim.bits() as usize, 0, 0, 0, 0]);
+        let args = SyscallArgs::new([0, h_victim.bits() as usize, 0, 0, 0, 0, 0]);
         assert_eq!(
             reg.dispatch_number(nums::TASK_KILL, &mut kctx, &args),
             Ok(0)
@@ -2407,7 +2453,7 @@ mod tests {
 
         // SUSPEND своего потока: Ready -> Suspended.
         let tv = id(t);
-        let args = SyscallArgs::new([0, tv[0], tv[1], 0, 0, 0]);
+        let args = SyscallArgs::new([0, tv[0], tv[1], 0, 0, 0, 0]);
         assert_eq!(
             reg.dispatch_number(nums::THREAD_SUSPEND, &mut ctx, &args),
             Ok(0)
@@ -2422,13 +2468,13 @@ mod tests {
         assert_eq!(tasks.thread_view(&t).unwrap().state, TaskState::Ready);
 
         // EX_REGS: смена entry (стек не трогаем), возврат прежнего entry.
-        let args = SyscallArgs::new([0, tv[0], tv[1], 0x9000, usize::MAX, 0]);
+        let args = SyscallArgs::new([0, tv[0], tv[1], 0x9000, usize::MAX, 0, 0]);
         assert_eq!(
             reg.dispatch_number(nums::THREAD_EX_REGS, &mut ctx, &args),
             Ok(0x4000)
         );
         // Второе слово возврата — прежний стек (меняем стек, читаем его).
-        let args = SyscallArgs::new([0, tv[0], tv[1], usize::MAX, 0xA000, 1]);
+        let args = SyscallArgs::new([0, tv[0], tv[1], usize::MAX, 0xA000, 1, 0]);
         assert_eq!(
             reg.dispatch_number(nums::THREAD_EX_REGS, &mut ctx, &args),
             Ok(0x8000)
@@ -2443,7 +2489,7 @@ mod tests {
             .create_thread(st, stranger, TaskPriority(1), 0, 0)
             .unwrap();
         let sv = id(st);
-        let args = SyscallArgs::new([0, sv[0], sv[1], 0, 0, 0]);
+        let args = SyscallArgs::new([0, sv[0], sv[1], 0, 0, 0, 0]);
         assert_eq!(
             reg.dispatch_number(nums::THREAD_SUSPEND, &mut ctx, &args),
             Err(SyscallError::MissingRight)
@@ -2462,7 +2508,7 @@ mod tests {
             reg.dispatch_number(
                 nums::CAP_LIST,
                 &mut ctx,
-                &SyscallArgs::new([0, 0, 0, 0, 0, 0])
+                &SyscallArgs::new([0, 0, 0, 0, 0, 0, 0])
             ),
             Ok(0)
         );
@@ -2478,7 +2524,7 @@ mod tests {
             .dispatch_number(
                 nums::CAP_LIST,
                 &mut ctx,
-                &SyscallArgs::new([0, 1, 0, 0, 0, 0]),
+                &SyscallArgs::new([0, 1, 0, 0, 0, 0, 0]),
             )
             .unwrap();
         assert_eq!(w as u64, h_tcb.bits(), "полный хендл без обрезания");
@@ -2486,7 +2532,7 @@ mod tests {
             .dispatch_number(
                 nums::CAP_LIST,
                 &mut ctx,
-                &SyscallArgs::new([0, 2, 0, 0, 0, 0]),
+                &SyscallArgs::new([0, 2, 0, 0, 0, 0, 0]),
             )
             .unwrap();
         assert_eq!(k, 2, "kind = TaskTCB");
@@ -2496,7 +2542,7 @@ mod tests {
             reg.dispatch_number(
                 nums::CAP_INFO,
                 &mut ctx,
-                &SyscallArgs::new([0, h_tcb.bits() as usize, i, 0, 0, 0]),
+                &SyscallArgs::new([0, h_tcb.bits() as usize, i, 0, 0, 0, 0]),
             )
             .unwrap()
         };
@@ -2511,7 +2557,7 @@ mod tests {
             reg.dispatch_number(
                 nums::CAP_INFO,
                 &mut ctx,
-                &SyscallArgs::new([0, h_tcb.bits() as usize, 6, 0, 0, 0])
+                &SyscallArgs::new([0, h_tcb.bits() as usize, 6, 0, 0, 0, 0])
             ),
             Err(SyscallError::InvalidArgument)
         );
@@ -2538,7 +2584,7 @@ mod tests {
             .dispatch_number(
                 nums::EP_CREATE,
                 &mut wctx,
-                &SyscallArgs::new([0, 4, 0, 0, 0, 0]),
+                &SyscallArgs::new([0, 4, 0, 0, 0, 0, 0]),
             )
             .unwrap() as u64;
         let gate = caps
@@ -2548,7 +2594,7 @@ mod tests {
 
         // Жертва гаснет по исключению (паника рантайма).
         let mut vctx = crate::syscall::SyscallCtx::core(0, victim, tasks, caps).with_ipc(ipc);
-        let args = SyscallArgs::new([0, 0xDEAD_BEEF, 0x4000, 2, 0xAAAA, 0xBBBB]);
+        let args = SyscallArgs::new([0, 0xDEAD_BEEF, 0x4000, 2, 0xAAAA, 0xBBBB, 0]);
         assert_eq!(
             reg.dispatch_number(nums::TASK_EXIT_EXCEPTION, &mut vctx, &args),
             Ok(0)

@@ -103,6 +103,8 @@ const SYS_IOMMU_IRQ_UNMAP: u64 = 0x86;
 // v0.9: спавн/песочница/права.
 const SYS_TASK_KILL: u64 = 0x13;
 const SYS_CAP_MINT: u64 = 0x21;
+// v0.15: mint IoResource с сужением ПОДДИАПАЗОНА (arg5 = base, arg6 = len).
+const SYS_CAP_MINT_RANGE: u64 = 0x27;
 const SYS_CAP_SEND: u64 = 0x22;
 const SYS_EP_CREATE: u64 = 0x31;
 const SYS_IPC_SEND: u64 = 0x32;
@@ -1325,8 +1327,12 @@ unsafe fn acpid_demo() {
 
         // Гранты сырых ресурсов: копии IoResource init -> cspace acpid
         // (CAP_MINT; init сохраняет свои — раздаёт копии).
+        // v0.15: линии — сужение поддиапазона: acpid'у нужны только SCI
+        // (GSI 9, кнопка питания/FADT); корневые 0..256 не отдаём —
+        // CAP_MINT_RANGE, демонстрация минимальных привилегий.
         let n = syscall6(SYS_CAP_LIST, 0, 0, 0, 0, 0, 0);
         let mut granted = 0u64;
+        let mut narrowed_irq = false;
         if n > 0 {
             let mut idx = 1u64;
             for _ in 0..n {
@@ -1334,15 +1340,29 @@ unsafe fn acpid_demo() {
                 let handle = syscall6(SYS_CAP_LIST, idx, 0, 0, 0, 0, 0) as u64;
                 let kind = syscall6(SYS_CAP_LIST, idx + 1, 0, 0, 0, 0, 0) as u64;
                 if (6..=8).contains(&kind) && handle > 0 {
-                    let m = syscall6(
-                        SYS_CAP_MINT,
-                        handle,
-                        ACPID_TASK as u64,
-                        (ACPID_TASK >> 64) as u64,
-                        0xFF,
-                        0xFFFF_FFFF_FFFF_FFFF,
-                        0,
-                    );
+                    let m = if kind == 8 {
+                        // Irq: сужение 0..256 -> 9..10 (SCI-линия).
+                        narrowed_irq = true;
+                        syscall6(
+                            SYS_CAP_MINT_RANGE,
+                            handle,
+                            ACPID_TASK as u64,
+                            (ACPID_TASK >> 64) as u64,
+                            0xFF,
+                            9,
+                            1,
+                        )
+                    } else {
+                        syscall6(
+                            SYS_CAP_MINT,
+                            handle,
+                            ACPID_TASK as u64,
+                            (ACPID_TASK >> 64) as u64,
+                            0xFF,
+                            0xFFFF_FFFF_FFFF_FFFF,
+                            0,
+                        )
+                    };
                     if m > 0 {
                         granted += 1;
                     } else {
@@ -1363,6 +1383,9 @@ unsafe fn acpid_demo() {
             0,
         );
         debug_word_line("init: acpid: IoResource grants minted = ", granted);
+        if narrowed_irq {
+            puts("init: acpid: Irq grant NARROWED via CAP_MINT_RANGE: GSI 9 only (v0.15)");
+        }
         if granted < 3 {
             puts("init: acpid: WARN: fewer than 3 IoResource grants (kinit?)");
         }

@@ -359,7 +359,7 @@ impl CapabilityManager {
                 }
                 let parent = CapabilityGate::new(cte.cap_ref.clone(), cte.perms, cte.badge);
                 Ok((
-                    parent.derive(spec),
+                    parent.derive(spec)?,
                     cte.target,
                     CteRef {
                         target: TargetRef::from_obj(cte),
@@ -1360,5 +1360,354 @@ impl<const LINES: usize> ResolveCache<LINES> {
 impl<const LINES: usize> Default for ResolveCache<LINES> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ───────────────────── Тесты сужения поддиапазонов (v0.15) ─────────────────────
+
+#[cfg(test)]
+mod narrow_tests {
+    use alloc::boxed::Box;
+
+    use crate::task::{TaskId, TaskPriority, TcbManager};
+
+    use super::{
+        ActionPermissions, CapHandle, CapabilityBadge, CapabilityError, CapabilityGate,
+        CapabilityManager, ContainerACCCapability, IoResourceKind, MintSpec,
+    };
+
+    struct Env {
+        tasks: &'static TcbManager,
+        caps: &'static CapabilityManager,
+        root: TaskId,
+        child: TaskId,
+    }
+
+    impl Env {
+        fn new() -> Self {
+            let tasks: &'static TcbManager = Box::leak(Box::new(TcbManager::new().unwrap()));
+            let caps: &'static CapabilityManager =
+                Box::leak(Box::new(CapabilityManager::new().unwrap()));
+            let root = TaskId::from_u128(0x1501);
+            let child = TaskId::from_u128(0x1502);
+            tasks.create(root, TaskPriority::DEFAULT).unwrap();
+            tasks.create(child, TaskPriority::DEFAULT).unwrap();
+            Self {
+                tasks,
+                caps,
+                root,
+                child,
+            }
+        }
+
+        /// Корневой IoResource-грант владельцу + хендл.
+        fn grant_io(&self, owner: TaskId, kind: IoResourceKind) -> CapHandle {
+            self.caps
+                .grant(
+                    self.tasks,
+                    owner,
+                    CapabilityGate::new(
+                        ContainerACCCapability::IoResource { kind },
+                        ActionPermissions::all(),
+                        CapabilityBadge::FULL,
+                    ),
+                )
+                .unwrap()
+        }
+
+        /// Диапазон IoResource-хендла (CAP_INFO-слово 4..5) для проверок.
+        fn range_of(&self, owner: TaskId, h: CapHandle) -> (u64, u64) {
+            let view = self.caps.get(self.tasks, owner, h).unwrap();
+            match view.cap_ref {
+                ContainerACCCapability::IoResource { kind } => {
+                    let [base, len] = kind.ident_words();
+                    (base, len)
+                }
+                other => panic!("not an IoResource: {other:?}"),
+            }
+        }
+
+        fn flavor_of(&self, owner: TaskId, h: CapHandle) -> u64 {
+            let view = self.caps.get(self.tasks, owner, h).unwrap();
+            match view.cap_ref {
+                ContainerACCCapability::IoResource { kind } => kind.flavor_word(),
+                other => panic!("not an IoResource: {other:?}"),
+            }
+        }
+
+        fn live_of(&self, owner: TaskId) -> usize {
+            self.caps.task_cap_count(self.tasks, owner).unwrap()
+        }
+    }
+
+    /// Легальное сужение: производная получает запрошенный поддиапазон.
+    #[test]
+    fn narrow_success_and_identity() {
+        let env = Env::new();
+        let h = env.grant_io(
+            env.root,
+            IoResourceKind::Mmio {
+                base: 0,
+                len: 0x1_0000_0000,
+            },
+        );
+        let before = env.live_of(env.child);
+        let sub = env
+            .caps
+            .mint(
+                env.tasks,
+                env.root,
+                h,
+                env.child,
+                &MintSpec::subrange(ActionPermissions::all(), 0xFEC0_0000, 0x1000),
+            )
+            .unwrap();
+        assert_eq!(env.range_of(env.child, sub), (0xFEC0_0000, 0x1000));
+        assert_eq!(env.flavor_of(env.child, sub), 1); // Mmio
+        assert_eq!(env.live_of(env.child), before + 1, "чистый успех: +1 слот");
+        // Родитель не изменился (сужение — только у производной).
+        assert_eq!(env.range_of(env.root, h), (0, 0x1_0000_0000));
+    }
+
+    /// Отказы: наружу родителя, частичное пересечение, len = 0,
+    /// переполнение конца. Все — RangeNotSubset и БЕЗ новых слотов.
+    #[test]
+    fn narrow_rejects_non_subset() {
+        let env = Env::new();
+        let h = env.grant_io(
+            env.root,
+            IoResourceKind::Mmio {
+                base: 0x1000,
+                len: 0x1000,
+            },
+        );
+        let before = env.live_of(env.child);
+        for (base, len) in [
+            (0x800, 0x1000),   // начало до родителя
+            (0x1000, 0x2000),  // вылезает за конец
+            (0x1800, 0x1000),  // частичное пересечение
+            (0x1000, 0),       // нулевая длина
+            (u64::MAX - 1, 2), // переполнение checked_add
+        ] {
+            assert_eq!(
+                env.caps.mint(
+                    env.tasks,
+                    env.root,
+                    h,
+                    env.child,
+                    &MintSpec::subrange(ActionPermissions::all(), base, len),
+                ),
+                Err(CapabilityError::RangeNotSubset),
+                "base={base:#x} len={len:#x} должно быть отказом"
+            );
+        }
+        assert_eq!(
+            env.live_of(env.child),
+            before,
+            "отказы без побочных эффектов"
+        );
+    }
+
+    /// Транзитивность: сужать можно только внутрь уже суженного.
+    #[test]
+    fn narrow_transitive_chain() {
+        let env = Env::new();
+        let root = env.grant_io(
+            env.root,
+            IoResourceKind::Mmio {
+                base: 0,
+                len: 0x1_0000_0000,
+            },
+        );
+        let mid = env
+            .caps
+            .mint(
+                env.tasks,
+                env.root,
+                root,
+                env.child,
+                &MintSpec::subrange(ActionPermissions::all(), 0, 0x4000_0000),
+            )
+            .unwrap();
+        // Внутрь mid — можно.
+        let leaf = env
+            .caps
+            .mint(
+                env.tasks,
+                env.child,
+                mid,
+                env.root,
+                &MintSpec::subrange(ActionPermissions::all(), 0x1000_0000, 0x1000),
+            )
+            .unwrap();
+        assert_eq!(env.range_of(env.root, leaf), (0x1000_0000, 0x1000));
+        // Наружу mid (но внутрь root) — отказ: решётка замкнута по mid.
+        assert_eq!(
+            env.caps.mint(
+                env.tasks,
+                env.child,
+                mid,
+                env.root,
+                &MintSpec::subrange(ActionPermissions::all(), 0x4000_0000, 0x1000),
+            ),
+            Err(CapabilityError::RangeNotSubset)
+        );
+    }
+
+    /// Диапазон запрошен у не-IoResource источника — отказ.
+    #[test]
+    fn narrow_rejects_non_io_resource() {
+        let env = Env::new();
+        let tcb = env
+            .caps
+            .grant(
+                env.tasks,
+                env.root,
+                CapabilityGate::new(
+                    ContainerACCCapability::TaskTCB { task_id: env.child },
+                    ActionPermissions::all(),
+                    CapabilityBadge::FULL,
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            env.caps.mint(
+                env.tasks,
+                env.root,
+                tcb,
+                env.child,
+                &MintSpec::subrange(ActionPermissions::all(), 0, 0x1000),
+            ),
+            Err(CapabilityError::RangeNotSubset)
+        );
+        // А без range — прежняя семантика работает.
+        assert!(
+            env.caps
+                .mint(env.tasks, env.root, tcb, env.child, &MintSpec::UNCHANGED)
+                .is_ok()
+        );
+    }
+
+    /// Разновидности сузиваются каждая в своих границах:
+    /// IoPort (u16) и Irq (u32), граница — по родителю.
+    #[test]
+    fn narrow_ioport_and_irq_bounds() {
+        let env = Env::new();
+        let io = env.grant_io(
+            env.root,
+            IoResourceKind::IoPort {
+                base: 0,
+                len: u16::MAX,
+            },
+        );
+        let sub_io = env
+            .caps
+            .mint(
+                env.tasks,
+                env.root,
+                io,
+                env.child,
+                &MintSpec::subrange(ActionPermissions::all(), 0x3F8, 8),
+            )
+            .unwrap();
+        assert_eq!(env.range_of(env.child, sub_io), (0x3F8, 8));
+        assert_eq!(env.flavor_of(env.child, sub_io), 2); // IoPort
+        // 0x1_0000 — вне u16-границы родителя 0..=0xFFFF.
+        assert_eq!(
+            env.caps.mint(
+                env.tasks,
+                env.root,
+                io,
+                env.child,
+                &MintSpec::subrange(ActionPermissions::all(), 0x1_0000, 1),
+            ),
+            Err(CapabilityError::RangeNotSubset)
+        );
+
+        let irq = env.grant_io(
+            env.root,
+            IoResourceKind::Irq {
+                base: 0,
+                count: 256,
+            },
+        );
+        let sci = env
+            .caps
+            .mint(
+                env.tasks,
+                env.root,
+                irq,
+                env.child,
+                &MintSpec::subrange(ActionPermissions::all(), 9, 1),
+            )
+            .unwrap();
+        assert_eq!(env.range_of(env.child, sci), (9, 1));
+        assert_eq!(env.flavor_of(env.child, sci), 3); // Irq
+        assert_eq!(
+            env.caps.mint(
+                env.tasks,
+                env.root,
+                irq,
+                env.child,
+                &MintSpec::subrange(ActionPermissions::all(), 255, 2),
+            ),
+            Err(CapabilityError::RangeNotSubset)
+        );
+    }
+
+    /// Revoke родителя гасит суженное поддерево в чужом cspace.
+    #[test]
+    fn narrow_revoke_cascade() {
+        let env = Env::new();
+        let h = env.grant_io(
+            env.root,
+            IoResourceKind::Irq {
+                base: 0,
+                count: 256,
+            },
+        );
+        let sub = env
+            .caps
+            .mint(
+                env.tasks,
+                env.root,
+                h,
+                env.child,
+                &MintSpec::subrange(ActionPermissions::all(), 9, 1),
+            )
+            .unwrap();
+        let before_child = env.live_of(env.child);
+        // Отзыв корня: слот root + суженный у child.
+        let report = env.caps.revoke(env.tasks, env.root, h).unwrap();
+        assert_eq!(report.revoked_slots, 2);
+        assert_eq!(env.live_of(env.child), before_child - 1);
+        // Хендл суженного больше не резолвится.
+        assert!(env.caps.get(env.tasks, env.child, sub).is_none());
+    }
+
+    /// Syscall-ABI хендлер: CAP_MINT_RANGE проходит путь
+    /// require_dst_capable + subrange через фасад (регрессия接线).
+    #[test]
+    fn narrow_facade_path() {
+        let env = Env::new();
+        let h = env.grant_io(
+            env.root,
+            IoResourceKind::Irq {
+                base: 0,
+                count: 256,
+            },
+        );
+        // Фасадный путь (тот же менеджер, что и хендлер 0x27).
+        let sub = env
+            .caps
+            .mint(
+                env.tasks,
+                env.root,
+                h,
+                env.root, // свой домен: require_dst_capable свободен
+                &MintSpec::subrange(ActionPermissions::all(), 9, 1),
+            )
+            .unwrap();
+        assert_eq!(env.range_of(env.root, sub), (9, 1));
     }
 }

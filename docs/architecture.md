@@ -30,8 +30,9 @@ SMP, модель синхронизации (v0.12, без Big Kernel Lock), п
 |------|-------|-----------------|
 | Загрузка | `uefi_stub`, `boot_info`, `bootcfg` | UEFI-заглушка (образ ядра встроен), BootInfo-ABI, разбор boot_cfg.xml |
 | Механика ISA | `arch` (+ крейт `x86_64`) | per-CPU блоки через GS, COM1 16550, константы загрузочного ABI, MSR |
-| Ядро | `kernel` (`pkg_generic_interface`) | GCTL — фасад менеджеров; HAL-трейты; syscall-таблица; sync-примитивы |
-| Исполнитель x86_64 | `backend` | гейт входов, планировщик, LAPIC/IOAPIC, SMP/IPI, память (MMAP/KMAP/ASID), VT-d/AMD-Vi |
+| **Контракты HAL (v0.15)** | **`kernel-hal`** | типы (PhysAddr, Bdf, DevicePath) + трейты платформы; НЕ зависит ни от одного крейта workspace — экспозиция архитектуры не проникает между крейтами (граница видна cargo) |
+| Ядро | `kernel` (`pkg_generic_interface`) | GCTL — фасад менеджеров; реэкспорт контрактов kernel-hal + IrqRouter (механизм GSI→endpoint); syscall-таблица; sync-примитивы |
+| Исполнитель x86_64 | `backend` | гейт входов, планировщик, LAPIC/IOAPIC, SMP/IPI, память (MMAP/KMAP/ASID), VT-d/AMD-Vi; реализует контракты kernel-hal — единственное место экспозиции архитектуры |
 | Политика запуска | `startup` | kinit: порядок инициализации, elfload, пулы, KernelGlue |
 | Пользователь | `init`, `rogue`, `userlib`, `pie` | серверы, C-ABI-обёртки, PIE-загрузчик спавна |
 
@@ -44,13 +45,16 @@ SMP, модель синхронизации (v0.12, без Big Kernel Lock), п
 связаны между собой **параметрами, не полями** (паттерн
 `CapabilityManager::ops(&TcbManager)`): GCTL — витрина, а не god-object.
 
-**HAL-трейты** (`kernel/hal/traits/`): `MMAPInterface` (адресные
-пространства пользователя), `KMAPInterface` (изображение ядра,
-изоляция Meltdown/KPTI), `ASIDInterface` (PCID/ASID, FlushMode),
+**HAL-контракты** (`kernel-hal` — отдельный крейт с v0.15; ядро
+реэкспортирует их как `kernel::hal::{types, traits}`): `MMAPInterface`
+(адресные пространства пользователя), `KMAPInterface` (изображение
+ядра, изоляция Meltdown/KPTI), `ASIDInterface` (PCID/ASID, FlushMode),
 `DmaOps`/`DmaPlatform`, `ANIOMMUInterface` (агностик IOMMU),
 `IrqLineOps` (внешние линии), `IoPortOps` (медитация I/O-портов — v0.14),
-`CpuInterface`. Перенос на другую ISA =
-реализация `Platform` (+ head.S + гейт); политика kinit не меняется.
+`CpuInterface`. Контрактный слой собирается автономно
+(`cargo build -p kernel-hal`) — если перестал, архитектура начала
+протекать. Перенос на другую ISA = реализация `Platform` (+ head.S +
+гейт) в новом бекенде; политика kinit не меняется.
 
 **KernelGlue** (`startup`) — интеграционная плоскость «арх-гейт ↔
 ядро»: диспетчеризация сисколов, активация пространств, смерть/фолты
@@ -385,18 +389,37 @@ PWRBTN_EN; выключение ПК — IOP_OUT в PM1a_CNT значения SL
 SLP_EN (демо v0.14: QEMU завершается с кодом 0). AML-интерпретатор —
 самая рискованная часть ACPI — теперь паникует в юзерспейсе.
 
+**Сужение поддиапазонов (v0.15)**: деривация IoResource — решётка по
+вложению: `CAP_MINT_RANGE` (0x27) выдаёт производную с диапазоном
+`base..base+len`, строго вложенным в родительский той же разновидности
+(инварианты: checked-вложение, len>0, совпадение вида; нарушение —
+`RangeNotSubset` БЕЗ создания слота/узла дерева). CAP_MINT (0x21)
+не менялся — «полный диапазон» остался ABI-совместимым путём; badge
+у IoResource не применяется (гейты 0x40 его не читают). Шестой аргумент
+ABI (a6 = r9) подключён впервые — asm-стаб передавал его всегда,
+гейт отбрасывал (SYSCALL_ARG_COUNT 6→7; прежние сисколлы читают
+arg(6)=0). Отзыв — прежний каскад дерева деривации. Демо минимальных
+привилегий: init выдаёт acpid Irq 0..256 → суженный 9..10 (только SCI)
+через CAP_MINT_RANGE; полный контур — CAP_MINT_RANGE →
+IRQ_ATTACH(SCI 9) → PWRBTN_EN → S5.
+
 ## 10. Верификация
 
-- **Host-тесты**: `cargo test` — 151 тест ядра (менеджеры, песочница,
-  квоты, IPC, capability, PIE-парсер) + bootcfg + boot_info; ядро
-  гоняет их на std с host-хуками аллокатора.
+- **Host-тесты**: `cargo test` — ядро 136 (менеджеры, песочница,
+  квоты, IPC, capability, PIE-парсер, сужение поддиапазонов ×7)
+  + kernel-hal 2 (ASID-контракт, автономная сборка крейта) +
+  bootcfg + boot_info; ядро гоняет их на std с host-хуками
+  аллокатора.
+- **Автономность контрактов (v0.15)**: `cargo build -p kernel-hal`
+обязан собираться без ядра — быстрый архитектурный гейт
+  («экспозиция не протекла»).
 - **QEMU-прогоны** (три конфигурации: baseline / Intel VT-d
   intremap=on / AMD-Vi intremap=on, OVMF q35, TCG SMP=2): полный
   демо-сценарий init — IOMMU smoke обоих вендоров, SMP-стресс без
   lost updates, песочница (9+ атак блокированы, `sandbox HELD`),
   CPU-квота (`cpu quota HELD`, точный заряд циклами), PIE-спавн на
-  двух базах, IOAPIC COM1 → L4-signal, exit 0; холд машины после
-  демо (EXIT=124 = успех).
+  двух базах, IOAPIC COM1 → L4-signal, acpid: перечисление + SCI по
+  суженному гранту + S5-выключение из юзерспейса (exit 0).
 - **rustfmt** — чисто на всех версиях; сборка образа — exit 0.
 
 Регресс-политика: каждая версия проходит все три конфигурации QEMU;

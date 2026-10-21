@@ -216,6 +216,65 @@ impl IoResourceKind {
             IoResourceKind::Irq { base, count } => [*base as u64, *count as u64],
         }
     }
+
+    /// Сужение поддиапазона (v0.15): производная IoResource обязана
+    /// лежать ВНУТРИ родительского диапазона той же разновидности —
+    /// решёточный инвариант деривации (производная никогда не шире
+    /// родителя, как у прав и badge).
+    ///
+    /// Инварианты (нарушение любого — `None`, отказ без побочных
+    /// эффектов):
+    /// 1. вложение: `new_base >= base` и `new_base + new_len <= base + len`
+    ///    (арифметика без переполнения — checked_add);
+    /// 2. позитивность: `new_len > 0` (пустой диапазон — не право);
+    /// 3. совпадение вида: пары слов интерпретируются по разновидности
+    ///    РОДИТЕЛЯ (Mmio: 64/64 бита, IoPort: граница u16, Irq: граница u32);
+    /// 4. транзитивность обеспечена самим вложением: сужать можно только
+    ///    от уже суженного и только внутрь его.
+    pub fn narrow(&self, new_base: u64, new_len: u64) -> Option<IoResourceKind> {
+        if new_len == 0 {
+            return None;
+        }
+        match *self {
+            IoResourceKind::Mmio { base, len } => {
+                // Вложение без переполнения: сравниваем через checked_add.
+                let new_end = new_base.checked_add(new_len)?;
+                let end = base.checked_add(len)?;
+                if new_base >= base && new_end <= end {
+                    Some(IoResourceKind::Mmio {
+                        base: new_base,
+                        len: new_len,
+                    })
+                } else {
+                    None
+                }
+            }
+            IoResourceKind::IoPort { base, len } => {
+                let new_end = new_base.checked_add(new_len)?;
+                let end = base as u64 + len as u64;
+                if new_base >= base as u64 && new_end <= end {
+                    Some(IoResourceKind::IoPort {
+                        base: new_base as u16,
+                        len: new_len as u16,
+                    })
+                } else {
+                    None
+                }
+            }
+            IoResourceKind::Irq { base, count } => {
+                let new_end = new_base.checked_add(new_len)?;
+                let end = base as u64 + count as u64;
+                if new_base >= base as u64 && new_end <= end {
+                    Some(IoResourceKind::Irq {
+                        base: new_base as u32,
+                        count: new_len as u32,
+                    })
+                } else {
+                    None
+                }
+            }
+        }
+    }
 }
 
 /// Объект, на который ссылается capability. Сохранён из прежней версии
@@ -316,14 +375,31 @@ impl CapabilityGate {
     }
 
     /// Порождает гейт производной capability: права и badge сужаются
-    /// пересечением с `spec`. Метод — «чистая» функция над значениями;
-    /// дерево деривации и счётчики ведёт менеджер.
-    pub(crate) fn derive(&self, spec: &MintSpec) -> Self {
-        Self {
-            cap_ref: self.cap_ref.clone(),
+    /// пересечением с `spec`, диапазон IoResource — вложенным
+    /// поддиапазоном `spec.range` (v0.15). Метод — «чистая» функция над
+    /// значениями; дерево деривации и счётчики ведёт менеджер.
+    ///
+    /// `Err(RangeNotSubset)` — поддиапазон не вложен в родительский либо
+    /// диапазон запрошен у не-IoResource источника; отказ чистый: ни CTE,
+    /// ни узла деривации не создаётся (гарантирует менеджер).
+    pub(crate) fn derive(&self, spec: &MintSpec) -> Result<Self, CapabilityError> {
+        let cap_ref = match (&self.cap_ref, spec.range) {
+            (ContainerACCCapability::IoResource { kind }, Some((base, len))) => {
+                let narrowed = kind
+                    .narrow(base, len)
+                    .ok_or(CapabilityError::RangeNotSubset)?;
+                ContainerACCCapability::IoResource { kind: narrowed }
+            }
+            // Диапазон имеет смысл только у сырых ресурсов: у гейтов/TCB
+            // сужением служит badge, у IoResource — поддиапазон.
+            (_, Some(_)) => return Err(CapabilityError::RangeNotSubset),
+            _ => self.cap_ref.clone(),
+        };
+        Ok(Self {
+            cap_ref,
             perms: self.perms & spec.perms,
             badge: self.badge.narrow(spec.badge),
-        }
+        })
     }
 }
 
@@ -337,20 +413,40 @@ impl core::fmt::Debug for CapabilityGate {
     }
 }
 
-/// Запрошенное сужение при mint: какие права и какие подресурсы просит
-/// производная capability. Менеджер отвечает пересечением с родителем.
+/// Запрошенное сужение при mint: какие права, какие подресурсы (badge) и
+/// какой ПОДДИАПАЗОН просит производная capability. Менеджер отвечает
+/// пересечением с родителем (права/badge) и проверкой вложенности
+/// (диапазон: только ⊆ родителя).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MintSpec {
     pub perms: ActionPermissions,
     pub badge: CapabilityBadge,
+    /// Сужение поддиапазона IoResource (v0.15): `Some((base, len))` —
+    /// только для источников-`IoResource` (иначе отказ
+    /// [`CapabilityError::RangeNotSubset`]); `None` — прежняя семантика
+    /// (диапазон клонируется целиком, как права/badge без сужения).
+    pub range: Option<(u64, u64)>,
 }
 
 impl MintSpec {
-    /// Без сужения: производная получает те же права/badge, что родитель.
+    /// Без сужения: производная получает те же права/badge/диапазон, что
+    /// родитель (диапазон IoResource клонируется целиком).
     pub const UNCHANGED: Self = Self {
         perms: ActionPermissions::all(),
         badge: CapabilityBadge::FULL,
+        range: None,
     };
+
+    /// Сужение поддиапазона IoResource: `base..base+len` обязано лежать
+    /// внутри родительского диапазона (проверяет менеджер через
+    /// [`IoResourceKind::narrow`]).
+    pub const fn subrange(perms: ActionPermissions, base: u64, len: u64) -> Self {
+        Self {
+            perms,
+            badge: CapabilityBadge::FULL,
+            range: Some((base, len)),
+        }
+    }
 }
 
 // ==== Снимки для аудита и горячего пути ====
@@ -412,7 +508,7 @@ pub struct RevokeReport {
 /// чужих capability по хендлу не различимо (хендл локален cspace). Отдельные
 /// ошибки (`MissingRight`, `TaskNotFound`) выдаются только после того, как
 /// хендл нашёлся в таблице вызывающего.
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CapabilityError {
     #[error("task {0} not found")]
@@ -436,6 +532,12 @@ pub enum CapabilityError {
     /// Сбой slab/страничной таблицы (память под CTE, гейт или IRQ-объект).
     #[error("out of memory")]
     OutOfMemory,
+    /// Запрошенный поддиапазон IoResource не вложен в родительский
+    /// (v0.15): вне диапазона, нулевая длина, переполнение конца,
+    /// несовпадение разновидности либо диапазон запрошен у не-IoResource
+    /// источника. Отказ чистый: ни CTE, ни узла деривации не создано.
+    #[error("requested subrange is not within the parent IoResource")]
+    RangeNotSubset,
 }
 
 impl From<PagedError> for CapabilityError {

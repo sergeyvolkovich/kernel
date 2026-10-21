@@ -108,6 +108,13 @@ int64_t l4_thread_ex_regs(uint64_t tid_lo, uint64_t tid_hi,
 int64_t l4_cap_mint(uint64_t src, uint64_t dst_lo, uint64_t dst_hi,
                     uint64_t perms, uint64_t badge);
 
+/* CAP_MINT_RANGE(0x27, v0.15): производная IoResource-возможности со
+ * сужением ПОДДИАПАЗОНА: base..base+len обязан лежать строго внутри
+ * родительского диапазона той же разновидности (иначе RangeNotSubset).
+ * Первый пользователь шестого аргумента ABI (a6). */
+int64_t l4_cap_mint_range(uint64_t src, uint64_t dst_lo, uint64_t dst_hi,
+                          uint64_t perms, uint64_t new_base, uint64_t new_len);
+
 /* CAP_SEND(0x22): передать capability (право Send у источника). */
 int64_t l4_cap_send(uint64_t src, uint64_t dst_lo, uint64_t dst_hi);
 

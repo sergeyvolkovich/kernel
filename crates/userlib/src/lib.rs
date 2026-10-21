@@ -237,6 +237,22 @@ pub extern "C" fn l4_cap_mint(src: u64, dst_lo: u64, dst_hi: u64, perms: u64, ba
     unsafe { l4_syscall6(0x21, src, dst_lo, dst_hi, perms, badge, 0) }
 }
 
+/// CAP_MINT_RANGE(0x27): производная IoResource-возможности со сужением
+/// ПОДДИАПАЗОНА (v0.15): `base..base+len` обязан лежать строго внутри
+/// родительского диапазона той же разновидности (иначе RangeNotSubset).
+/// Использует ШЕСТОЙ аргумент ABI (a6): SYSCALL_ARG_COUNT=7 с v0.15.
+#[unsafe(no_mangle)]
+pub extern "C" fn l4_cap_mint_range(
+    src: u64,
+    dst_lo: u64,
+    dst_hi: u64,
+    perms: u64,
+    new_base: u64,
+    new_len: u64,
+) -> i64 {
+    unsafe { l4_syscall6(0x27, src, dst_lo, dst_hi, perms, new_base, new_len) }
+}
+
 /// CAP_SEND(0x22): передать capability.
 #[unsafe(no_mangle)]
 pub extern "C" fn l4_cap_send(src: u64, dst_lo: u64, dst_hi: u64) -> i64 {

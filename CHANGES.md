@@ -1,5 +1,103 @@
 # rust-l4: изменения по версиям (workspace)
 
+# v0.15 — kernel-hal: контракты в отдельном крейте + сужение поддиапазонов IoResource (CAP_MINT_RANGE)
+
+> Завершение запроса «экспозиция архитектуры не проникает между
+> крейтами»: HAL-контракты покидают generic-ядро и становятся
+> НЕЗАВИСИМЫМ крейтом kernel-hal — граница видна cargo при каждой
+> сборке. Вторая половина: деривация IoResource умеет СУЖАТЬ
+> поддиапазон (CAP_MINT_RANGE 0x27) — минимальные привилегии для
+> драйверов: бар устройства, а не вся физика; SCI-линия, а не весь
+> GSI-space. Ссылка: дизайн-документ kernel_v015_design.pdf (обложка
+> Template 01, 10 стр.).
+
+### Сделано
+
+**kernel-hal — контрактный крейт (структурная изоляция):**
+- Новый крейт `crates/kernel-hal` (пакет `kernel-hal`, lib
+  `kernel_hal`): hal/types.rs (298 стр: PhysAddr, Bdf, DevicePath,
+  IommuProt, DeviceInfo) + hal/traits/{asid,cpu,dma,iommu,ioport,irq,
+  kmap,mmap} (1752 стр контрактов) — перенесены из
+  pkg_generic_interface git-mv (история сохранена). Зависимости:
+  bitflags/thiserror + ТИПЫ ОШИБОК контракта MMAP (llfree::Error,
+  SlabError, AlignedBoxError — часть сигнатуры трейта) — ни одного
+  крейта workspace: контрактный слой физически не видит ни ядро,
+  ни бекенд (обратного ребра в Cargo.toml нет).
+- IrqRouter (hal/irq.rs: GSI→endpoint) ОСТАЛСЯ в kernel — это
+  механизм уровня ядра (сигнатуры содержат CapabilityManager/
+  IpcManager/TcbManager); перенос сломал бы независимость крейта.
+- Миграция БЕЗ переписывания 20 файлов ядра: kernel::hal реэкспортирует
+  `kernel_hal::{types, traits}` (pub use) + локальный `pub mod irq` —
+  пути crate::hal::types::*/crate::hal::traits::* в потребителях
+  не менялись. backend и startup импортируют контракты НАПРЯМУЮ
+  (`use kernel_hal::traits::…`): граница «контракт отдельно от нутра
+  ядра» видна и в их исходниках, а не только в графе сборки.
+- Автономный гейт: `cargo build -p kernel-hal` — контрактный слой
+  обязан собираться без ядра (быстрая проверка «архитектура не
+  протекла»). IommuError через границу крейта — non_exhaustive:
+  syscall/iommu.rs получил wildcard-ветку (новый вариант больше не
+  может сломать ABI сисколлов).
+- Тесты ASID-контракта переехали вместе с файлами: kernel-hal 2
+  (asid_pair/high_bit), ядро 129 + 7 новых (narrowing) = 136.
+
+**Сужение поддиапазонов IoResource (решётка деривации):**
+- `IoResourceKind::narrow(base, len)`: производная обязана лежать
+  строго ВНУТРИ родительского диапазона той же разновидности.
+  Инварианты (нарушение — None, отказ чистый): вложение (checked_add,
+  без wrap-around), len > 0, совпадение вида (Mmio 64/64, IoPort —
+  u16-границы, Irq — u32), транзитивность (сужать только внутрь
+  суженного).
+- `MintSpec.range: Option<(base, len)>` (UNCHANGED — прежняя
+  семантика «клонировать целиком»); `CapabilityGate::derive` — теперь
+  Result: `CapabilityError::RangeNotSubset` (новый вариант, enum
+  получил PartialEq для тестов). Отказ БЕЗ создания CTE/узла дерева.
+  Отзыв — прежний каскад дерева деривации: revoke родителя гасит
+  суженное поддерево в чужих cspace.
+- **CAP_MINT_RANGE (0x27)**: ABI arg1=src, arg2..3=TaskId(lo,hi),
+  arg4=perms, arg5=new_base, arg6=new_len. ШЕСТОЙ аргумент ABI
+  подключён впервые: SYSCALL_ARG_COUNT 6→7 — asm-стаб передавал
+  r9/a6 всегда, гейт отбрасывал; теперь a6 в слоте 6, все прежние
+  сисколлы читают arg(6)=0 — ABI-совместимость сохранена. badge не
+  сужается (гейты 0x40 его не читают) — производная наследует
+  родительский. Права получателя — как у CAP_MINT (свой домен ИЛИ
+  TaskTCB + max_caps против флода).
+- CAP_MINT (0x21) НЕ ИЗМЕНЁН (badge-путь, полный диапазон):
+  перегрузка badge половинками диапазона отвергнута как
+  неразличимая. userlib: l4_cap_mint_range + l4.h; l4_syscall6 уже
+  несла a6.
+- Демо минимальных привилегий в QEMU (S6): init выдаёт acpid Irq
+  0..256 → **суженный 9..10** (SCI кнопки питания, FADT) через
+  CAP_MINT_RANGE — «Irq grant NARROWED... GSI 9 only» в логе; полный
+  контур сужения: CAP_MINT_RANGE → IRQ_ATTACH(SCI 9) → PWRBTN_EN →
+  S5-выключение из юзерспейса. Mmio/IoPort-гранты acpid — как
+  прежде (ему нужны все таблицы/порты).
+- Host-тесты (7): успех+идентичность, отказы (наружу/пересечение/
+  len=0/переполнение — без побочных эффектов), транзитивная цепочка,
+  не-IoResource источник (диапазон запрошен у TaskTCB), границы
+  IoPort (u16)/Irq (u32), revoke-каскад суженного дерева, фасадный
+  путь.
+
+### Верификация
+
+- cargo fmt; cargo build -p kernel-hal (автономно); host-тесты:
+  kernel 136 (129 + 7 narrowing) + kernel-hal 2 + bootcfg 9 +
+  boot_info 8 + pie 5 — все зелёные.
+- Полная сборка образа build.sh [1..6/6] (kernel, userlib, rogue,
+  acpid ET_DYN, init, uefi_stub, capp, ESP) — зелёная.
+- QEMU q35+OVMF SMP=2 (TCG single-thread): S1–S6 прежние зелёные,
+  «Irq grant NARROWED via CAP_MINT_RANGE: GSI 9 only (v0.15)»,
+  acpid: 53 узла namespace, 11 устройств, SCI line attached по
+  суженной cap, S5 из юзерспейса — VM выключается сама.
+
+### Roadmap (v0.16+)
+
+- pcid: PCI-перечислитель в юзерспейсе через CF8/CFC за IoPort-cap
+  (суженные гранты — прямое применение CAP_MINT_RANGE).
+- Интерактивная кнопка питания (QEMU monitor `system_powerdown`).
+- Проверка квот IPC-пробуждённых (enqueue-гейты).
+- Частичный unmap huge-страниц; расширение дерева деривации — revocation
+  волной по CPU.
+
 # v0.14 — Устройств в ядре НЕТ: AML/перечисление вынесены в юзерспейс, сырые ресурсы за IoResource-capability, выключение ПК из юзерспейса (S5)
 
 > Модель seL4: ядро не знает НИ ОДНОГО устройства. Перечисление (ACPI/

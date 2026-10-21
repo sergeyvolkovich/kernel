@@ -437,6 +437,7 @@ mod tests {
             1,
             0x55,
             0,
+            0,
         ]);
         assert_eq!(IopOutHandler.invoke(&mut ctx, &args).unwrap(), 0);
         assert_eq!(MOCK_PORT.load(Ordering::SeqCst), 0x3F8);
@@ -450,6 +451,7 @@ mod tests {
             4,
             0,
             0,
+            0,
         ]);
         assert_eq!(IopInHandler.invoke(&mut ctx, &args).unwrap(), 0xA5A5_1234);
         let args = SyscallArgs::new([
@@ -457,6 +459,7 @@ mod tests {
             cap.bits() as usize,
             7,
             2,
+            0,
             0,
             0,
         ]);
@@ -471,6 +474,7 @@ mod tests {
             env.gate_handle.bits() as usize,
             0,
             1,
+            0,
             0,
             0,
         ]);
@@ -495,6 +499,7 @@ mod tests {
             env.gate_handle.bits() as usize,
             0,
             0,
+            0,
         ]);
         assert_eq!(
             IrqAttachHandler.invoke(&mut ctx, &args),
@@ -509,6 +514,7 @@ mod tests {
             env.gate_handle.bits() as usize,
             0,
             0,
+            0,
         ]);
         assert_eq!(IrqAttachHandler.invoke(&mut ctx, &args).unwrap(), 0);
         assert_eq!(
@@ -518,7 +524,7 @@ mod tests {
         assert_eq!(env.router.len(), 1);
 
         // Гейт не владельца — привязка осталась у env.owner.
-        let ack = SyscallArgs::new([IrqAckHandler::SYSCALL.as_u64() as usize, 42, 0, 0, 0, 0]);
+        let ack = SyscallArgs::new([IrqAckHandler::SYSCALL.as_u64() as usize, 42, 0, 0, 0, 0, 0]);
         assert_eq!(IrqAckHandler.invoke(&mut ctx, &ack).unwrap(), 0);
     }
 }
