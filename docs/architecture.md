@@ -38,8 +38,9 @@ SMP, модель синхронизации (v0.12, без Big Kernel Lock), п
 **GCTL** (`kernel/src/lib.rs`) — корневой фасад, владелец менеджеров:
 `TcbManager` (домены + потоки), `CapabilityManager` (cspace,
 гейты, деривация/отзыв), `MemoryManager` (физпул + фасады адресных
-пространств + привязки задача→фасад), `DeviceManager` (+ claims),
-`IpcManager`, `ShmManager`, `IrqRouter`, `SyscallRegistry`. Менеджеры
+пространств + привязки задача→фасад), `IpcManager`, `ShmManager`,
+`IrqRouter` (внешние линии GSI), `SyscallRegistry`. Реестра устройств
+в GCTL НЕТ с v0.14 — ядро не знает ни одного устройства. Менеджеры
 связаны между собой **параметрами, не полями** (паттерн
 `CapabilityManager::ops(&TcbManager)`): GCTL — витрина, а не god-object.
 
@@ -47,8 +48,8 @@ SMP, модель синхронизации (v0.12, без Big Kernel Lock), п
 пространства пользователя), `KMAPInterface` (изображение ядра,
 изоляция Meltdown/KPTI), `ASIDInterface` (PCID/ASID, FlushMode),
 `DmaOps`/`DmaPlatform`, `ANIOMMUInterface` (агностик IOMMU),
-`IrqLineOps` (внешние линии), `CpuInterface`; устройства —
-`BusEnumerator`/`DeviceRecord`/claim-контракты. Перенос на другую ISA =
+`IrqLineOps` (внешние линии), `IoPortOps` (медитация I/O-портов — v0.14),
+`CpuInterface`. Перенос на другую ISA =
 реализация `Platform` (+ head.S + гейт); политика kinit не меняется.
 
 **KernelGlue** (`startup`) — интеграционная плоскость «арх-гейт ↔
@@ -320,25 +321,50 @@ SHM/io_uring: регионы из физпула, SQ/CQ-кольца (геоме
 submit), отображение в оба домена zero-copy. Все операции — только
 владельцу региона (owner-гейт, v0.9).
 
-## 9. Устройства и прерывания
+## 9. Сырые ресурсы и прерывания (v0.14: устройств в ядре нет)
 
-`DeviceManager` — реестр записей (PCI/ACPI-пути; легаси-шина платформы
-для ISA-устройств COM1/PIT — v0.11), экспорт capability
-DeviceReference, rescan с hot-removal: пропавшее устройство —
-ядровая ошибка ждущим претендентам + IPC DEVICE_LOST владельцу +
-снятие IRQ-привязок (`IrqRouter::detach_device`).
+v0.14 переводит ядро на модель seL4: **ядро не перечисляет и не знает
+устройств**. Прежний `DeviceManager` (реестр, rescan, claims,
+DeviceReference-capability, шины PCI/ACPI/ISA) и AML-интерпретатор
+(крейт `acpi`) удалены из ядра целиком: перечисление — политика
+юзерспейса (acpid читает ACPI/AML, будущий pcid обойдёт PCI config
+через порты). Ядро осталось **механизмом**: медитация сырых диапазонов
+за capability + доставка линий прерываний как L4-сообщений.
 
-**Claims** — эксклюзивные локи устройств (DEVICE_CLAIM): парк ждущих
-под CLAIM-локом (lost-wakeup закрыт), notify-endpoint для потери.
+**IoResource-capability** — право на ДИАПАЗОН, а не на «устройство»:
+`Mmio { base, len }` (физика; таблицы прошивки, MMIO-баре),
+`IoPort { base, len }` (порты x86), `Irq { base, count }` (линии GSI).
+Стартовый грант kinit (модель root task seL4): init получает физику
+0..4 GiB + порты 0..64 KiB + линии 0..256, плюс факт `rsdp=0x…` в
+boot_state (ссылка на таблицы; интерпретация — юзерспейс). Производные
+— CAP_MINT (копия диапазона; сужение поддиапазона — roadmap).
 
-**IrqRouter** — привязки GSI → endpoint (L4 irq_attach): прерывание
-становится signal-сообщением (word = gsi), драйвер ждёт обычным
-IPC_RECV, EOI-семантика — IRQ_ACK (до ACK события копятся одним
-pending-битом).
+**Сисколы группы 0x40** (все — только за IoResource-cap):
 
-**IOAPIC** (v0.11): драйвер читает MADT (тип 1 — override, тип 2 —
-базовое; ISO-флаги полярности/триггера), `enable_line` программирует
-обычный RTE либо remapped-формат:
+- `MMIO_MAP` (0x41): физика → байто-точный vaddr (кадры внешние,
+  снятие MEM_FREE);
+- `IOP_IN/IOP_OUT` (0x42/0x43): in/out исполняет ЯДРО (IOPL
+  пользовательских контекстов = 0 — прямого доступа к портам из
+  юзерспейса не существует) через платформенный сервис `IoPortOps`;
+- `IRQ_ATTACH` (0x46): GSI за Irq-cap → endpoint.
+
+**IrqRouter** (`hal/irq.rs`, GSI-keyed) — привязки линия → endpoint
+(L4 irq_attach): прерывание становится signal-сообщением (word = gsi),
+драйвер ждёт обычным IPC_RECV, EOI-семантика — IRQ_ACK (до ACK события
+копятся одним pending-битом). Смерть задачи снимает её привязки
+(detach_all_of); «горячее удаление» — не понятие ядра (менеджер
+устройств в юзерспейсе отзывает caps и приказывает IRQ_DETACH).
+
+**Фасад памяти v0.14**: одна и та же физика может стоять в НЕСКОЛЬКИХ
+регионах (как frame в seL4) — ключ paddr-индекса записей — пара
+(физическая база, виртуальная база); это паттерн acpi-крейта (мапит
+заголовок таблицы и затем полную таблицу одного адреса, оба живы).
+Снятие записи — по точной паре ключей.
+
+**IOAPIC** (v0.11, без изменений): драйвер читает MADT (тип 1 —
+override, тип 2 — базовое; ISO-флаги полярности/триггера каноничнее
+подсказок флагов IRQ_ATTACH), `enable_line` программирует обычный RTE
+либо remapped-формат:
 
 - Intel VT-d: IRTE-слот 0x10+pin, remapped-RTE несёт handle+триггер
   (формат Linux IR_IO_APIC_route_entry — совместимо с QEMU);
@@ -350,6 +376,14 @@ pending-битом).
 контекста) → `IrqRouter` → signal в endpoint. IRQ-хендлеры соблюдают
 IF-дисциплину: спины на глубине 0 — с IF=1, вложение внешних линий
 ограничено одним уровнем.
+
+**acpid** (юзерспейс, крейт `crates/acpid`): acpi::Handler поверх
+MMIO_MAP (refcount-кэш перекрывающихся снапшотов) и IOP_IN/OUT;
+namespace-walk (_HID/_CID/_UID/_ADR/_STA/_CRS), FADT (PM1a_EVT/CNT,
+SCI), `\_S5_`; кнопка питания — SCI (GSI 9) через IRQ_ATTACH +
+PWRBTN_EN; выключение ПК — IOP_OUT в PM1a_CNT значения SLP_TYPa<<10 |
+SLP_EN (демо v0.14: QEMU завершается с кодом 0). AML-интерпретатор —
+самая рискованная часть ACPI — теперь паникует в юзерспейсе.
 
 ## 10. Верификация
 

@@ -18,10 +18,9 @@
 //!   │        + endpoint'ы (GateObj с состоянием IPC)
 //!   ├─ memory_manager: MemoryManager<MMAP, ARCPool>  фасады памяти (KPTI/PCID)
 //!   │        + привязки задача→фасад (MemRouter для сисколов/IPC)
-//!   ├─ device_manager: DeviceManager            реестр устройств: шины
-//!   │        (pci/acpi, dtb — план) + экспорт capability
-//!   │        + claims: DeviceClaimRegistry       эксклюзивные локи,
-//!   │        hot-removal уведомления (ошибка ядра + IPC)
+//!   ├─ irq_router: IrqRouter                     внешние линии (GSI)→endpoint
+//!   │        (v0.14: реестра устройств в ядре НЕТ — перечисление и
+//!   │        драйверы в юзерспейсе; сырые ресурсы — IoResource-cap)
 //!   ├─ ipc_manager: IpcManager                  L4-IPC: endpoint'ы,
 //!   │        fast-path по ThreadID, exit-протокол (3 вида данных)
 //!   ├─ shm_manager: ShmManager                  разделяемая память
@@ -47,7 +46,7 @@ use thiserror::Error;
 
 use crate::{
     capability::CapabilityManager,
-    hal::device::{DeviceError, DeviceManager},
+    hal::irq::IrqRouter,
     hal::traits::mmap::MMAPInterface,
     ipc::{IpcManager, ShmManager},
     mem::{ARCPool, Arc, MemRouterImpl, MemoryManager},
@@ -71,8 +70,6 @@ pub enum GctlError {
     Memory(#[from] hal::traits::mmap::MemErrorCode),
     #[error("syscall registry init failed: {0}")]
     Syscall(#[from] syscall::SyscallError),
-    #[error("device subsystem error: {0}")]
-    Device(#[from] DeviceError),
 }
 
 /// Корневой фасад ядра (Generic ConTroL): владелец менеджеров подсистем.
@@ -92,14 +89,13 @@ pub struct GCTL<MMAP: MMAPInterface> {
     /// Подсистема памяти: физический аллокатор + фасады адресных
     /// пространств (KMAP/KPTI + ASID/PCID) + привязки задача→фасад.
     memory_facade: MemoryManager<MMAP, ARCPool>,
-    /// Реестр устройств + эксклюзивные локи (claim) с hot-removal.
-    device_manager: DeviceManager,
     /// IPC L4: endpoint'ы, fast-path, exit-протокол (3 вида данных).
     ipc_manager: IpcManager,
     /// Разделяемая память io_uring: регионы + кольца + doorbell.
     shm_manager: ShmManager,
-    /// Привязки IRQ→endpoint (L4 irq_attach: прерывания драйверов).
-    irq_router: crate::hal::device::IrqRouter,
+    /// Привязки внешних линий (GSI)→endpoint (L4 irq_attach; v0.14:
+    /// право на линию — IoResource-cap, устройств в ядре нет).
+    irq_router: IrqRouter,
     /// Реестр хендлеров сисколов (см. `syscall::mod`); при сборке GCTL
     /// получает ДЕФОЛТНУЮ таблицу крейта (все встроенные хендлеры).
     syscalls: SyscallRegistry,
@@ -118,10 +114,9 @@ impl<MMAP: MMAPInterface> GCTL<MMAP> {
             capability_manager: CapabilityManager::new()?,
             task_manager: TcbManager::new()?,
             memory_facade: MemoryManager::new(p_allocator.clone())?,
-            device_manager: DeviceManager::new(),
             ipc_manager: IpcManager::new(),
             shm_manager: ShmManager::new(p_allocator),
-            irq_router: crate::hal::device::IrqRouter::new(),
+            irq_router: IrqRouter::new(),
             syscalls,
         })
     }
@@ -150,20 +145,10 @@ impl<MMAP: MMAPInterface> GCTL<MMAP> {
         &mut self.memory_facade
     }
 
-    /// Реестр устройств (перечисление шинами, доступ к записям).
-    /// Подключение шин и rescan — [`Self::device_manager_mut`]; экспорт
-    /// capability — `DeviceManager::export_capabilities(&tasks, &caps, ..)`
-    /// (менеджеры связаны параметрами, не полями).
-    #[inline]
-    pub fn device_manager(&self) -> &DeviceManager {
-        &self.device_manager
-    }
-
-    /// Реестр устройств, изменяемый доступ (register_bus / enumerate).
-    #[inline]
-    pub fn device_manager_mut(&mut self) -> &mut DeviceManager {
-        &mut self.device_manager
-    }
+    /// Реестр устройств — УДАЛЁН в v0.14: ядро не перечисляет
+    /// устройства (ACPI/AML/PCI — юзерспейс-менеджеры, acpid/драйверы);
+    /// сырые ресурсы (физика/порты/GSI) раздаются IoResource-capability
+    /// стартовым грантом kinit (см. `startup::kinit`).
 
     /// IPC-менеджер (L4: endpoint'ы, fast-path, exit-протокол).
     #[inline]
@@ -177,10 +162,10 @@ impl<MMAP: MMAPInterface> GCTL<MMAP> {
         &self.shm_manager
     }
 
-    /// IRQ-роутер (привязки линий прерываний к endpoint'ам драйверов;
-    /// событие — `irq_event` из верхнего полуобработчика прерываний).
+    /// IRQ-роутер (привязки внешних линий GSI к endpoint'ам; событие —
+    /// `irq_event` из верхнего полуобработчика прерываний).
     #[inline]
-    pub fn irq_router(&self) -> &crate::hal::device::IrqRouter {
+    pub fn irq_router(&self) -> &IrqRouter {
         &self.irq_router
     }
 
@@ -209,7 +194,6 @@ impl<MMAP: MMAPInterface> GCTL<MMAP> {
         syscall::SyscallFacade::new(&self.task_manager, &self.capability_manager, &self.syscalls)
             .with_ipc(&self.ipc_manager)
             .with_shm(&self.shm_manager)
-            .with_devices(&self.device_manager)
             .with_irq(&self.irq_router)
     }
 
@@ -236,29 +220,10 @@ impl<MMAP: MMAPInterface> GCTL<MMAP> {
             as &'static dyn crate::mem::MemRouter
     }
 
-    /// Перечислить устройства И уведомить держателей локов о пропаже
-    /// (оркестрация, которую платформа обязана выполнить после rescan:
-    /// hot-removal = ядерная ошибка разбуженным претендентам + IPC
-    /// DEVICE_LOST владельцам + снятие IRQ-привязок пропавших устройств).
-    ///
-    /// Возвращает отчёт перечисления; пути пропавших — в
-    /// `device_manager().removed_since_last_scan()` (уже обработаны).
-    pub fn rescan_devices(&mut self) -> Result<crate::hal::device::EnumerationReport, GctlError> {
-        let report = self.device_manager.enumerate()?;
-        let removed: alloc::vec::Vec<_> = self.device_manager.removed_since_last_scan().to_vec();
-        for path in removed {
-            // Привязки IRQ пропавшего устройства гаснут вместе с ним
-            // (события больше не доставляются — линии нет).
-            self.irq_router.detach_device(&path);
-            let _ = self.device_manager.claims().on_device_removed(
-                &self.task_manager,
-                &self.capability_manager,
-                &self.ipc_manager,
-                &path,
-            );
-        }
-        Ok(report)
-    }
+    // rescan_devices — УДАЛЁН в v0.14 вместе с реестром устройств:
+    // «горячее удаление» — политика юзерспейс-менеджера устройств (он
+    // отзывает capability и снимает привязки линий через IRQ_DETACH);
+    // ядро не знает об устройствах ничего.
 }
 
 #[cfg(test)]

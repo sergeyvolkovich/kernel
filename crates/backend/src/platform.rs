@@ -84,12 +84,6 @@ impl X86Platform {
 }
 
 impl startup::Platform for X86Platform {
-    fn legacy_bus(
-        &self,
-    ) -> Option<&'static dyn pkg_generic_interface::hal::device::traits::BusEnumerator> {
-        // v0.11: ISA q35 — COM1/PIT (линии — GSI через MADT-ISO).
-        Some(crate::ioapic::legacy_isa_bus())
-    }
     type Mmap = UserTables;
 
     fn console_write(&self, s: &str) {
@@ -205,6 +199,10 @@ impl startup::Platform for X86Platform {
             // внешних линий (IRQ_ATTACH возводит линии). После IOMMU —
             // IRTE-ремаппинг линий видит включённый IR.
             crate::ioapic::init();
+            // I/O-порты (v0.14): медитированный сервис IOP_IN/IOP_OUT
+            // (исполнение in/out в ядре за IoResource(IoPort)-cap;
+            // прямой доступ из юзерспейса не существует: IOPL=0).
+            pkg_generic_interface::syscall::io::install_io_port_service(&crate::ioport::X86_PORTS);
         }
         if let Some(glue) = startup::glue() {
             // v0.13: единица CPU-времени — циклов TSC на тик (квоты

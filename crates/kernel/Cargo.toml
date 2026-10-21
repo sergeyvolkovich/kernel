@@ -10,7 +10,10 @@ edition = "2024"
 host-hooks = []
 
 [dependencies]
-acpi = "6.1.1"
+# v0.14: крейт `acpi` (с AML-интерпретатором) УДАЛЁН из ядра —
+# перечисление ACPI/AML теперь в юзерспейсе (crates/acpid); ядро
+# парсит только статические таблицы для СЕБЯ (MADT/DMAR/IVRS —
+# backend/smp.rs, iommu-rs), без AML.
 attachable-slab-allocator = {git = "https://github.com/KiyanSisakhti/attachable-slab-allocator.git"}
 bitflags = "2.13.2"
 intrusive-collections = "0.10.3"

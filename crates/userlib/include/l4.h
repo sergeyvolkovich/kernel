@@ -167,34 +167,27 @@ int64_t l4_ipc_msg_clear(void);
  * обязан иметь ёмкость. */
 int64_t l4_notify_signal(uint64_t ep, uint64_t word);
 
-/* ─────────────── 0x40: устройства и IRQ ─────────────── */
+/* ───── 0x40: сырые ресурсы (IoResource) и IRQ (v0.14) ───── */
+/* «Устройств в ядре нет» (v0.14): доступ к физике/портам/линиям
+ * гейтован IoResource-capability; перечисление (ACPI/AML/PCI) и
+ * драйверы — юзерспейс (acpid). */
 
-/* DEVICE_CLAIM(0x41): эксклюзивный захват устройства (блокировка при
- * занятости; flags: bit0 = try). */
-int64_t l4_device_claim(uint64_t dev, uint64_t flags, uint64_t notify_ep);
+/* MMIO_MAP(0x41): отобразить физический диапазон (Mmio-cap); кадры
+ * внешние (снятие — l4_mem_free(base_vaddr)). Возврат: байто-точный
+ * виртуальный адрес. */
+int64_t l4_mmio_map(uint64_t mmio_cap, uint64_t off, uint64_t pages, uint64_t flags);
 
-/* DEVICE_RELEASE(0x42): отпустить лок (владелец). */
-int64_t l4_device_release(uint64_t dev);
+/* IOP_IN(0x42): чтение из I/O-порта (in исполняет ядро за IoPort-cap;
+ * width = 1|2|4). Возврат: значение. */
+int64_t l4_iop_in(uint64_t io_cap, uint64_t off, uint64_t width);
 
-/* DEVICE_CLAIM_STATUS(0x43): статус лока (0 = занятость, 1..2 =
- * owner(lo, hi), 3 = waiters, 4 = gone). */
-int64_t l4_device_claim_status(uint64_t dev, uint64_t index);
+/* IOP_OUT(0x43): запись в I/O-порт (width = 1|2|4). */
+int64_t l4_iop_out(uint64_t io_cap, uint64_t off, uint64_t width, uint64_t value);
 
-/* DEVICE_INFO(0x02): метаданные устройства по хендлу. */
-int64_t l4_device_info(uint64_t dev, uint64_t index);
-
-/* DEVICE_ENUM(0x44): обзор реестра живых устройств. Слово 0 = число;
- * далее по 4 слова: (kind, path_w0, path_w1, flags); kind: 1 = Pci
- * (path_w0 = bdf-биты), 2 = Acpi, 3 = StreamId, 4 = Dt; flags bit0 = msi. */
-int64_t l4_device_enum(uint64_t index);
-
-/* DEVICE_MAP_REGION(0x45): отобразить MMIO BAR в пространство
- * вызывающего (zero-copy). Возврат: виртуальный адрес. */
-int64_t l4_device_map_region(uint64_t dev, uint64_t region);
-
-/* IRQ_ATTACH(0x46): привязать IRQ устройства к notify-endpoint'у
- * (прерывание = signal-сообщение, word = gsi). */
-int64_t l4_irq_attach(uint64_t dev, uint64_t gsi, uint64_t gate);
+/* IRQ_ATTACH(0x46): привязать внешнюю линию (GSI) за Irq-cap к
+ * notify-endpoint'у (прерывание = signal, word = gsi). flags: bit0 =
+ * level, bit1 = active_low (подсказка; MADT-ISO каноничнее). */
+int64_t l4_irq_attach(uint64_t irq_cap, uint64_t gsi, uint64_t gate, uint64_t flags);
 
 /* IRQ_DETACH(0x47): снять привязку IRQ (владелец). */
 int64_t l4_irq_detach(uint64_t gsi);

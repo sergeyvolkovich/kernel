@@ -46,13 +46,14 @@ use spin::Once;
 use thiserror::Error;
 
 use crate::capability::{CapHandle, CapabilityManager, MintSpec};
+use crate::hal::irq::IrqRouter;
 use crate::hal::traits::asid::AsidPair;
 use crate::hal::traits::mmap::PhysADDR;
 use crate::task::{CpuId, TaskId, TcbManager};
 
 pub mod debug;
-pub mod device;
 pub mod handle_guard;
+pub mod io;
 pub mod iommu;
 pub mod ipc;
 pub mod mem;
@@ -67,7 +68,6 @@ pub use types::{
     SYSCALL_ARG_COUNT, SyscallArgs, SyscallCtx, SyscallError, SyscallNumber, SyscallRet,
 };
 
-use crate::hal::device::DeviceManager;
 use crate::ipc::{IpcManager, ShmManager};
 use crate::mem::MemRouter;
 use crate::task::ThreadId;
@@ -504,10 +504,9 @@ impl SyscallRegistry {
         use crate::syscall::debug::{
             DebugDumpTasksHandler, DebugDumpThreadsHandler, DebugTraceHandler, DebugWriteHandler,
         };
-        use crate::syscall::device::{
-            DeviceClaimHandler, DeviceClaimStatusHandler, DeviceEnumHandler, DeviceInfoHandler,
-            DeviceMapRegionHandler, DeviceReleaseHandler, IrqAckHandler, IrqAttachHandler,
-            IrqDetachHandler,
+        use crate::syscall::io::{
+            IopInHandler, IopOutHandler, IrqAckHandler, IrqAttachHandler, IrqDetachHandler,
+            MmioMapHandler,
         };
         use crate::syscall::iommu::{
             IommuAttachHandler, IommuDetachHandler, IommuEnumHandler, IommuIrqMapHandler,
@@ -540,7 +539,6 @@ impl SyscallRegistry {
         }
 
         // 0x00: системные.
-        slot!(nums::DEVICE_INFO, DeviceInfoHandler);
         slot!(nums::SELF_INFO, SelfInfoHandler);
         slot!(nums::SYS_TIME, SysTimeHandler);
 
@@ -582,12 +580,10 @@ impl SyscallRegistry {
         slot!(nums::IPC_MSG_CLEAR, IpcMsgClearHandler);
         slot!(nums::NOTIFY_SIGNAL, NotifySignalHandler);
 
-        // 0x40: устройства и IRQ.
-        slot!(nums::DEVICE_CLAIM, DeviceClaimHandler);
-        slot!(nums::DEVICE_RELEASE, DeviceReleaseHandler);
-        slot!(nums::DEVICE_CLAIM_STATUS, DeviceClaimStatusHandler);
-        slot!(nums::DEVICE_ENUM, DeviceEnumHandler);
-        slot!(nums::DEVICE_MAP_REGION, DeviceMapRegionHandler);
+        // 0x40: сырые ресурсы (IoResource) и IRQ.
+        slot!(nums::MMIO_MAP, MmioMapHandler);
+        slot!(nums::IOP_IN, IopInHandler);
+        slot!(nums::IOP_OUT, IopOutHandler);
         slot!(nums::IRQ_ATTACH, IrqAttachHandler);
         slot!(nums::IRQ_DETACH, IrqDetachHandler);
         slot!(nums::IRQ_ACK, IrqAckHandler);
@@ -658,11 +654,10 @@ pub struct SyscallFacade<'a> {
     // ==== Расширенные подсистемы (L4-слой; None — не подключены) ====
     ipc: Option<&'a IpcManager>,
     shm: Option<&'a ShmManager>,
-    devices: Option<&'a DeviceManager>,
     memory: Option<&'a dyn MemRouter>,
     space: Option<&'a dyn crate::mem::SpaceFactory>,
     copy: Option<&'a dyn crate::mem::UserCopy>,
-    irq: Option<&'a crate::hal::device::IrqRouter>,
+    irq: Option<&'a IrqRouter>,
 }
 
 impl<'a> SyscallFacade<'a> {
@@ -679,7 +674,6 @@ impl<'a> SyscallFacade<'a> {
             registry,
             ipc: None,
             shm: None,
-            devices: None,
             memory: None,
             space: None,
             copy: None,
@@ -696,12 +690,6 @@ impl<'a> SyscallFacade<'a> {
     /// Подключить SHM-подсистему (builder).
     pub fn with_shm(mut self, shm: &'a ShmManager) -> Self {
         self.shm = Some(shm);
-        self
-    }
-
-    /// Подключить реестр устройств (builder).
-    pub fn with_devices(mut self, devices: &'a DeviceManager) -> Self {
-        self.devices = Some(devices);
         self
     }
 
@@ -724,8 +712,8 @@ impl<'a> SyscallFacade<'a> {
         self
     }
 
-    /// Подключить IRQ-роутер (builder; привязки прерываний драйверов).
-    pub fn with_irq(mut self, irq: &'a crate::hal::device::IrqRouter) -> Self {
+    /// Подключить IRQ-роутер (builder; привязки внешних линий).
+    pub fn with_irq(mut self, irq: &'a IrqRouter) -> Self {
         self.irq = Some(irq);
         self
     }
@@ -757,7 +745,6 @@ impl<'a> SyscallFacade<'a> {
             caps: self.caps,
             ipc: self.ipc,
             shm: self.shm,
-            devices: self.devices,
             memory: self.memory,
             space: self.space,
             copy: self.copy,
@@ -783,7 +770,6 @@ impl<'a> SyscallFacade<'a> {
             caps: self.caps,
             ipc: self.ipc,
             shm: self.shm,
-            devices: self.devices,
             memory: self.memory,
             space: self.space,
             copy: self.copy,

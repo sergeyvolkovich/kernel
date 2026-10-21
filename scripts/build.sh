@@ -53,11 +53,23 @@ readelf -h "$ROGUE" | grep -q "DYN (Position-Independent" \
     || { echo "FATAL: rogue is not static-PIE (ET_DYN)"; exit 1; }
 echo "rogue PIE relocs: $(readelf -rW "$ROGUE" | grep -c R_X86_64_RELATIVE)"
 
-echo "== [4/6] init (static user ELF @ 0x40000000; вшитый образ rogue) =="
+echo "== [3b/6] acpid (ACPI-менеджер юзерспейса v0.14: static-PIE, AML вне ядра) =="
+# v0.14: AML-интерпретатор (крейт acpi) вынесен из ядра в юзерспейс —
+# acpid перечисляет устройства, подписывается на SCI (кнопка питания)
+# и выключает ПК (S5 в PM1a_CNT за IoResource-cap).
+RUSTFLAGS="-C relocation-model=pic" CARGO_TARGET_DIR="$OUT/pic" \
+    cargo build -p acpid --target x86_64-unknown-none $R
+ACPID=$WS/$OUT/pic/x86_64-unknown-none/release/acpid
+readelf -h "$ACPID" | grep -q "DYN (Position-Independent" \
+    || { echo "FATAL: acpid is not static-PIE (ET_DYN)"; exit 1; }
+echo "acpid PIE relocs: $(readelf -rW "$ACPID" | grep -c R_X86_64_RELATIVE)"
+
+echo "== [4/6] init (static user ELF @ 0x40000000; вшитые образы rogue+acpid) =="
 # ROGUE_ELF: build-скрипт init копирует бинарь rogue в OUT_DIR/child.bin,
 # init читает include_bytes! и спавнит домен через TASK_SPAWN_IMAGE
 # (дескриптор: сегменты/стек/argv/лимиты — всё готовит юзерспейс).
-ROGUE_ELF=$ROGUE cargo build -p init --target x86_64-unknown-none $R
+# ACPID_ELF (v0.14): то же для acpid (S6: ACPI/AML в юзерспейсе, S5-off).
+ROGUE_ELF=$ROGUE ACPID_ELF=$ACPID cargo build -p init --target x86_64-unknown-none $R
 
 echo "== [5/6] uefi_stub (kernel.efi: stub + встроенный образ ядра) =="
 cargo build -p uefi_stub --target x86_64-unknown-uefi $R

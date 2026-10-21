@@ -33,10 +33,8 @@ use crate::syscall::types::SyscallNumber;
 /// arg3 = приоритет.
 pub const TASK_SPAWN: SyscallNumber = SyscallNumber(0x01);
 
-/// Чтение метаданных устройства по capability (пример v0.2).
-/// ABI: arg1 = хендл DeviceReference, arg2 = индекс слова
-/// (сериализация `DeviceRecord::record_words`).
-pub const DEVICE_INFO: SyscallNumber = SyscallNumber(0x02);
+// 0x02 — свободен с v0.14 (был DEVICE_INFO; реестр устройств удалён
+// из ядра — перечисление и метаданные устройств теперь в юзерспейсе).
 
 /// Идентификация себя: задача после старта не знает своих ID.
 /// Слова по индексу: 0 = task_id.lo, 1 = task_id.hi, 2 = thread_id.lo,
@@ -206,18 +204,20 @@ pub const CAP_REVOKE: SyscallNumber = SyscallNumber(0x23);
 /// ABI: arg1 = хендл.
 pub const CAP_DELETE: SyscallNumber = SyscallNumber(0x24);
 
-/// Обход cspace вызывающего (менеджеры задач/устройств находят
-/// выданные ядром хендлы). Слова по индексу: 0 = число занятых
+/// Обход cspace вызывающего (юзерспейс-менеджеры находят выданные
+/// ядром хендлы). Слова по индексу: 0 = число занятых
 /// слотов; далее ПО ОДНОМУ слову на слот: (kind << 32) | handle_bits.
-/// kind: 1 = DeviceReference, 2 = TaskTCB, 3 = Gate, 4 = Irq.
+/// kind: 2 = TaskTCB, 3 = Gate, 4 = Irq, 5 = IommuAdmin,
+/// 6 = IoResource(Mmio), 7 = IoResource(IoPort), 8 = IoResource(Irq)
+/// (v0.14; 1 = DeviceReference — удалён вместе с реестром устройств).
 /// ABI: arg1 = индекс слова.
 pub const CAP_LIST: SyscallNumber = SyscallNumber(0x25);
 
 /// Снимок capability по хендлу. Слова по индексу: 0 = kind (как у
 /// CAP_LIST), 1 = perms, 2 = badge (64 бита), 3 = alive(1/0),
 /// 4..5 = идентификация: TaskTCB -> TaskId(lo, hi); Gate -> (obj_id, 0);
-/// Irq -> (gsi, obj_id); DeviceReference -> (компактное слово пути
-/// DEVICE_ENUM-кодировки, 0). ABI: arg1 = хендл, arg2 = индекс слова.
+/// Irq -> (gsi, obj_id); IoResource -> (base, len|count) (v0.14).
+/// ABI: arg1 = хендл, arg2 = индекс слова.
 pub const CAP_INFO: SyscallNumber = SyscallNumber(0x26);
 
 // ==== 0x30: IPC ====
@@ -269,46 +269,39 @@ pub const IPC_MSG_CLEAR: SyscallNumber = SyscallNumber(0x39);
 /// arg2 = слово.
 pub const NOTIFY_SIGNAL: SyscallNumber = SyscallNumber(0x3A);
 
-// ==== 0x40: устройства и IRQ ====
+// ==== 0x40: сырые аппаратные ресурсы (IoResource) и IRQ ====
+// v0.14: «устройств в ядре нет» — сисколы группы гейтованы
+// IoResource-capability (Mmio/IoPort/Irq диапазоны), а не реестром
+// устройств. Перечисление (ACPI/AML/PCI) — юзерспейс (acpid/драйверы).
 
-/// Эксклюзивный захват устройства (одна задача одновременно).
-/// Требует DeviceReference capability. ABI: arg1 = хендл устройства,
-/// arg2 = флаги (bit0 = try), arg3 = хендл notify-endpoint (0 — без
-/// уведомлений о потере). Возврат: 0; блокировка — при занятости.
-pub const DEVICE_CLAIM: SyscallNumber = SyscallNumber(0x41);
+/// Отобразить физический диапазон (Mmio-cap) в пространство вызывающего
+/// (кадры внешние, снятие — MEM_FREE). ABI: arg1 = хендл
+/// IoResource(Mmio), arg2 = байтовый офсет в диапазоне, arg3 = страницы,
+/// arg4 = биты MMAPMemoryFlags (0 = device-nocache).
+/// Возврат: виртуальный адрес, байто-точный к base+off.
+pub const MMIO_MAP: SyscallNumber = SyscallNumber(0x41);
 
-/// Отпустить лок (владелец). ABI: arg1 = хендл устройства.
-pub const DEVICE_RELEASE: SyscallNumber = SyscallNumber(0x42);
+/// Чтение из I/O-порта (исполнение в ядре через платформенный сервис).
+/// ABI: arg1 = хендл IoResource(IoPort), arg2 = офсет порта от базы,
+/// arg3 = ширина байт (1|2|4). Возврат: значение.
+pub const IOP_IN: SyscallNumber = SyscallNumber(0x42);
 
-/// Статус лока слова́ми (по индексу, как DEVICE_INFO):
-/// 0 = занятость (1 = owner есть), 1..2 = owner(lo, hi),
-/// 3 = waiters, 4 = gone. ABI: arg1 = хендл, arg2 = индекс.
-pub const DEVICE_CLAIM_STATUS: SyscallNumber = SyscallNumber(0x43);
+/// Запись в I/O-порт. ABI: arg1 = хендл IoResource(IoPort), arg2 = офсет,
+/// arg3 = ширина (1|2|4), arg4 = значение.
+pub const IOP_OUT: SyscallNumber = SyscallNumber(0x43);
 
-/// Обзор реестра живых устройств (devmon: связывает устройства с
-/// capability после rescan). Слова по индексу: 0 = число живых;
-/// далее по 4 слова на устройство: (kind, path_w0, path_w1, flags).
-/// kind: 1 = Pci, 2 = Acpi, 3 = StreamId, 4 = Dt.
-/// Pci: path_w0 = bdf-биты; StreamId: (iommu, id); Acpi/Dt:
-/// (длина пути, FNV-1a хэш) — полный путь только в DeviceReference
-/// (см. CAP_INFO). flags: bit0 = msi. ABI: arg1 = индекс слова.
-pub const DEVICE_ENUM: SyscallNumber = SyscallNumber(0x44);
+// 0x44/0x45 — свободны с v0.14 (были DEVICE_ENUM/DEVICE_MAP_REGION).
 
-/// Отобразить ресурс устройства (MMIO BAR) в пространство вызывающего
-/// (zero-copy, кадры не из пула). Требует DeviceReference + claim
-/// устройства вызывающим. ABI: arg1 = хендл устройства,
-/// arg2 = индекс ресурса (порядок `DeviceRecord::resources`).
-/// Возврат: виртуальный адрес.
-pub const DEVICE_MAP_REGION: SyscallNumber = SyscallNumber(0x45);
-
-/// Привязать IRQ устройства к notify-endpoint'у (L4 irq_attach):
+/// Привязать внешнюю линию (GSI) к notify-endpoint'у (L4 irq_attach):
 /// прерывание становится signal-сообщением в endpoint (word = gsi),
-/// драйвер ждёт обычным IPC_RECV. Требует DeviceReference; gsi обязан
-/// принадлежать ресурсам ЖИВОГО устройства. ABI: arg1 = хендл
-/// устройства, arg2 = gsi, arg3 = хендл Gate. Возврат: 0.
+/// драйвер ждёт обычным IPC_RECV. Право на линию подтверждает
+/// IoResource(Irq)-cap (диапазон GSI). ABI: arg1 = хендл Irq-cap,
+/// arg2 = gsi, arg3 = хендл Gate, arg4 = флаги (bit0 = level,
+/// bit1 = active_low — подсказка; MADT-ISO каноничнее).
+/// Возврат: 0.
 pub const IRQ_ATTACH: SyscallNumber = SyscallNumber(0x46);
 
-/// Снять привязку IRQ (владелец). ABI: arg1 = gsi. ABI: arg1 = gsi.
+/// Снять привязку IRQ (владелец). ABI: arg1 = gsi.
 pub const IRQ_DETACH: SyscallNumber = SyscallNumber(0x47);
 
 /// Подтвердить обработку прерывания (EOI-семантика L4): до ACK

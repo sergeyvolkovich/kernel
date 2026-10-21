@@ -223,10 +223,8 @@ impl SyscallFacade<'_> {
         if let Some(ipc) = ipc {
             ipc.deliver_exit(self.tasks, self.caps, task, payload)?;
         }
-        // 2. Локи устройств: домен умирает — ресурсы не переживают его.
-        if let Some(devices) = self.devices {
-            devices.claims().release_all_of(self.tasks, &task);
-        }
+        // 2. v0.14: локов устройств нет (реестр удалён); привязки IRQ
+        //    гасятся каскадом смерти через Glue (detach_all_of).
         // 3. Каскад: задача Dead, потоки погашены менеджером.
         self.tasks.set_state(&task, TaskState::Dead)?;
         Ok(0)
@@ -482,10 +480,7 @@ impl SyscallHandler for TaskExitHandler {
                 },
             )?;
         }
-        // 2. Локи устройств + привязки IRQ.
-        if let Some(devices) = ctx.devices {
-            devices.claims().release_all_of(ctx.tasks, &ctx.task);
-        }
+        // 2. Привязки внешних линий (v0.14: локов устройств больше нет).
         if let Some(irq) = ctx.irq {
             irq.detach_all_of(&ctx.task);
         }
@@ -921,10 +916,7 @@ impl SyscallHandler for TaskKillHandler {
                 },
             )?;
         }
-        // 2. Локи + IRQ цели.
-        if let Some(devices) = ctx.devices {
-            devices.claims().release_all_of(ctx.tasks, &task_id);
-        }
+        // 2. Привязки IRQ цели (v0.14: локов устройств больше нет).
         if let Some(irq) = ctx.irq {
             irq.detach_all_of(&task_id);
         }
@@ -962,10 +954,7 @@ impl SyscallHandler for TaskExitExceptionHandler {
                 ExitPayload::Exception { snapshot, fault },
             )?;
         }
-        // 2. Локи + IRQ.
-        if let Some(devices) = ctx.devices {
-            devices.claims().release_all_of(ctx.tasks, &ctx.task);
-        }
+        // 2. Привязки IRQ (v0.14: локов устройств больше нет).
         if let Some(irq) = ctx.irq {
             irq.detach_all_of(&ctx.task);
         }
@@ -1098,7 +1087,7 @@ impl SyscallHandler for CapListHandler {
 /// Снимок capability по хендлу (CAP_INFO). Слова по индексу: 0 = kind,
 /// 1 = perms, 2 = badge (64 бита), 3 = alive, 4..5 = идентификация
 /// (TaskTCB: TaskId lo/hi; Gate: obj_id; Irq: (gsi, obj_id);
-/// DeviceReference: (компактное слово пути, 0)).
+/// IoResource: (base, len|count) — v0.14).
 /// ABI: arg1 = хендл, arg2 = индекс.
 pub struct CapInfoHandler;
 
@@ -1118,11 +1107,9 @@ impl SyscallHandler for CapInfoHandler {
             ContainerACCCapability::Gate { gate_id } => [gate_id.0, 0],
             ContainerACCCapability::Irq { irq, obj_id } => [irq.0 as u64, obj_id.0],
             ContainerACCCapability::IommuAdmin => [0xFFFF_FFFF_FFFF_0001, 0],
-            ContainerACCCapability::DeviceReference { .. } => {
-                // Полный путь — только в реестре устройств; компактная
-                // кодировка пути — та же, что у DEVICE_ENUM.
-                [cap_path_word0(&view.cap_ref), 0]
-            }
+            // v0.14: идентификация сырого ресурса — [base, len|count]
+            // (разновидность — в слове 0: kind 6/7/8).
+            ContainerACCCapability::IoResource { kind } => kind.ident_words(),
         };
         let words = [
             cap_kind_word(&view.cap_ref),
@@ -1142,22 +1129,9 @@ impl SyscallHandler for CapInfoHandler {
 
 /// Слово-код типа capability (стабильная кодировка CAP_LIST/CAP_INFO).
 fn cap_kind_word(cap: &ContainerACCCapability) -> u64 {
-    match cap {
-        ContainerACCCapability::DeviceReference { .. } => 1,
-        ContainerACCCapability::TaskTCB { .. } => 2,
-        ContainerACCCapability::Gate { .. } => 3,
-        ContainerACCCapability::Irq { .. } => 4,
-        ContainerACCCapability::IommuAdmin => 5,
-    }
-}
-
-/// Компактное слово пути устройства (общая кодировка с DEVICE_ENUM).
-fn cap_path_word0(cap: &ContainerACCCapability) -> u64 {
-    if let ContainerACCCapability::DeviceReference { dev_path } = cap {
-        crate::syscall::device::path_word0(dev_path)
-    } else {
-        0
-    }
+    // Стабильная кодировка CAP_LIST/CAP_INFO (см. `ContainerACCCapability::
+    // kind_word`; 1 — DeviceReference — удалён в v0.14).
+    cap.kind_word()
 }
 
 /// Проверка права на поток: вызывающий владеет TaskTCB домена потока
@@ -2602,7 +2576,7 @@ mod tests {
     }
 
     /// Репродукция v0.11-сценария «два инстанса → два reap → выход init»:
-    /// kinit-гранты (TaskTCB(себя), IommuAdmin, 2× DeviceReference), на
+    /// kinit-гранты (TaskTCB(себя), IommuAdmin, 2× IoResource — v0.14), на
     /// каждый инстанс — EP_CREATE + TaskTCB(ребёнка) + CAP_MINT(port и
     /// TCB → ребёнку), гибель ребёнка по контракту reaper'а
     /// (revoke_all → destroy), затем выход init (revoke_all(4 корней +
@@ -2614,13 +2588,13 @@ mod tests {
     #[test]
     fn two_instance_spawn_reap_cycle_then_init_revoke_all() {
         use crate::capability::{ActionPermissions, CapabilityBadge, CapabilityGate, MintSpec};
-        use crate::hal::types::{AcpiPath, DevicePath};
 
         let tasks: &'static TcbManager = Box::leak(Box::new(TcbManager::new().unwrap()));
         let caps: &'static CapabilityManager =
             Box::leak(Box::new(CapabilityManager::new().unwrap()));
 
-        // init (права от kinit): TaskTCB(себя) + IommuAdmin + 2× DeviceReference.
+        // init (права от kinit): TaskTCB(себя) + IommuAdmin + 2× IoResource
+        // (v0.14: сырые ресурсы вместо DeviceReference — Mmio + IoPort).
         let init = uuid_next();
         tasks.create(init, TaskPriority::DEFAULT).unwrap();
         grant_tcb(caps, tasks, init, init);
@@ -2634,14 +2608,21 @@ mod tests {
             ),
         )
         .unwrap();
-        for path in ["\\_SB.COM1", "\\_SB.PIT0"] {
+        for kind in [
+            crate::capability::IoResourceKind::Mmio {
+                base: 0,
+                len: 1 << 32,
+            },
+            crate::capability::IoResourceKind::IoPort {
+                base: 0,
+                len: u16::MAX,
+            },
+        ] {
             caps.grant(
                 tasks,
                 init,
                 CapabilityGate::new(
-                    ContainerACCCapability::DeviceReference {
-                        dev_path: DevicePath::Acpi(AcpiPath::new(path)),
-                    },
+                    ContainerACCCapability::IoResource { kind },
                     ActionPermissions::all(),
                     CapabilityBadge::FULL,
                 ),
@@ -2692,13 +2673,13 @@ mod tests {
         }
 
         // Выход init: домен Dead (TASK_EXIT), затем revoke_all корней:
-        // 1×TaskTCB(self), IommuAdmin, 2×DeviceReference, 2×gate,
+        // 1×TaskTCB(self), IommuAdmin, 2×IoResource, 2×gate,
         // 2×TaskTCB(child) = 8.
         tasks.set_state(&init, TaskState::Dead).unwrap();
         let report = caps.revoke_all(tasks, init).unwrap();
         assert_eq!(
             report.revoked_slots, 8,
-            "корни init: tcb-self, iommu, 2 dev, 2 gates, 2 tcb-child"
+            "корни init: tcb-self, iommu, 2 io, 2 gates, 2 tcb-child"
         );
         tasks.destroy(init).unwrap();
     }

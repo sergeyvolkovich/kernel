@@ -1,0 +1,20 @@
+[package]
+name = "acpid"
+version.workspace = true
+edition.workspace = true
+description = "ACPI-менеджер в юзерспейсе (v0.14): AML-интерпретатор и перечисление устройств ВНЕ ядра — RSDP->XSDT->DSDT/SSDT, namespace walk (_HID/_CID/_UID/_ADR/_STA/_CRS), фиксированные события (кнопка питания через SCI) и выключение S5 (PM1a_CNT) — всё за IoResource-capability"
+
+[[bin]]
+name = "acpid"
+path = "src/main.rs"
+
+[dependencies]
+# userlib (rlib): _start + l4_* (стартовый протокол L4, консоль, сисколы).
+userlib = { path = "../userlib" }
+# acpi: форматы таблиц + AML-интерпретатор. В ЯДРЕ крейт удалён (v0.14) —
+# теперь самое тяжёлое и самое рискованное ACPI живёт в юзерспейсе:
+# паника AML убивает acpid, а не ядро.
+acpi = "6.1.1"
+# spin: кэш живых мапингов acpi::Handler (refcount — несколько PhysicalMapping
+# одной страницы: acpi-крейт мапит заголовок и полную таблицу одного адреса).
+spin = { workspace = true }

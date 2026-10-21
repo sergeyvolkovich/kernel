@@ -75,17 +75,6 @@ pub trait Platform: Sync {
     /// Тип адресного пространства пользователя бекенда.
     type Mmap: MMAPInterface + KMAPInterface + ASIDInterface + 'static;
 
-    /// Легаси-шина платформы (v0.11): фиксированные устройства, которые
-    /// не обходит PCI/ACPI-перечислитель (x86_64: ISA — COM1/PIT).
-    /// kinit регистриует её в реестре устройств и выдаёт init'у
-    /// DeviceReference на всё найденное — root-сервер устройств.
-    /// None — у платформы нет легаси-устройств.
-    fn legacy_bus(
-        &self,
-    ) -> Option<&'static dyn pkg_generic_interface::hal::device::traits::BusEnumerator> {
-        None
-    }
-
     /// Ранняя консоль (побайтово; до установки DebugSink).
     fn console_write(&self, s: &str);
 
@@ -738,56 +727,59 @@ pub fn kinit<P: Platform + 'static>(bi: &BootInfo, platform: &'static P) -> ! {
             );
         }
 
-        // 8.3 Легаси-шина платформы (v0.11): фиксированные устройства
-        // (x86_64: ISA COM1/PIT) — реестр + DeviceReference init'у на
-        // каждое живое: init — root-сервер устройств (claim/IRQ/
-        // IOMMU-гейты у него уже есть; порождённые песочницы грантов НЕ
-        // получают — права не протекают вниз по дереву задач).
-        if let Some(bus) = platform.legacy_bus() {
-            if let Err(e) = gctl.device_manager_mut().register_bus(bus) {
-                fatal(
-                    platform,
-                    &alloc::format!("kinit: FATAL legacy bus register: {e:?}\r\n"),
+        // 8.3 Стартовые гранты сырых ресурсов (v0.14, «устройств в ядре
+        // нет»): init — корневой ресурс-сервер (модель seL4 root task).
+        // Ядро НЕ перечисляет устройства: init получает ВСЁ адресное
+        // пространство ресурсов и раздаёт производные (CAP_MINT) своим
+        // службам — ACPI-менеджеру (acpid: AML теперь в юзерспейсе) и
+        // драйверам. Песочницы грантов НЕ получают — права не протекают
+        // вниз по дереву задач; отказ производной — revoke.
+        //
+        // Диапазоны (x86_64):
+        //   * Mmio  0..4 GiB   — physmap-покрытие: таблицы прошивки
+        //     (RSDP/XSDT/DSDT — acpid мапит их MMIO_MAP-ом), MMIO-баре;
+        //   * IoPort 0..64 KiB — всё пространство портов ISA/PCI (PM1a,
+        //     PCI config CF8/CFC — IOP_IN/OUT медитированы cap-ом);
+        //   * Irq 0..256       — внешние линии (IOAPIC GSI; SCI — acpid).
+        let grant_resource =
+            |name: &str, kind: pkg_generic_interface::capability::IoResourceKind| {
+                let gate = CapabilityGate::new(
+                    ContainerACCCapability::IoResource { kind },
+                    ActionPermissions::all(),
+                    CapabilityBadge::FULL,
                 );
-            }
-            match gctl.device_manager_mut().enumerate() {
-                Ok(report) => {
-                    let dm = gctl.device_manager();
-                    let mut granted = 0usize;
-                    for rec in dm.records().iter() {
-                        if !rec.functional || dm.get_alive(&rec.path).is_none() {
-                            continue;
-                        }
-                        let _ = dm.export_capability(
-                            gctl.task_manager(),
-                            gctl.capability_manager(),
-                            init_task,
-                            &rec.path,
-                            ActionPermissions::all(),
-                            CapabilityBadge::FULL,
-                        );
-                        granted += 1;
-                    }
-                    log(
+                match gctl
+                    .capability_manager()
+                    .grant(gctl.task_manager(), init_task, gate)
+                {
+                    Ok(_) => log(platform, &alloc::format!("kinit: grant {name} to init\r\n")),
+                    Err(e) => fatal(
                         platform,
-                        &alloc::format!(
-                            "kinit: legacy bus \"{}\": {} discovered, {} granted to init\r\n",
-                            bus.bus_name(),
-                            report.discovered,
-                            granted
-                        ),
-                    );
+                        &alloc::format!("kinit: FATAL {name} grant: {e:?}\r\n"),
+                    ),
                 }
-                Err(e) => {
-                    // Шина опциональна: отказ перечисления — НЕ фатален
-                    // (устройств не будет, демо честно пропустится).
-                    log(
-                        platform,
-                        &alloc::format!("kinit: legacy bus enumerate failed: {e:?}\r\n"),
-                    );
-                }
-            }
-        }
+            };
+        grant_resource(
+            "IoResource(Mmio 0..4 GiB)",
+            pkg_generic_interface::capability::IoResourceKind::Mmio {
+                base: 0,
+                len: 1 << 32,
+            },
+        );
+        grant_resource(
+            "IoResource(IoPort 0..64 KiB)",
+            pkg_generic_interface::capability::IoResourceKind::IoPort {
+                base: 0,
+                len: u16::MAX,
+            },
+        );
+        grant_resource(
+            "IoResource(Irq 0..256)",
+            pkg_generic_interface::capability::IoResourceKind::Irq {
+                base: 0,
+                count: 256,
+            },
+        );
     }
 
     let facade = match gctl.memory_manager_mut().create_ufacade(
@@ -823,11 +815,20 @@ pub fn kinit<P: Platform + 'static>(bi: &BootInfo, platform: &'static P) -> ! {
     };
     let blob = platform.phys_slice(module.base, module.len as usize);
     // boot_state — транзитом в argv (протокол старта: ядро НЕ интерпретирует).
-    let state: Vec<(String, String)> = bi
+    // v0.14: ядро добавляет ОДИН факт о прошивке — физический адрес RSDP
+    // (его ядро и так знает из BootInfo; acpid-менеджеру нужна только
+    // «ссылка» на таблицы — интерпретация ACPI в юзерспейсе).
+    let mut state: Vec<(String, String)> = bi
         .state_vars()
         .iter()
         .map(|v| (String::from(v.name_str()), String::from(v.value_str())))
         .collect();
+    if bi.firmware.rsdp != 0 {
+        state.push((
+            String::from("rsdp"),
+            alloc::format!("{:#x}", bi.firmware.rsdp),
+        ));
+    }
     let loaded = match elfload::load(
         platform,
         gctl,

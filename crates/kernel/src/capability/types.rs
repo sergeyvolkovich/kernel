@@ -4,9 +4,10 @@
 //   * TaskObj  (таблица в TcbManager)          — цель `TaskTCB`;
 //   * GateObj  (таблица в CapabilityManager)   — цель `Gate` (IPC-гейт);
 //   * IrqObj   (таблица в CapabilityManager)   — цель `Irq` (линия прерываний);
-//   * устройства — БЕЗ объекта: `DeviceReference` адресует DeviceManager
-//     по `DevicePath` (вне крейта), цель «бессмертна» (TargetRef::immortal),
-//     отзыв выполняется через revoke самой capability.
+//   * сырые ресурсы — БЕЗ объекта: `IoResource` (v0.14) адресует ДИАПАЗОН
+//     (физика / порты / GSI) без знания об устройствах — ядро не знает
+//     НИ ОДНОГО устройства (перечисление и драйверы — юзерспейс), цель
+//     «бессмертна» (TargetRef::immortal), отзыв — revoke самой capability.
 //
 // Уровень 2 — локальная таблица хендлов задачи (`HandleTable` из CTE).
 // Пользовательский хендл — не Uuid, а `CapHandle = u64 (idx, generation)`, как fd
@@ -24,7 +25,6 @@
 use thiserror::Error;
 
 use crate::capability::paged::{PagedError, TargetRef};
-use crate::hal::types::DevicePath;
 
 use crate::task::TaskId;
 
@@ -177,25 +177,67 @@ impl core::fmt::Display for IrqId {
 
 // ==== Объекты capability ====
 
+/// Сырой аппаратный ресурс за capability (v0.14: «устройств в ядре нет»).
+///
+/// Право — ДИАПАЗОН адресов/портов/линий, а не идентификатор устройства:
+/// кто такой «COM1» или «LPC-мост» — знает только юзерспейс. Корневой
+/// сервер (init) получает гранты на всё адресное пространство ресурсов
+/// от kinit и распределяет их ПОСЛЕ собственного перечисления (ACPI
+/// manager / драйверы — уже юзерспейс-код, включая AML). Ядро проверяет
+/// только принадлежность адреса диапазону capability (гейты сисколов
+/// MMIO_MAP / IOP_IN / IOP_OUT / IRQ_ATTACH).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IoResourceKind {
+    /// Физический диапазон: MMIO-баре устройств, таблицы прошивки
+    /// (ACPI),APIC-регионов и т.д. `base..base+len` по физике.
+    Mmio { base: u64, len: u64 },
+    /// Диапазон I/O-портов (x86: 0..=65535), `base..base+len`.
+    IoPort { base: u16, len: u16 },
+    /// Диапазон внешних линий прерываний (GSI): `base..base+count`.
+    Irq { base: u32, count: u32 },
+}
+
+impl IoResourceKind {
+    /// Слово-вид разновидности для CAP_INFO (аудит/диагностика):
+    /// 1 = Mmio, 2 = IoPort, 3 = Irq.
+    pub fn flavor_word(&self) -> u64 {
+        match self {
+            IoResourceKind::Mmio { .. } => 1,
+            IoResourceKind::IoPort { .. } => 2,
+            IoResourceKind::Irq { .. } => 3,
+        }
+    }
+
+    /// Слова-идентификаторы для CAP_INFO: [base, len|count].
+    pub fn ident_words(&self) -> [u64; 2] {
+        match self {
+            IoResourceKind::Mmio { base, len } => [*base, *len],
+            IoResourceKind::IoPort { base, len } => [*base as u64, *len as u64],
+            IoResourceKind::Irq { base, count } => [*base as u64, *count as u64],
+        }
+    }
+}
+
 /// Объект, на который ссылается capability. Сохранён из прежней версии
 /// (внешний формат расширяется новыми вариантами), поля открыты для
 /// сопоставления с образцом.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ContainerACCCapability {
-    /// Ссылка на устройство: ключ — типизированный `DevicePath`, тот же,
-    /// что в реестре `DeviceManager`. Цель «бессмертна» на этом слое:
-    /// живость устройства контролирует DeviceManager вне крейта, отзыв —
-    /// через revoke capability.
-    DeviceReference { dev_path: DevicePath },
     /// Ссылка на TCB задачи: цель — generation-защищённый объект задачи.
     TaskTCB { task_id: TaskId },
     /// IPC-гейт (объект ядра): очередь, ожидающий поток и т.д.
     Gate { gate_id: ObjId },
     /// Линия прерываний: стабильное имя `irq` + ссылка на объект ядра.
     Irq { irq: IrqId, obj_id: ObjId },
+    /// Сырой аппаратный ресурс (v0.14): диапазон физики / портов / GSI.
+    /// Цель «бессмертна» (право на диапазон, не на объект ядра); выдаёт
+    /// kinit корневому серверу (init), производные — CAP_MINT в
+    /// юзерспейс-менеджеры и драйверы. Ядро НЕ знает, какому «устройству»
+    /// соответствует диапазон — это политика юзерспейса.
+    IoResource { kind: IoResourceKind },
     /// Мастер-право подсистемы IOMMU/DMA-ремаппинга (v0.9): гейт всей
     /// группы сисколов 0x80. Цель «бессмертна» (глобальный сервис —
-    /// как DeviceReference): право выдаёт ядро доверенным задачам
+    /// как IoResource): право выдаёт ядро доверенным задачам
     /// (init — менеджер устройств), отзыв — revoke производной.
     /// Ядро НЕ гарантирует уникальность держателя: политика выдачи —
     /// у стартового кода платформы.
@@ -204,15 +246,24 @@ pub enum ContainerACCCapability {
 
 impl ContainerACCCapability {
     /// Слово-вид для аудита дерева деривации (no_std без fmt::Debug в
-    /// консоли): 1=DeviceReference, 2=TaskTCB, 3=Gate, 4=Irq,
-    /// 5=IommuAdmin (v0.11).
+    /// консоли): 2=TaskTCB, 3=Gate, 4=Irq, 5=IommuAdmin,
+    /// 6=IoResource(Mmio), 7=IoResource(IoPort), 8=IoResource(Irq)
+    /// (v0.14; 1 — DeviceReference — удалён вместе с реестром устройств).
     pub fn kind_word(&self) -> u64 {
         match self {
-            ContainerACCCapability::DeviceReference { .. } => 1,
             ContainerACCCapability::TaskTCB { .. } => 2,
             ContainerACCCapability::Gate { .. } => 3,
             ContainerACCCapability::Irq { .. } => 4,
             ContainerACCCapability::IommuAdmin => 5,
+            ContainerACCCapability::IoResource {
+                kind: IoResourceKind::Mmio { .. },
+            } => 6,
+            ContainerACCCapability::IoResource {
+                kind: IoResourceKind::IoPort { .. },
+            } => 7,
+            ContainerACCCapability::IoResource {
+                kind: IoResourceKind::Irq { .. },
+            } => 8,
         }
     }
 }

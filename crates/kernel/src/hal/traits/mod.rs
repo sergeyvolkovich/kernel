@@ -21,6 +21,7 @@ pub mod asid;
 pub mod cpu;
 pub mod dma;
 pub mod iommu;
+pub mod ioport;
 pub mod irq;
 pub mod kmap;
 pub mod mmap;

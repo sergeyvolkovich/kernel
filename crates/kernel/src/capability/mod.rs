@@ -59,8 +59,8 @@ use crate::task::{TaskId, TcbManager};
 
 pub use types::{
     ActionPermissions, CapHandle, CapResolved, CapabilityBadge, CapabilityError, CapabilityGate,
-    CapabilityView, ContainerACCCapability, EndpointState, IrqId, MintSpec, ObjId, ParentRef,
-    RevokeReport,
+    CapabilityView, ContainerACCCapability, EndpointState, IoResourceKind, IrqId, MintSpec, ObjId,
+    ParentRef, RevokeReport,
 };
 
 /// Слотов на страницу хендл-таблицы. Страница = 4 + 8 * sizeof(Cte) ≈ 1.2 КБ:
@@ -299,18 +299,16 @@ impl CapabilityManager {
         gate: CapabilityGate,
     ) -> Result<CapHandle, CapabilityError> {
         let target = match gate.cap_ref() {
-            ContainerACCCapability::DeviceReference { .. } => {
-                // Устройство адресуется по пути; живость контролирует
-                // DeviceManager вне крейта. Цель «бессмертна», отзыв —
-                // через revoke capability.
-                TargetRef::immortal()
-            }
             ContainerACCCapability::TaskTCB { task_id } => tasks
                 .target_ref(task_id)
                 .ok_or(CapabilityError::UnknownTaskTarget(*task_id))?,
             // Мастер-право IOMMU (v0.9): глобальный сервис ядра — цель
             // «бессмертна», как у устройств; право живёт, пока не отозвано.
             ContainerACCCapability::IommuAdmin => TargetRef::immortal(),
+            // Сырой ресурс (v0.14): право на ДИАПАЗОН — цель «бессмертна»
+            // (реестра устройств в ядре больше нет, живость диапазона —
+            // не понятие ядра); отзыв — через revoke самой capability.
+            ContainerACCCapability::IoResource { .. } => TargetRef::immortal(),
             ContainerACCCapability::Gate { .. } | ContainerACCCapability::Irq { .. } => {
                 return Err(CapabilityError::Internal);
             }
@@ -960,13 +958,11 @@ impl CapabilityManager {
     fn check_alive(cte: &Cte, handle: CapHandle) -> Result<Option<TargetRef>, CapabilityError> {
         let dead = || CapabilityError::InvalidHandle(handle);
         match &cte.cap_ref {
-            ContainerACCCapability::DeviceReference { .. } => {
-                // Цель «бессмертна» на этом слое (см. grant).
-                Ok(None)
-            }
             // Мастер-право IOMMU (v0.9): цель «бессмертна» — отзыв только
             // revoke самой capability (как у устройств).
             ContainerACCCapability::IommuAdmin => Ok(None),
+            // Сырой ресурс (v0.14): право на диапазон — «бессмертно».
+            ContainerACCCapability::IoResource { .. } => Ok(None),
             ContainerACCCapability::TaskTCB { .. } => {
                 // Одна проверка: generation задачи и есть живость цели.
                 if !cte.target.alive() {

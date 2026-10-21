@@ -13,7 +13,7 @@ use core::fmt;
 use thiserror::Error;
 
 use crate::capability::{CapHandle, CapabilityError, CapabilityManager, CapabilityView};
-use crate::hal::device::{DeviceManager, IrqRouter};
+use crate::hal::irq::IrqRouter;
 use crate::hal::traits::mmap::MemErrorCode;
 use crate::ipc::{IpcManager, ShmManager};
 use crate::mem::{MemRouter, SpaceFactory, UserCopy};
@@ -313,9 +313,8 @@ pub struct SyscallCtx<'a> {
     pub ipc: Option<&'a IpcManager>,
     /// SHM/кольца io_uring.
     pub shm: Option<&'a ShmManager>,
-    /// Реестр устройств (claim/статусы/живость).
-    pub devices: Option<&'a DeviceManager>,
-    /// Роутер памяти (аллокация регионов, flexpage-переносы).
+    /// Роутер памяти (аллокация регионов, flexpage-переносы; v0.14:
+    /// MMIO_MAP мапит сырую физику за IoResource-cap через map_external).
     pub memory: Option<&'a dyn MemRouter>,
     /// Фабрика адресных пространств (v0.9: TASK_CREATE рождает домен
     /// СО пространством; смерть домена — destroy_space).
@@ -344,7 +343,6 @@ impl<'a> SyscallCtx<'a> {
             caps,
             ipc: None,
             shm: None,
-            devices: None,
             memory: None,
             space: None,
             copy: None,
@@ -379,12 +377,6 @@ impl<'a> SyscallCtx<'a> {
     /// Подключить SHM-подсистему.
     pub fn with_shm(mut self, shm: &'a ShmManager) -> Self {
         self.shm = Some(shm);
-        self
-    }
-
-    /// Подключить реестр устройств.
-    pub fn with_devices(mut self, devices: &'a DeviceManager) -> Self {
-        self.devices = Some(devices);
         self
     }
 

@@ -17,6 +17,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "acpid"
+version = "0.5.0"
+dependencies = [
+ "acpi",
+ "spin",
+ "userlib",
+]
+
+[[package]]
 name = "aligned_box"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -241,7 +250,6 @@ version = "0.5.0"
 name = "pkg_generic_interface"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "aligned_box",
  "attachable-slab-allocator",
  "bitflags",

@@ -7,6 +7,13 @@
 Lock (fine-grained + lock-free) и полный стек IOMMU (Intel VT-d и
 AMD-Vi: DMA- и IRQ-ремаппинг, мульти-IOMMU, 2 МиБ-страницы).
 
+v0.14: в ядре НЕТ устройств — как в seL4. Перечисление ACPI (AML-
+интерпретатор), PCI и драйверы — юзерспейс; ядро лишь медитирует
+сырые ресурсы (физика/порты/линии) за IoResource-capability.
+Юзерспейс-менеджер acpid читает DSDT/SSDT, перечисляет устройства,
+подписывается на кнопку питания (SCI как L4-сигнал) и ВЫКЛЮЧАЕТ ПК
+записью S5 в PM1a_CNT за capability.
+
 Загрузка — UEFI (OVMF): самодостаточная заглушка `BOOTX64.EFI` со
 встроенным образом ядра, конфигурация серверов в `boot_cfg.xml`.
 Пользовательский мир — freestanding-серверы без libc: единственный API —
@@ -48,7 +55,7 @@ OVMF -> BOOTX64.EFI (uefi_stub + встроенный kernel.bin)
 | **Планировщик** | SMP, RR-кванты, ленивый deschedule, resched-IPI, троттлинг доменов по CPU-квоте, вытеснение LAPIC TSC-deadline (суб-тик, фолбэк — периодический тик) |
 | **Песочница GTCB** | rlimit-пределы в TCB: страницы/потоки/endpoint'ы/SHM/capability/приоритет/may_spawn/CPU-квота; семантика трещотки (только ужесточение); аудит `[kernel: sandbox]` |
 | **Спавн доменов** | `TASK_SPAWN_IMAGE`: образ готовит юзерспейс-родитель (ядро — только указатели); PIE-образы (R_X86_64_RELATIVE, крейт `pie`), ET_EXEC-легаси как StaticFixed |
-| **Устройства и IRQ** | Реестр устройств (PCI/ACPI + легаси-шина), эксклюзивные claim с hot-removal, IOAPIC: внешние линии — L4-signal без переключения контекста |
+| **Сырые ресурсы + IRQ** | Устройств в ядре НЕТ (v0.14): перечисление ACPI/AML/PCI и драйверы — юзерспейс (acpid); ядро медитирует диапазоны за IoResource-cap: `MMIO_MAP` (физика), `IOP_IN/OUT` (порты, исполнение в ядре, IOPL=0), `IRQ_ATTACH` по Irq-cap (IOAPIC: линия — L4-signal без переключения контекста) |
 | **IOMMU** | Intel VT-d (DMAR/DRHD, QI-инвалидации) и AMD-Vi (IVRS/IVHD, командный буфер): DMA-ремаппинг, IRQ-ремаппинг (IRTE/IntTab), мульти-IOMMU, 2 МиБ-листья |
 | **Загрузка** | UEFI-заглушка с динамическим размещением ядра, boot_cfg.xml, argv-протокол, SIPI-bring-up AP |
 | **Юзерспейс** | `userlib` (C-ABI `_start` + `l4_*` для C и Rust), эталонные серверы: `init` (Rust) и `capp` (C) |
@@ -102,15 +109,19 @@ crates/
   boot_info/    ABI страница BootInfo (заглушка -> ядро): память, модули, RSDP
   bootcfg/      mini-XML парсер boot_cfg.xml (+ host-тесты)
   kernel/       ядро-крейт pkg_generic_interface: GCTL, менеджеры, HAL,
-                сисколы, sync-примитивы; 151 host-тест
+                сисколы, sync-примитивы; 131 host-тест
   arch/         механика x86_64: per-CPU (GS), COM1 16550, константы ABI
   backend/      платформенный крейт: гейт, планировщик, SMP, LAPIC/IOAPIC,
                 память, VT-d (vtd.rs), AMD-Vi (amd.rs), IOMMU-агрегатор
   startup/      kinit: политика запуска (Platform/KernelGlue), elfload, пулы
   uefi_stub/    BOOTX64.EFI: boot_cfg, модули, ExitBootServices, прыжок в ядро
   init/         первый сервер (Rust, сырые сисколы): топология, IOMMU smoke,
-                SMP-стресс, песочница (спавн rogue + вердикт)
+                SMP-стресс, песочница (спавн rogue + вердикт), спавн acpid
+                (IoResource-гранты + argv-транзит rsdp=)
   rogue/        дочерний образ песочницы (static-PIE, ET_DYN + RELA)
+  acpid/        ACPI-менеджер ЮЗЕРСПЕЙСА (v0.14, static-PIE): AML-
+                интерпретатор (крейт acpi) вне ядра, namespace-walk,
+                кнопка питания (SCI) и выключение ПК (S5, PM1a_CNT)
   pie/          юзерспейс-парсер PIE-образов: PT_LOAD W^X, R_X86_64_RELATIVE
   userlib/      C-ABI: _start + l4_* (статическая бибилиотека, заголовок l4.h)
 scripts/        build.sh (полная цепочка), run_qemu.sh (OVMF+q35),
@@ -212,14 +223,24 @@ KVM/железе ограничения нет. **`EXIT=124` — норма**: �
    разрушение SHM родителя, проталкивание капов) — каждая блокирована,
    аудит `[kernel: sandbox]`; exit 0x5A, вердикты `sandbox HELD` +
    `cpu quota HELD`.
-6. **Выход**: init TASK_EXIT(0), ядро: `all user threads gone — halting
-   (boot chain OK)`.
+6. **S5. Внешняя линия**: IoResource(Irq)-cap → IRQ_ATTACH(GSI 4):
+   реальное прерывание COM1 прибывает L4-сигналом (`signal word = 4`),
+   ACK/DETACH — вердикт полного контура IOAPIC→LAPIC→endpoint.
+7. **S6. acpid — ACPI в юзерспейсе, выключение ПК**: init спавнит acpid
+   (argv `rsdp=0x…` + три IoResource-гранта через CAP_MINT);
+   таблицы через MMIO_MAP (refcount-кэш), DSDT/SSDT в namespace,
+   перечисление устройств (_HID/_STA/_CRS) ЦЕЛИКОМ в юзерспейсе
+   (11 устройств: LNKA..D, FWCF, GPE0, PHPR, PRES, MOU_), FADT:
+   PM1a_EVT/CNT, SCI; `\_S5_` → SLP_TYP; кнопка питания подписана
+   (IRQ_ATTACH(SCI=9) + PWRBTN_EN); запись S5|SLP_EN в PM1a_CNT за
+   IoPort-cap — **VM выключается из юзерспейса: QEMU завершается с
+   кодом 0** (без таймаута).
 
 ## Тесты
 
 ```bash
 cargo test                       # host-портящиеся крейты (default-members):
-                                 # kernel (151), bootcfg, boot_info, pie
+                                 # kernel (131), bootcfg, boot_info, pie
 ```
 
 Ядро-крейт гоняет тесты на std (host-хуки аллокатора); непортящиеся
@@ -251,6 +272,7 @@ cargo test                       # host-портящиеся крейты (defau
 | v0.11 | PIE-спавн (крейт pie, rogue static-PIE) + IOAPIC-драйвер (линии как L4-сигналы) |
 | v0.12 | Демонтаж Big Kernel Lock: fine-grained локи, lock-free планировщик, IF-дисциплина |
 | v0.13 | Точность квот (заряд циклами TSC, TSC-deadline), per-CPU кэш контекстов, демонтаж легаси task-level enqueue |
+| v0.14 | Устройств в ядре НЕТ: AML/перечисление → юзерспейс (acpid), IoResource-capability (MMIO/порты/GSI), выключение ПК из юзерспейса (S5) |
 
 ## Известные ограничения
 
@@ -271,6 +293,11 @@ cargo test                       # host-портящиеся крейты (defau
 - **Квант пробуждённых**: пробуждённый IPC-поток домена за пределом
   квоты отрабатывает до одного вытеснения (документированное окно
   перерасхода; спиннеры паркуются немедленно).
-- Устройства: PCI/ACPI-перечисление — рабочая поверхность (DEVICE_ENUM),
-  драйверы устройств — юзерспейс; прохладное отношение к ISA-легаси
-  (COM1/PIT) оформлено легаси-шиной платформы.
+- **Устройства (v0.14)**: в ядре НЕТ перечисления — только сырые
+  ресурсы за IoResource-cap. acpid перечисляет ACPI/AML; PCI-драйверы
+  (pcid через IOP CF8/CFC) — roadmap; поддиапазоны IoResource при
+  CAP_MINT не сужаются (копия целого диапазона); песочницы IoResource
+  не получают вовсе.
+- **Кнопка питания**: SCI подписан (IRQ_ATTACH + PWRBTN_EN), но демо
+  не «нажимает» её — после окна ожидания acpid выключает ПК сам (S5);
+  интерактивное выключение через QEMU monitor — roadmap.

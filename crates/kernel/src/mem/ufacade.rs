@@ -71,10 +71,16 @@ pub struct RecordData {
 intrusive_adapter!(RDPAdapter = UnsafeRef<RecordData> : RecordData {p_link => RBTreeLink});
 
 impl<'a> KeyAdapter<'a> for RDPAdapter {
-    type Key = PhysADDR;
+    /// v0.14: ключ — ПАРА (физическая база, виртуальная база). Одна и та
+    /// же физика МОЖЕТ быть отображена несколько раз (acpid/acpi-крейт
+    /// мапит заголовок таблицы и затем полную таблицу по одному адресу;
+    /// AML-менеджер держит перекрывающиеся снапшоты). Уникальность
+    /// гарантируется уникальным vaddr (аллокатор фасадного окна), а не
+    /// физикой — как в seL4 (frame может стоять в нескольких мапингах).
+    type Key = (usize, usize);
 
     fn get_key(&self, value: &'a RecordData) -> Self::Key {
-        value.p_addr.p
+        (value.p_addr.p.0, value.v_addr.0)
     }
 }
 
@@ -273,9 +279,12 @@ impl<MmapWraper: MMAPInterface, AP: ArcPool<Data = LLFree<'static>>> UFacade<Mma
     /// O(log n) по индексу физической базы (редкий путь: аудит/диагностика).
     #[allow(dead_code)]
     fn snapshot_by_paddr(&self, p_addr: PhysADDR) -> Option<RecordSnapshot> {
+        // v0.14: ключ дерева — пара (p, vaddr) (физика может стоять в
+        // нескольких мапингах) — частичный поиск по физике линейный;
+        // путь только аудит/диагностика, не горячий.
         self.records_by_paddr
-            .find(&p_addr)
-            .get()
+            .iter()
+            .find(|r| r.p_addr.p == p_addr)
             .map(|record| RecordSnapshot {
                 p_addr: record.p_addr.p,
                 p_pages_count: record.p_addr.pages_count,
@@ -299,7 +308,7 @@ impl<MmapWraper: MMAPInterface, AP: ArcPool<Data = LLFree<'static>>> UFacade<Mma
     ) -> Result<UnsafeRef<RecordData>, MemErrorCode> {
         let paddr = self
             .records_by_paddr
-            .find_mut(&snapshot.p_addr)
+            .find_mut(&(snapshot.p_addr.0, snapshot.v_addr.0))
             .remove()
             .ok_or(MemErrorCode::InvalADDR)?;
         let vaddr = self
@@ -344,11 +353,11 @@ impl<MmapWraper: MMAPInterface, AP: ArcPool<Data = LLFree<'static>>> UFacade<Mma
 
     /// Store a record in both RBTree indices using the facade-owned slab cache.
     fn store_record(&mut self, state: RecordData) -> Result<(), MemErrorCode> {
-        // `RBTree::insert` does not check for duplicate keys, so do it up front
-        // — в ОБОИХ индексах (инвариант: одна запись — одно членство в каждом).
-        if self.records_by_paddr.find(&state.p_addr.p).get().is_some() {
-            return Err(MemErrorCode::InternalError);
-        }
+        // `RBTree::insert` does not check for duplicate keys, so do it up front.
+        // v0.14: проверки дубликата по ФИЗИКЕ больше НЕТ: одна и та же
+        // физика может быть отображена многократно (acpid/acpi-крейт:
+        // заголовок таблицы + полная таблица по одному адресу; ключ
+        // paddr-индекса — пара (p, vaddr), уникальность даёт vaddr).
         if self.records_by_vaddr.find(&state.v_addr).get().is_some() {
             return Err(MemErrorCode::InternalError);
         }
@@ -2328,6 +2337,80 @@ pub(crate) mod tests {
         assert!(matches!(err, MemErrorCode::InternalError));
         assert!(facade.asid_pair().is_some(), "пара осталась за фасадом");
         assert_eq!(pool.freed(), 0, "free не вызван после отказа инвалидации");
+    }
+
+    /// v0.14: большие MEM_ALLOC (куча acpid) — запрос order 11 (2048 стр)
+    /// через дефолтный класс фасада обязан проходить (класс запроса
+    /// выбирается по ордеру, как в eval-хелперах llfree).
+    #[test]
+    fn alloc_large_order_class_selection() {
+        let p_alloc = make_p_allocator();
+        let mut facade = UFacade::new(
+            p_alloc.clone(),
+            MockMmap::new(),
+            16384,
+            1,
+            VirtualADDR(BASE),
+        )
+        .unwrap();
+        let v = facade.alloc_region(2048, MMAPMemoryFlags::RW);
+        assert!(v.is_ok(), "MEM_ALLOC(2048) отклонён: {v:?}");
+        let v = v.unwrap();
+        facade.shrink_memory_wiev(v).unwrap();
+
+        // И обычные мелкие аллокации после большой — тоже работают.
+        let small = facade.alloc_region(1, MMAPMemoryFlags::RW).unwrap();
+        facade.shrink_memory_wiev(small).unwrap();
+    }
+
+    /// v0.14 (MMIO_MAP): цикл external map -> free -> map — путь acpid
+    /// (acpi::Handler мапит таблицы поверх MMIO_MAP и снимает их при
+    /// дропе PhysicalMapping; тысячи итераций за один перечисление).
+    #[test]
+    fn external_map_free_map_cycle() {
+        let p_alloc = make_p_allocator();
+        let mut facade = UFacade::new(
+            p_alloc.clone(),
+            MockMmap::new(),
+            FRAMES,
+            1,
+            VirtualADDR(BASE),
+        )
+        .unwrap();
+
+        // Паттерн acpi-крейта (from_rsdt): заголовок таблицы И затем
+        // ПОЛНАЯ таблица по ОДНОМУ адресу — обе живы ОДНОВРЕМЕННО
+        // (перекрывающиеся мапинги одной физики — легальны, v0.14).
+        let hdr = facade
+            .map_external(PhysADDR(0x1FB7_D000), 1, MMAPMemoryFlags::RW)
+            .unwrap();
+        let full = facade
+            .map_external(PhysADDR(0x1FB7_D000), 1, MMAPMemoryFlags::RW)
+            .expect("повторный map той же физики обязан работать");
+        assert_ne!(hdr.0, full.0, "разные записи — разные vaddr");
+        facade.shrink_memory_wiev(full).unwrap();
+        facade.shrink_memory_wiev(hdr).unwrap();
+
+        // Первая таблица (RSDP-страница): map -> byte-точный доступ.
+        let v1 = facade
+            .map_external(PhysADDR(0x1FB7_E000), 1, MMAPMemoryFlags::RW)
+            .unwrap();
+        // Снятие (как MEM_FREE: shrink по адресу региона).
+        facade.shrink_memory_wiev(v1).unwrap();
+        // Вторая таблица (XSDT-страница) — обязана мапиться после снятия.
+        let v2 = facade.map_external(PhysADDR(0x1FB7_D000), 1, MMAPMemoryFlags::RW);
+        assert!(v2.is_ok(), "map после free отклонён: {v2:?}");
+        facade.shrink_memory_wiev(v2.unwrap()).unwrap();
+
+        // Стресс-цикл: 100 итераций map/free (AML-обход дропает mappings
+        // пакетами; переиспользование дыры vaddr — обязательное свойство).
+        for i in 0..100usize {
+            let v = facade
+                .map_external(PhysADDR(0x1000 * (i + 1)), 1, MMAPMemoryFlags::RW)
+                .expect("map в цикле");
+            facade.shrink_memory_wiev(v).unwrap();
+        }
+        assert_eq!(facade.records_by_vaddr.iter().count(), 0);
     }
 
     /// Двойной индекс: устойчивость вставки/снятия записей в обоих деревьях

@@ -32,7 +32,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use pkg_generic_interface::hal::traits::iommu::IommuError;
 use pkg_generic_interface::hal::traits::irq::IrqLineOps;
-use pkg_generic_interface::syscall::device::install_irq_line_service;
+use pkg_generic_interface::syscall::io::install_irq_line_service;
 
 use arch::boot;
 
@@ -247,86 +247,12 @@ pub fn init() {
 
 static IOAPIC_LINES: IoApicLines = IoApicLines;
 
-// ───────────────────── Легаси-шина ISA (для kinit-грантов) ─────────────────────
-
-/// Фиксированные ISA-устройства q35: их линии — GSI через ISO (MADT),
-/// MMIO-регистры — legacy-порты. Перечислитель отдаёт их реестру;
-/// kinit выдаёт init'у DeviceReference на каждое (root-сервер устройств).
-pub struct LegacyIsaBus;
-
-static LEGACY_ISA: LegacyIsaBus = LegacyIsaBus;
-
-impl pkg_generic_interface::hal::device::traits::BusEnumerator for LegacyIsaBus {
-    fn bus_name(&self) -> &str {
-        "isa.legacy"
-    }
-
-    fn scan(
-        &self,
-        sink: &mut dyn pkg_generic_interface::hal::device::traits::DeviceSink,
-    ) -> Result<(), pkg_generic_interface::hal::device::traits::BusError> {
-        use alloc::string::String;
-        use pkg_generic_interface::hal::device::traits::{
-            BusDeviceData, DeviceResource, DiscoveredDevice,
-        };
-        use pkg_generic_interface::hal::types::{
-            AcpiPath, DeviceInfo, DeviceKind, PhysAddr, PlatformId,
-        };
-
-        // ISO-канонизация GSI/триггера — при включении линии (enable_line),
-        // здесь декларируем только то, что лежит в шине: COM1 (PNP0501)
-        // на ISA IRQ 4 и PIT (PNP0100) на IRQ 0 (реально GSI 2 через ISO).
-        let mk = |path: &str,
-                  hid: &str,
-                  irq: u8,
-                  io_base: u64,
-                  io_len: u64,
-                  level: bool,
-                  active_low: bool| {
-            DiscoveredDevice {
-                path: pkg_generic_interface::hal::types::DevicePath::Acpi(AcpiPath::new(path)),
-                info: DeviceInfo::new(DeviceKind::Platform(PlatformId {
-                    acpi_uid: None,
-                    dt_path: None,
-                })),
-                resources: alloc::vec![
-                    DeviceResource::Mmio {
-                        base: PhysAddr(io_base),
-                        len: io_len,
-                    },
-                    DeviceResource::Irq {
-                        gsi: irq as u32,
-                        trigger: if level {
-                            pkg_generic_interface::hal::traits::irq::TriggerMode::Level
-                        } else {
-                            pkg_generic_interface::hal::traits::irq::TriggerMode::Edge
-                        },
-                        active_low,
-                    },
-                ],
-                data: BusDeviceData::Acpi(
-                    pkg_generic_interface::hal::device::acpi::AcpiDeviceData {
-                        hid: Some(String::from(hid)),
-                        cids: alloc::vec![],
-                        uid: None,
-                        adr: None,
-                        sta: Some(0x0F),
-                        hpet: None,
-                    },
-                ),
-                functional: true,
-            }
-        };
-        sink.discovered(mk("\\_SB.COM1", "PNP0501", 4, 0x3F8, 8, false, false));
-        sink.discovered(mk("\\_SB.PIT0", "PNP0100", 2, 0x40, 4, false, false));
-        Ok(())
-    }
-}
-
-/// Ссылка на легаси-шину (Platform::legacy_bus бекенда x86_64).
-pub fn legacy_isa_bus() -> &'static LegacyIsaBus {
-    &LEGACY_ISA
-}
+// ───────────────────── Легаси-шина ISA — УДАЛЕНА в v0.14 ─────────────────────
+// «Устройств в ядре нет»: фиксированные ISA-узлы (COM1/PIT) больше не
+// перечисляются реестром — acpid в юзерспейсе читает их из ACPI-namespace,
+// а ядро лишь медитирует сырые ресурсы за IoResource-cap (порты/линии).
+// Консоль ядра (COM1) — собственность boot-консоли (arch::serial), не
+// «устройство реестра»; линия IRQ4 внешним драйверам — GSI через MADT-ISO.
 
 // ───────────────────── Host-тесты ─────────────────────
 

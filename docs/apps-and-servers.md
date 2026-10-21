@@ -166,17 +166,21 @@ SELF_INFO-слова: `0` task_id.lo, `1` task_id.hi, `2` thread_id.lo,
 | 0x39 | IPC_MSG_CLEAR | — | |
 | 0x3A | NOTIFY_SIGNAL | ep, слово | doorbell (нужна ёмкость) |
 
-### 0x40 — устройства и IRQ
+### 0x40 — сырые аппаратные ресурсы (IoResource) и IRQ (v0.14)
+
+Устройств в ядре НЕТ: доступ к физике/портам/линиям гейтован
+IoResource-capability (CAP_LIST kinds 6 = Mmio, 7 = IoPort, 8 = Irq;
+CAP_INFO слова 4..5 = [base, len|count]). Перечисление ACPI/AML/PCI —
+юзерспейс (acpid).
 
 | № | Сискол | ABI | Прим. |
 |---|--------|-----|-------|
-| 0x02 | DEVICE_INFO | хендл, индекс слова | DeviceRecord |
-| 0x41 | DEVICE_CLAIM | хендл, flags(bit0 try), notify_ep | эксклюзивно |
-| 0x42 | DEVICE_RELEASE | хендл | |
-| 0x43 | DEVICE_CLAIM_STATUS | хендл, индекс | 0 занят, 1..2 owner, 3 waiters, 4 gone |
-| 0x44 | DEVICE_ENUM | индекс слова | 0 = число; далее 4 слова/устройство: kind, path_w0, path_w1, flags(bit0 msi) |
-| 0x45 | DEVICE_MAP_REGION | хендл, индекс ресурса | MMIO BAR → vaddr (zero-copy) |
-| 0x46 | IRQ_ATTACH | хендл, gsi, Gate | прерывание = signal в ep (word = gsi) |
+| 0x02 | — | — | (свободен с v0.14: был DEVICE_INFO) |
+| 0x41 | MMIO_MAP | хендл Mmio, байтовый офсет, страницы, flags(0=dev-nocache) | физика → байто-точный vaddr; кадры внешние, снятие MEM_FREE |
+| 0x42 | IOP_IN | хендл IoPort, офсет, ширина(1\|2\|4) | чтение порта (исполняет ядро, IOPL=0) |
+| 0x43 | IOP_OUT | хендл IoPort, офсет, ширина, значение | запись в порт |
+| 0x44–0x45 | — | — | (свободны с v0.14: были DEVICE_ENUM/MAP_REGION) |
+| 0x46 | IRQ_ATTACH | хендл Irq, gsi, Gate, flags(bit0 level, bit1 low) | прерывание = signal в ep (word = gsi); gsi обязан лежать в диапазоне cap |
 | 0x47 | IRQ_DETACH | gsi | |
 | 0x48 | IRQ_ACK | gsi | EOI-семантика L4 |
 
@@ -428,13 +432,15 @@ l4_iommu_detach(0, dev);
 Capability-модель: право на операцию над чужой задачей — хендл в
 вашем cspace. kinit выдаёт init `TaskTCB(себя)` (право творца):
 THREAD_CREATE/TASK_CREATE работают по нему; чужие задачи — после
-CAP_SEND/CAP_MINT. Устройства — по DeviceReference (выдаёт devmon;
-v0.8 реестр устройств — черновая поверхность DEVICE_ENUM). IOMMU-группа
-(v0.9) гейтована мастер-capability IommuAdmin: её выдает ядро
-доверенным задачам (kinit — init); claim устройства — отдельное
-право для сектора устройств.
+CAP_SEND/CAP_MINT. IOMMU-группа (v0.9) гейтована мастер-capability
+IommuAdmin: её выдает ядро доверенным задачам (kinit — init). Сырые
+ресурсы (v0.14) — IoResource-capability: kinit выдаёт init ТРИ
+корневых диапазона (физика/порты/линии GSI) + `rsdp=0x…` в boot_state;
+перечисление устройств и производные гранты — юзерспейс (acpid,
+раздел 10.7; IOMMU-пути устройств разрешаются против ACPI-таблиц
+самого IOMMU, реестра в ядре нет).
 
-Ограничения (честный список, состояние v0.13):
+Ограничения (честный список, состояние v0.14):
 
 - порождение серверов — РЕШЕНО в v0.9 (TASK_SPAWN_IMAGE: init —
   спавн-сервер, спавнит домены из готовых образов; см. §10);
@@ -446,7 +452,7 @@ v0.8 реестр устройств — черновая поверхность
 - окно перерасхода квоты у IPC-пробуждений — до одного вытесненного
   отрезка (см. [cpu-quotas.md §7](cpu-quotas.md)).
 
-Следующие шаги (roadmap v0.14+): enqueue-проверка квоты
+Следующие шаги (roadmap v0.15+): enqueue-проверка квоты
 IPC-пробуждённых (закрытие окна перерасхода); частичный unmap с
 расщеплением huge; device-iotlb (AWT/ATC); PASID (крейты iommu-rs
 уже несут строители); исключения-фолты как IPC (pager-протокол
@@ -620,3 +626,32 @@ init (S4) спавнит ОДИН образ на ДВУХ базах (0x4000000
 (PIE_PTR) — накат релокаций проверяется на живом домене; разные
 базы = изоляция доменов на уровне адресного пространства.
 Полный разбор контракта — [gtcb-sandbox.md §6](gtcb-sandbox.md).
+
+### 10.7 acpid — ACPI-менеджер в юзерспейсе (v0.14)
+
+Самая тяжёлая и рискованная часть ACPI — AML-интерпретатор (крейт
+`acpi`) — с v0.14 живёт НЕ в ядре, а здесь: паника AML убивает
+acpid, а не ядро. Роль — модель seL4 root-task для железа: init
+спавнит образ (static-PIE) с argv ["acpid", "rsdp=0x…"] и копиями
+ТРЁХ корневых IoResource-грантов (CAP_MINT: физика 0..4 GiB, порты
+0..64 KiB, линии 0..256).
+
+Поток работы (демо S6):
+
+1. **Таблицы**: `acpi::Handler::map_physical_region` = MMIO_MAP за
+   Mmio-cap (байто-точные адреса; refcount-кэш живых мапингов —
+   acpi-крейт держит перекрывающиеся снапшоты одной физики: заголовок
+   таблицы + полная таблица). Op-regions: SystemMemory — MMIO-страницы,
+   SystemIO — IOP_IN/OUT, PCIConfig — CF8/CFC за IoPort-cap.
+2. **Перечисление**: namespace-walk (53 узла q35) с исполнением
+   AML-методов _HID/_CID/_UID/_ADR/_STA/_CRS — 11 устройств;
+   `\_S5_` → SLP_TYPa; FADT → PM1a_EVT/PM1a_CNT, SCI (GSI 9).
+3. **События**: EP_CREATE + IRQ_ATTACH(SCI за Irq-cap) + PWRBTN_EN —
+   нажатие кнопки питания прибывает L4-сигналом.
+4. **Выключение ПК**: IOP_OUT в PM1a_CNT значения SLP_TYPa<<10 |
+   SLP_EN — VM завершается из юзерспейса (QEMU exit 0). Демо не
+   «нажимает» кнопку: после окна ожидания — fallback self-S5.
+
+Куча acpid — ленивый bump по регионам 1 МиБ (order 8 — большие
+непрерывные физические пробеги после бут-фрагментации не гарантированы),
+потолок 8 МиБ в пределах квоты спавна.

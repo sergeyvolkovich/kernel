@@ -453,6 +453,17 @@ unsafe fn smp_stress(cpu_count: u64) {
 /// build.sh линкует rogue как static-pie (ET_DYN + RELATIVE-релоки).
 static CHILD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/child.bin"));
 
+/// v0.14: встроенный образ acpid — ACPI-менеджер в юзерспейсе (AML
+/// вынесен из ядра). Сборка build.sh (ACPID_ELF) -> OUT_DIR/acpid.bin;
+/// пусто — демо S6 пропускается.
+static ACPID_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/acpid.bin"));
+
+/// Пойманный из boot_state факт прошивки: "rsdp=0x..." (kinit ->
+/// argv init -> argv acpid: ядро передаёт ССЫЛКУ на таблицы,
+/// интерпретация ACPI — юзерспейс).
+static mut RSDP_LINE: [u8; 24] = [0; 24];
+static mut RSDP_LINE_LEN: usize = 0;
+
 // Геометрия ребёнка — выбор init (всё в дескрипторе; ядро мапит куда
 // сказано). Для PIE стек/argv кладутся ЗА образом (относительно базы);
 // для статического образа (легаси-режим сборки rogue) база — 0, адреса
@@ -652,7 +663,7 @@ unsafe fn spawn_and_run_child(
         let mut reloc_ok = !is_pie; // статике накатывать нечего
         if is_pie {
             let applied = plan.apply_rela(base, |vaddr, val| {
-                if let Some((ptr, off)) = staging_ptr_of(plan, &srcs, vaddr) {
+                if let Some((ptr, off)) = staging_ptr_of(&plan, &srcs, vaddr) {
                     unsafe { put64(ptr, off, val) };
                 }
             });
@@ -1041,20 +1052,19 @@ unsafe fn sandbox_pie_demo() {
 
 // ───────────────────────── S5 (v0.11): внешние линии ─────────────────────────
 
-const SYS_DEVICE_CLAIM: u64 = 0x41;
-const SYS_DEVICE_RELEASE: u64 = 0x42;
 const SYS_IRQ_ATTACH: u64 = 0x46;
 const SYS_IRQ_DETACH: u64 = 0x47;
 const SYS_IRQ_ACK: u64 = 0x48;
+const SYS_SYS_TIME: u64 = 0x04;
 
 /// S5: НАСТОЯЩАЯ линия железа как L4-сообщение (COM1, ISA IRQ4 -> GSI 4).
 ///
-/// init — root-сервер устройств (kinit-гранты легаси-шины, v0.11):
-/// перебираем свои DeviceReference (CLAIM-try + IRQ_ATTACH(gsi=4)
-/// одобряет только владельца линии — COM1), ядро возводит линию
-/// (IOAPIC RTE; при включённом ремаппинге IOMMU — IRTE+remapped-RTE —
-/// аудит ядра в консоли), затем вывод консоли осушает передатчик —
-/// IRQ4 -> irq_c -> signal (=gsi) в наш endpoint. ACK -> detach ->
+/// v0.14: право на линию подтверждает IoResource(Irq)-cap (kinit-грант):
+/// перебираем свои capability (CAP_LIST), находим kind=8 (Irq-диапазон)
+/// и привязываем GSI 4 к endpoint. Реестра устройств в ядре больше нет —
+/// ядро возводит линию (IOAPIC RTE; при включённом ремаппинге IOMMU —
+/// IRTE+remapped-RTE — аудит ядра в консоли), вывод консоли осушает
+/// передатчик — IRQ4 -> signal(=gsi) в наш endpoint. ACK -> detach ->
 /// вердикт: полный контур линии в сообщениях L4.
 unsafe fn ioapic_demo() {
     unsafe {
@@ -1065,38 +1075,37 @@ unsafe fn ioapic_demo() {
             puts("init: ioapic: EP_CREATE failed — skipped");
             return;
         }
-        // Перебор DeviceReference-хендлов: claim(try) + attach(4) —
-        // одобряет только владелец ресурса Irq{gsi=4} (COM1).
+        // Irq-cap (kind 8) — kinit-грант сырых ресурсов.
         let n = syscall6(SYS_CAP_LIST, 0, 0, 0, 0, 0, 0);
         if n <= 0 {
             puts("init: ioapic: no capabilities (kinit grants missing?) — skipped");
             return;
         }
-        let mut dev_handle = 0u64;
+        let mut irq_cap = 0u64;
         let mut idx = 1u64;
         for _ in 0..n {
-            let handle = syscall6(SYS_CAP_LIST, idx, 0, 0, 0, 0, 0);
-            let kind = syscall6(SYS_CAP_LIST, idx + 1, 0, 0, 0, 0, 0);
-            if kind == 1 && handle > 0 {
-                // try-claim: занято/чужое — не наше.
-                let claim = syscall6(SYS_DEVICE_CLAIM, handle as u64, 1, 0, 0, 0, 0);
-                if claim == 0 {
-                    let attach = syscall6(SYS_IRQ_ATTACH, handle as u64, 4, gate as u64, 0, 0, 0);
-                    if attach == 0 {
-                        dev_handle = handle as u64;
-                        break;
-                    }
-                }
+            // CAP_LIST: ПО ДВА слова на слот ([idx] = handle, [idx+1] = kind).
+            let handle = syscall6(SYS_CAP_LIST, idx, 0, 0, 0, 0, 0) as u64;
+            let kind = syscall6(SYS_CAP_LIST, idx + 1, 0, 0, 0, 0, 0) as u64;
+            if kind == 8 && handle > 0 {
+                irq_cap = handle;
+                break;
             }
             idx += 2;
         }
-        if dev_handle == 0 {
-            puts("init: ioapic: no device owns GSI 4 (legacy bus absent?) — skipped");
+        if irq_cap == 0 {
+            puts("init: ioapic: no IoResource(Irq) cap (kinit grant?) — skipped");
             return;
         }
-        debug_word_line("init: ioapic: com1 claimed, handle = ", dev_handle);
+        // Привязка GSI 4 (edge — ISO MADT канонизует триггер в бекенде).
+        let attach = syscall6(SYS_IRQ_ATTACH, irq_cap, 4, gate as u64, 0, 0, 0);
+        if attach != 0 {
+            debug_word_line("init: ioapic: IRQ_ATTACH(4) ret = ", attach as u64);
+            puts("init: ioapic: line attach failed — skipped");
+            return;
+        }
         // Строка ниже осушает передатчик: THR-empty -> IRQ4 latch-ится
-        // (под BKL IF=0) и прибудет signal-ом на первом же sysret.
+        // и прибудет signal-ом на первом же sysret.
         puts("init: ioapic: line up (ISA IRQ4 -> GSI 4); console drain fires it");
         // Приём сигнала (edge: события до pending склеиваются одним
         // словом — семантика уведомлений L4).
@@ -1105,7 +1114,6 @@ unsafe fn ioapic_demo() {
         debug_word_line("init: ioapic: signal word = ", word as u64);
         let ack = syscall6(SYS_IRQ_ACK, 4, 0, 0, 0, 0, 0);
         let detach = syscall6(SYS_IRQ_DETACH, 4, 0, 0, 0, 0, 0);
-        let _ = syscall6(SYS_DEVICE_RELEASE, dev_handle, 0, 0, 0, 0, 0);
         debug_word_line("init: ioapic: irq_ack ret    = ", ack as u64);
         debug_word_line("init: ioapic: irq_detach ret = ", detach as u64);
         if r >= 0 && word == 4 && detach == 0 {
@@ -1114,6 +1122,262 @@ unsafe fn ioapic_demo() {
             );
         } else {
             puts("init: ioapic VERDICT: demo finished with anomalies (see above)");
+        }
+    }
+}
+
+// ───────────── S6 (v0.14): acpid — ACPI/AML в юзерспейсе, S5-poweroff ─────────────
+
+/// Идентификаторы домена acpid (L4: 128-бит, выбирает init).
+const ACPID_TASK: u128 = 0x2600_0000;
+const ACPID_THREAD: u128 = 0x2600_0001;
+/// База PIE-образа acpid (S4-инстансы уже умерли и вернули кадры).
+const ACPID_BASE: u64 = 0x5000_0000;
+
+/// Квоты acpid (менеджер — не песочница: щедрые, но конечные).
+const ACPID_PAGES_HEADROOM: u64 = 2560; // + bump-куча 2048 и AML-namespace
+const ACPID_MAX_THREADS: u64 = 4;
+const ACPID_MAX_ENDPOINTS: u64 = 4;
+const ACPID_MAX_SHM: u64 = 2;
+const ACPID_MAX_CAPS: u64 = 16;
+const ACPID_PRIO: u8 = 100;
+const ACPID_CPU_QUOTA: u32 = 100;
+
+/// S6: спавн acpid — ACPI-менеджера в юзерспейсе. AML-интерпретатор
+/// (тяжелейшая часть ACPI) теперь НЕ в ядре: паника AML убивает
+/// acpid, а не ядро. init передаёт ребёнку (a) argv с rsdp=0x... и
+/// (b) три IoResource-гранта (физика/порты/линии) через CAP_MINT —
+/// acpid сам читает таблицы, обходит namespace, подписывается на SCI
+/// и ВЫКЛЮЧАЕТ ПК записью S5|SLP_EN в PM1a_CNT (IOP_OUT за cap).
+unsafe fn acpid_demo() {
+    unsafe {
+        puts("=== init: S6 acpid demo (userspace AML + S5 power-off) ===");
+        if ACPID_ELF.is_empty() {
+            puts("init: acpid: no embedded image (set ACPID_ELF at build) — skipped");
+            return;
+        }
+        let rsdp_len = unsafe { RSDP_LINE_LEN };
+        if rsdp_len == 0 {
+            puts("init: acpid: no rsdp= in boot_state (kinit?) — skipped");
+            return;
+        }
+        let plan = match pie::Plan::parse(ACPID_ELF) {
+            Ok(p) => p,
+            Err(e) => {
+                puts("init: acpid: image rejected by loader (fail-closed)");
+                debug_word_line("init: acpid: loader error code = ", e.code());
+                return;
+            }
+        };
+        if plan.kind == pie::ImageKind::Pie {
+            puts("init: acpid: image is ET_DYN — spawn at chosen base")
+        } else {
+            puts("init: acpid: image is ET_EXEC (legacy) — fixed-base spawn")
+        }
+        debug_word_line("init: acpid: PT_LOAD segments = ", plan.n_segs as u64);
+        debug_word_line("init: acpid: RELATIVE relocs = ", plan.n_relas as u64);
+
+        // Право творца init: TaskTCB(себя) — от kinit.
+        let Some(tcb_self) = find_tcb_handle() else {
+            puts("init: acpid: no creator TCB (kinit grant missing?) — skipped");
+            return;
+        };
+
+        // ---- Staging: сегменты (как у S4) ----
+        let is_pie = plan.kind == pie::ImageKind::Pie;
+        let base = if is_pie { ACPID_BASE } else { 0 };
+        let image_end = plan.image_end();
+        let stack_dst = (base + image_end + 0xFFF) & !0xFFF;
+        let stack_top = stack_dst + CHILD_STACK_PAGES * 0x1000;
+        let argv_dst = (stack_top + 0xFFF) & !0xFFF;
+
+        let mut srcs = [0u64; SPAWN_SEGS_MAX + 2];
+        let mut image_pages = 0u64;
+        let n_segs = plan.n_segs;
+        for i in 0..n_segs {
+            let seg = plan.segs[i];
+            let v = syscall6(SYS_MEM_ALLOC, seg.pages, 0b011, 0, 0, 0, 0);
+            if v <= 0 {
+                puts("init: acpid: staging MEM_ALLOC failed — abort");
+                return;
+            }
+            let region = v as u64 as *mut u8;
+            zero(region, 0, seg.pages as usize * 0x1000);
+            if seg.filesz > 0 {
+                let file_end = seg.in_seg as u64 + seg.filesz;
+                if seg.file_off + file_end <= ACPID_ELF.len() as u64 {
+                    copy_bytes(
+                        region.add(seg.in_seg as usize),
+                        &ACPID_ELF[seg.file_off as usize..(seg.file_off + seg.filesz) as usize],
+                    );
+                }
+            }
+            srcs[i] = region as u64;
+            image_pages += seg.pages;
+        }
+        // Релокации PIE (контракт: ядро получает залинкованный образ).
+        if is_pie {
+            let _ = plan.apply_rela(base, |vaddr, val| {
+                if let Some((ptr, off)) = staging_ptr_of(&plan, &srcs, vaddr) {
+                    unsafe { put64(ptr, off, val) };
+                }
+            });
+        }
+
+        // Стек.
+        let stack_v = syscall6(SYS_MEM_ALLOC, CHILD_STACK_PAGES, 0b011, 0, 0, 0, 0);
+        if stack_v <= 0 {
+            puts("init: acpid: stack staging failed — abort");
+            return;
+        }
+        zero(
+            stack_v as u64 as *mut u8,
+            0,
+            CHILD_STACK_PAGES as usize * 0x1000,
+        );
+        srcs[n_segs] = stack_v as u64;
+
+        // argv-блок: ["acpid", "rsdp=0x..."] — факт прошивки транзитом.
+        let argv_v = syscall6(SYS_MEM_ALLOC, CHILD_ARGV_PAGES, 0b011, 0, 0, 0, 0);
+        if argv_v <= 0 {
+            puts("init: acpid: argv staging failed — abort");
+            return;
+        }
+        let argv_region = argv_v as u64 as *mut u8;
+        zero(argv_region, 0, CHILD_ARGV_PAGES as usize * 0x1000);
+        let rsdp = unsafe { &RSDP_LINE[..rsdp_len] };
+        let name_len = "acpid".len();
+        put64(argv_region, 0, 2); // argc
+        put64(argv_region, 8, argv_dst + 40);
+        put64(argv_region, 16, argv_dst + 40 + (name_len + 1) as u64);
+        put64(argv_region, 24, 0); // NULL
+        put64(argv_region, 32, 0); // pad
+        let mut off = 40usize;
+        off += copy_str(argv_region.add(off), b"acpid");
+        for (i, &b) in rsdp.iter().enumerate() {
+            argv_region.add(off + i).write_volatile(b);
+        }
+        off += rsdp_len;
+        let argv_bytes = off;
+        srcs[n_segs + 1] = argv_v as u64;
+
+        // Дескриптор спавна.
+        let desc_v = syscall6(SYS_MEM_ALLOC, 1, 0b011, 0, 0, 0, 0);
+        if desc_v <= 0 {
+            puts("init: acpid: desc staging failed — abort");
+            return;
+        }
+        let desc = desc_v as u64 as *mut u8;
+        let max_pages = image_pages + CHILD_STACK_PAGES + CHILD_ARGV_PAGES + ACPID_PAGES_HEADROOM;
+        zero(desc, 0, 0x1000);
+        put64(desc, 0x00, base + plan.entry);
+        put64(desc, 0x08, stack_top);
+        put64(desc, 0x10, ACPID_THREAD as u64);
+        put64(desc, 0x18, (ACPID_THREAD >> 64) as u64);
+        put64(desc, 0x20, (n_segs + 1) as u64 | (CHILD_ARGV_PAGES << 32));
+        put64(desc, 0x28, argv_v as u64);
+        put64(desc, 0x30, argv_dst);
+        put64(desc, 0x38, argv_bytes as u64);
+        put64(desc, 0x40, 2); // argc
+        put64(desc, 0x48, max_pages);
+        put64(desc, 0x50, ACPID_MAX_THREADS | (ACPID_MAX_ENDPOINTS << 32));
+        put64(desc, 0x58, ACPID_MAX_SHM | (ACPID_MAX_CAPS << 32));
+        put64(desc, 0x60, ACPID_PRIO as u64); // may_spawn = 0
+        let b = ACPID_PRIO.to_le_bytes();
+        for i in 0..b.len() {
+            desc.add(0x68 + i).write_volatile(b[i]);
+        }
+        let q = ACPID_CPU_QUOTA.to_le_bytes();
+        for i in 0..4 {
+            desc.add(0x6C + i).write_volatile(q[i]);
+        }
+        for i in 0..n_segs {
+            let seg = plan.segs[i];
+            let at = SPAWN_HDR + i * SPAWN_SEG;
+            put64(desc, at, srcs[i]);
+            put64(desc, at + 8, base + seg.vstart);
+            put64(desc, at + 16, seg.pages);
+            put64(desc, at + 24, seg.flags);
+        }
+        let at = SPAWN_HDR + n_segs * SPAWN_SEG;
+        put64(desc, at, srcs[n_segs]);
+        put64(desc, at + 8, stack_dst);
+        put64(desc, at + 16, CHILD_STACK_PAGES);
+        put64(desc, at + 24, 0b011);
+        let desc_len = SPAWN_HDR + (n_segs + 1) * SPAWN_SEG;
+
+        // Спавн.
+        let r = syscall6(
+            SYS_TASK_SPAWN_IMAGE,
+            tcb_self,
+            ACPID_TASK as u64,
+            (ACPID_TASK >> 64) as u64,
+            desc_v as u64,
+            desc_len as u64,
+            0,
+        );
+        debug_word_line("init: acpid: spawn_image ret = ", r as u64);
+        if r <= 0 {
+            puts("init: acpid: spawn failed — demo aborted");
+            return;
+        }
+        let tcb_child = r as u64;
+
+        // Гранты сырых ресурсов: копии IoResource init -> cspace acpid
+        // (CAP_MINT; init сохраняет свои — раздаёт копии).
+        let n = syscall6(SYS_CAP_LIST, 0, 0, 0, 0, 0, 0);
+        let mut granted = 0u64;
+        if n > 0 {
+            let mut idx = 1u64;
+            for _ in 0..n {
+                // CAP_LIST: ПО ДВА слова на слот ([idx] = handle, [idx+1] = kind).
+                let handle = syscall6(SYS_CAP_LIST, idx, 0, 0, 0, 0, 0) as u64;
+                let kind = syscall6(SYS_CAP_LIST, idx + 1, 0, 0, 0, 0, 0) as u64;
+                if (6..=8).contains(&kind) && handle > 0 {
+                    let m = syscall6(
+                        SYS_CAP_MINT,
+                        handle,
+                        ACPID_TASK as u64,
+                        (ACPID_TASK >> 64) as u64,
+                        0xFF,
+                        0xFFFF_FFFF_FFFF_FFFF,
+                        0,
+                    );
+                    if m > 0 {
+                        granted += 1;
+                    } else {
+                        debug_word_line("init: acpid: CAP_MINT(kind) ret = ", m as u64);
+                    }
+                }
+                idx += 2;
+            }
+        }
+        // «Своя кухня» домена: копия TaskTCB(acpid) -> acpid.
+        let _ = syscall6(
+            SYS_CAP_MINT,
+            tcb_child,
+            ACPID_TASK as u64,
+            (ACPID_TASK >> 64) as u64,
+            0xFF,
+            0xFFFF_FFFF_FFFF_FFFF,
+            0,
+        );
+        debug_word_line("init: acpid: IoResource grants minted = ", granted);
+        if granted < 3 {
+            puts("init: acpid: WARN: fewer than 3 IoResource grants (kinit?)");
+        }
+
+        puts("init: acpid spawned: userspace AML -> enumerate -> SCI -> S5 power-off");
+        puts("init: parking (VM should power off from userspace; timeout = failure)");
+        // Парковка с дедлайном диагностики (60 с): успех = VM выключена.
+        let deadline = syscall6(SYS_SYS_TIME, 0, 0, 0, 0, 0, 0) as u64 + 60_000_000_000u64;
+        loop {
+            let now = syscall6(SYS_SYS_TIME, 0, 0, 0, 0, 0, 0);
+            if now as u64 >= deadline {
+                puts("init: acpid VERDICT: VM still alive after 60s — S5 failed (see log)");
+                break;
+            }
+            let _ = syscall6(SYS_THREAD_YIELD, 0, 0, 0, 0, 0, 0);
         }
     }
 }
@@ -1160,6 +1424,13 @@ fn main_loop() -> ! {
                         line[n] = src.add(n).read_volatile();
                         n += 1;
                     }
+                    // v0.14: rsdp=0x... — транзит для acpid (S6).
+                    if n >= 6 && &line[..5] == b"rsdp=" && n <= 24 {
+                        unsafe {
+                            RSDP_LINE[..n].copy_from_slice(&line[..n]);
+                            RSDP_LINE_LEN = n;
+                        }
+                    }
                     line[n] = b' ';
                     line[n + 1] = 0;
                     let mut prefix = [b' ', b' ', b' ', b' '];
@@ -1193,6 +1464,10 @@ fn main_loop() -> ! {
             // S5 (v0.11): настоящая линия железа (COM1 IRQ4 -> GSI 4)
             // как L4-signal: полный контур IOAPIC->LAPIC->endpoint.
             ioapic_demo();
+
+            // S6 (v0.14): acpid — ACPI/AML-менеджер в юзерспейсе;
+            // успех = ВЫКЛЮЧЕНИЕ ПК юзерспейсом (S5, PM1a_CNT).
+            acpid_demo();
         }
         puts("init: all demos done, exiting with code 0");
         sys_exit(0)

@@ -589,7 +589,7 @@ impl ExitPayload {
 /// Сам менеджер почти бессостоятелен (всё живёт в объектах ядра —
 /// endpoint'ы в `CapabilityManager`, ожидания в `TcbManager`): он владеет
 /// только счётчиками аудита. Методы принимают менеджеры параметрами —
-/// тот же паттерн, что `DeviceManager::export_capabilities(&tasks, &caps)`.
+/// тот же паттерн, что стартовые гранты kinit (IoResource, v0.14).
 pub struct IpcManager {
     /// Счётчики аудита (SMP v0.12: атомики — инкремент без лока).
     delivered: AtomicUsize,

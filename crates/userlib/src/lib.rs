@@ -335,51 +335,40 @@ pub extern "C" fn l4_notify_signal(ep: u64, word: u64) -> i64 {
     unsafe { l4_syscall6(0x3A, ep, word, 0, 0, 0, 0) }
 }
 
-// ───────────────────────── 0x40: устройства и IRQ ─────────────────────────
+// ───────────── 0x40: сырые ресурсы (IoResource) и IRQ (v0.14) ─────────────
+// «Устройств в ядре нет»: доступ к физике/портам/линиям гейтован
+// IoResource-capability; перечисление устройств (ACPI/AML/PCI) и
+// драйверы — юзерспейс (acpid).
 
-/// DEVICE_CLAIM(0x41): эксклюзивный захват устройства.
+/// MMIO_MAP(0x41): отобразить физический диапазон (Mmio-cap) в
+/// пространство вызывающего (кадры внешние, снятие MEM_FREE).
+/// Возврат: виртуальный адрес, байто-точный к base+off.
 #[unsafe(no_mangle)]
-pub extern "C" fn l4_device_claim(dev: u64, flags: u64, notify_ep: u64) -> i64 {
-    unsafe { l4_syscall6(0x41, dev, flags, notify_ep, 0, 0, 0) }
+pub extern "C" fn l4_mmio_map(mmio_cap: u64, off: u64, pages: u64, flags: u64) -> i64 {
+    unsafe { l4_syscall6(0x41, mmio_cap, off, pages, flags, 0, 0) }
 }
 
-/// DEVICE_RELEASE(0x42): отпустить лок.
+/// IOP_IN(0x42): чтение из I/O-порта (исполнение в ядре за IoPort-cap).
 #[unsafe(no_mangle)]
-pub extern "C" fn l4_device_release(dev: u64) -> i64 {
-    unsafe { l4_syscall6(0x42, dev, 0, 0, 0, 0, 0) }
+pub extern "C" fn l4_iop_in(io_cap: u64, off: u64, width: u64) -> i64 {
+    unsafe { l4_syscall6(0x42, io_cap, off, width, 0, 0, 0) }
 }
 
-/// DEVICE_CLAIM_STATUS(0x43): статус лока словами.
+/// IOP_OUT(0x43): запись в I/O-порт (исполнение в ядре за IoPort-cap).
 #[unsafe(no_mangle)]
-pub extern "C" fn l4_device_claim_status(dev: u64, index: u64) -> i64 {
-    unsafe { l4_syscall6(0x43, dev, index, 0, 0, 0, 0) }
+pub extern "C" fn l4_iop_out(io_cap: u64, off: u64, width: u64, value: u64) -> i64 {
+    unsafe { l4_syscall6(0x43, io_cap, off, width, value, 0, 0) }
 }
 
-/// DEVICE_INFO(0x02): метаданные устройства по capability.
+/// IRQ_ATTACH(0x46): привязать внешнюю линию (GSI) за Irq-cap к
+/// notify-endpoint'у (прерывание = signal-сообщение, word = gsi).
+/// flags: bit0 = level, bit1 = active_low (подсказка; MADT-ISO каноничнее).
 #[unsafe(no_mangle)]
-pub extern "C" fn l4_device_info(dev: u64, index: u64) -> i64 {
-    unsafe { l4_syscall6(0x02, dev, index, 0, 0, 0, 0) }
+pub extern "C" fn l4_irq_attach(irq_cap: u64, gsi: u64, gate: u64, flags: u64) -> i64 {
+    unsafe { l4_syscall6(0x46, irq_cap, gsi, gate, flags, 0, 0) }
 }
 
-/// DEVICE_ENUM(0x44): обзор реестра живых устройств.
-#[unsafe(no_mangle)]
-pub extern "C" fn l4_device_enum(index: u64) -> i64 {
-    unsafe { l4_syscall6(0x44, index, 0, 0, 0, 0, 0) }
-}
-
-/// DEVICE_MAP_REGION(0x45): отобразить MMIO BAR устройства.
-#[unsafe(no_mangle)]
-pub extern "C" fn l4_device_map_region(dev: u64, region: u64) -> i64 {
-    unsafe { l4_syscall6(0x45, dev, region, 0, 0, 0, 0) }
-}
-
-/// IRQ_ATTACH(0x46): привязать IRQ устройства к notify-endpoint'у.
-#[unsafe(no_mangle)]
-pub extern "C" fn l4_irq_attach(dev: u64, gsi: u64, gate: u64) -> i64 {
-    unsafe { l4_syscall6(0x46, dev, gsi, gate, 0, 0, 0) }
-}
-
-/// IRQ_DETACH(0x47): снять привязку IRQ.
+/// IRQ_DETACH(0x47): снять привязку IRQ (владелец).
 #[unsafe(no_mangle)]
 pub extern "C" fn l4_irq_detach(gsi: u64) -> i64 {
     unsafe { l4_syscall6(0x47, gsi, 0, 0, 0, 0, 0) }
