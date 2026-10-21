@@ -89,7 +89,9 @@ pub extern "C" fn kmain(bootinfo_phys: u64) -> ! {
     if backend::lapic::using_tsc_deadline() {
         backend::console::kprint_str("kmain: timer mode: tsc-deadline (sub-tick quotas)\r\n");
     } else {
-        backend::console::kprint_str("kmain: timer mode: periodic fallback (tsc-deadline not exposed)\r\n");
+        backend::console::kprint_str(
+            "kmain: timer mode: periodic fallback (tsc-deadline not exposed)\r\n",
+        );
     }
     backend::console::kprint_str("kmain: cpu+lapic+timer up\r\n");
 

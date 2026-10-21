@@ -19,7 +19,7 @@
 // инвариант, проверяемый init()); на этом стоит asm-обработчик
 // resched (см. ctxswitch.rs).
 
-use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use arch::boot;
 use pkg_generic_interface::syscall::system::TimeSource;
@@ -160,7 +160,10 @@ fn enter_tsc_deadline_mode() {
     // Intel SDM 10.5.4: DCR в TSC-deadline не используется — 0
     // (divide by 1); ICR не пишется; LVT — vector|bit18, unmasked.
     write(REG_TIMER_DCR, 0);
-    write(REG_LVT_TIMER, boot::VEC_TIMER as u32 | REG_TIMER_TSC_DEADLINE);
+    write(
+        REG_LVT_TIMER,
+        boot::VEC_TIMER as u32 | REG_TIMER_TSC_DEADLINE,
+    );
     arm_tsc_deadline(0);
 }
 

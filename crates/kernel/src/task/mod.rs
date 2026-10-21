@@ -168,7 +168,8 @@ impl TcbManager {
     /// и клампится в 1 (учёт остаётся в прежней единице).
     pub fn set_cpu_time_unit(&self, cycles_per_tick: u64) -> Result<(), TaskError> {
         // 0 вырожден: клампим в 1 (учёт остаётся в прежней единице).
-        self.cpu_unit.store(cycles_per_tick.max(1), Ordering::Release);
+        self.cpu_unit
+            .store(cycles_per_tick.max(1), Ordering::Release);
         Ok(())
     }
 

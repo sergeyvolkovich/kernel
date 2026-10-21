@@ -7,14 +7,17 @@
 //   * memory   — UserTables (MMAP/KMAP/ASID: страницы задач, перенос
 //     ядра MapFullKernel, CR3-активация), physmap-хелперы;
 //   * cpu      — GDT/TSS/IDT, per-CPU (GS), syscall-MSR (SMP: массивы);
-//   * lapic    — xAPIC + периодический таймер (PIT-калибровка) + часы
-//     + IPI (INIT-SIPI-SIPI / resched / shootdown / halt);
-//   * sched    — планировщик-бекенд (глобальная очередь + per-CPU
-//     текущий/квант/флаг, block-очереди, контексты);
+//   * lapic    — xAPIC + таймер (периодический тик ИЛИ TSC-deadline
+//     one-shot с v0.13; PIT-калибровка TSC) + IPI (INIT-SIPI-SIPI /
+//     resched / shootdown / halt);
+//   * sched    — планировщик-бекенд (lock-free MPMC-кольцо готовности
+//     + per-CPU текущий/квант/флаг/кэш контекстов, block-очереди,
+//     троттл-лист CPU-квот);
 //   * ctxswitch — asm-граница режимов (syscall/tick/faults/enter/IPI);
 //   * gate     — rust-часть границы (диспетчеризация сисколов, тик,
-//     фолты, idle) — точки входа/выхода BKL;
-//   * klock    — big kernel lock (SMP v0.6: сериализация входов в ядро);
+//     фолты, idle; v0.12+: без BKL — IF-дисциплина ядровых локов
+//     kernel::sync, хуки wait/wake/depth устанавливает здесь до
+//     старта SMP);
 //   * smp      — топология (MADT), SIPI-трамплин, bring-up AP, IPI,
 //     TLB shootdown, halt-all;
 //   * vtd      — Intel VT-d (DMAR/DRHD, QI, second-stage, IommuService);

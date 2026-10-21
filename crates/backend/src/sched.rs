@@ -280,8 +280,7 @@ impl CtxCpu {
 // обмен контекстами идёт через INNER.contexts.
 unsafe impl Sync for CtxCpu {}
 
-static CTX_CPU: [CtxCpu; crate::smp::MAX_CPUS] =
-    [const { CtxCpu::new() }; crate::smp::MAX_CPUS];
+static CTX_CPU: [CtxCpu; crate::smp::MAX_CPUS] = [const { CtxCpu::new() }; crate::smp::MAX_CPUS];
 
 /// Свой per-CPU кэш контекстов (cpu = GS cpu_id; индекс в границах —
 /// инвариант smp: cpu_id < MAX_CPUS).
@@ -983,9 +982,7 @@ pub fn preempt_step(ctx: Box<UserCtx>) -> ! {
     let mut throttled = false;
     if let Some(glue) = startup::glue() {
         if let Some(cur) = SCHED.current_thread() {
-            let cycles = SCHED
-                .cycles_since_dispatch()
-                .max(min_charge_cycles());
+            let cycles = SCHED.cycles_since_dispatch().max(min_charge_cycles());
             throttled = glue.on_cpu_cycles_consumed(cur, cycles);
         }
     }
