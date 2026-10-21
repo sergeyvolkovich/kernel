@@ -1,0 +1,24 @@
+[package]
+name = "kernel-hal"
+version = "0.1.0"
+edition = "2024"
+description = "HAL-контракты микроядра (v0.15): типы + трейты платформы. Не зависит ни от одного крейта workspace — структурная гарантия того, что экспозиция архитектуры не проникает между крейтами: ядро и бекенд видят контракты, контрактный слой не видит никого."
+
+[lib]
+name = "kernel_hal"
+path = "src/lib.rs"
+
+# Тесты и host-утилиты гоняются на std; боевой крейт — no_std
+# (как у kernel: cfg_attr ниже).
+[features]
+host-hooks = []
+
+[dependencies]
+bitflags = "2.13.2"
+# Контракт MMAP оперирует физическими фреймами: типы ошибок аллокатора
+# (llfree::Error, SlabError, AlignedBoxError) — часть сигнатуры трейта.
+# Внешние крейты, не workspace: изоляция между нашими крейтами сохраняется.
+llfree = { git = "https://github.com/luhsra/llfree-rs.git" }
+attachable-slab-allocator = { git = "https://github.com/KiyanSisakhti/attachable-slab-allocator.git" }
+aligned_box = { version = "0.3.1", default-features = false }
+thiserror = { version = "2.0.21", default-features = false }

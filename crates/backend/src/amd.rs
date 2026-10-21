@@ -54,10 +54,8 @@ use amd_iommu::ivrs::{DeviceEntry, DeviceType, EntryType, Ivhd, IvrsTable};
 use amd_iommu::pagetables;
 use amd_iommu::regs::{self, BufferBase, Control, DeviceTableBase, Status};
 
-use pkg_generic_interface::hal::traits::iommu::{
-    ANIOMMUInterface, DeviceId, IommuError, LIOMMUInterface,
-};
-use pkg_generic_interface::hal::types::{Bdf, DevicePath, IommuProt};
+use kernel_hal::traits::iommu::{ANIOMMUInterface, DeviceId, IommuError, LIOMMUInterface};
+use kernel_hal::types::{Bdf, DevicePath, IommuProt};
 use pkg_generic_interface::syscall::iommu::IommuService;
 
 use crate::iommu::{Mmio, free_page, zero_huge, zero_page};
@@ -1105,15 +1103,15 @@ impl AmdDriver {
 }
 
 impl ANIOMMUInterface for AmdDriver {
-    fn iommu_id(&self) -> pkg_generic_interface::hal::traits::iommu::IommuId {
-        pkg_generic_interface::hal::traits::iommu::IommuId(self.id)
+    fn iommu_id(&self) -> kernel_hal::traits::iommu::IommuId {
+        kernel_hal::traits::iommu::IommuId(self.id)
     }
 
     fn map_pages(
         &mut self,
         dev: DeviceId,
         iova: u64,
-        phys: pkg_generic_interface::hal::types::PhysAddr,
+        phys: kernel_hal::types::PhysAddr,
         count: usize,
         prot: IommuProt,
     ) -> Result<(), IommuError> {

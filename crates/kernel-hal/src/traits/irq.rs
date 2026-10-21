@@ -11,7 +11,7 @@
 
 use bitflags::bitflags;
 
-use crate::hal::{
+use crate::{
     traits::iommu::IommuError,
     types::{ItsId, PhysAddr},
 };

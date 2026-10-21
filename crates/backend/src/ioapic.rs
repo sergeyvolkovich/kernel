@@ -30,8 +30,8 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use pkg_generic_interface::hal::traits::iommu::IommuError;
-use pkg_generic_interface::hal::traits::irq::IrqLineOps;
+use kernel_hal::traits::iommu::IommuError;
+use kernel_hal::traits::irq::IrqLineOps;
 use pkg_generic_interface::syscall::io::install_irq_line_service;
 
 use arch::boot;

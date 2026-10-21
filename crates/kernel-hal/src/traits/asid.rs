@@ -56,7 +56,7 @@ use core::fmt;
 
 use thiserror::Error;
 
-use crate::hal::traits::mmap::{MMAPInterface, MemErrorCode, PhysADDR, VirtualADDR};
+use crate::traits::mmap::{MMAPInterface, MemErrorCode, PhysADDR, VirtualADDR};
 
 // ───────────────────────────── Тег адресного пространства ─────────────────────────────
 
@@ -205,7 +205,7 @@ impl fmt::Display for AddressSpaceMode {
 /// * `FlushAll` — нетегированное переключение: полный локальный сброс
 ///   не-глобальных записей (x86: запись CR3 без PCID).
 ///
-/// Глобальные записи (бит [`crate::hal::traits::mmap::MMAPMemoryFlags::GLOBAL`])
+/// Глобальные записи (бит [`crate::traits::mmap::MMAPMemoryFlags::GLOBAL`])
 /// не сбрасываются ни одной из политик — гасятся только
 /// [`TlbOp::All`] с `include_global = true`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -304,7 +304,7 @@ pub enum ASIDError {
 ///      `flush_tlb_all` при rollover PCID);
 ///   3. справочный счётчик TLB-записей (ARM ASID allocator).
 ///
-/// Крейт помогает контракту: [`crate::mem::ufacade::UFacade::release_asid`]
+/// Крейт помогает контракту: фасад пользовательских адресных пространств ядра
 /// гасит TLB пары ДО возврата тегов в пул.
 ///
 /// Парный бит (если схема `with_kernel_bit`) обязан резервироваться пулом:
@@ -349,7 +349,7 @@ pub trait AsidAllocator {
 ///    обязаны сохраниться: это и есть смысл PCID. Выход в `User` при
 ///    KPTI гарантирует, что активная таблица не содержит ядра сверх
 ///    EntryTrampoline/UserShared — полноту проверки выполняет компоновка
-///    (`crate::mem::kmap`), здесь — только исполнение переключения.
+///    (KMAP ядра), здесь — только исполнение переключения.
 /// 3. `root_table` — физический корень таблиц страниц пространства
 ///    (для трекинга гейтом сисколов / планировщиком). `None` допустимо,
 ///    если бекенд не раскрывает корень.

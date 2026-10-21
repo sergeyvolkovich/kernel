@@ -4,6 +4,7 @@ members = [
     "crates/boot_info",
     "crates/bootcfg",
     "crates/kernel",
+    "crates/kernel-hal",
     "crates/arch",
     "crates/backend",
     "crates/startup",
@@ -29,6 +30,7 @@ default-members = [
     "crates/boot_info",
     "crates/bootcfg",
     "crates/kernel",
+    "crates/kernel-hal",
     "crates/arch",
     "crates/pie",
 ]
@@ -40,6 +42,7 @@ edition = "2024"
 
 [workspace.dependencies]
 pkg_generic_interface = { path = "crates/kernel" }
+kernel_hal = { path = "crates/kernel-hal", package = "kernel-hal" }
 boot_info = { path = "crates/boot_info" }
 bootcfg = { path = "crates/bootcfg" }
 arch = { path = "crates/arch" }

@@ -136,6 +136,10 @@ impl SyscallError {
             IommuError::NotSupported
             | IommuError::IommuNotPresent
             | IommuError::RemappingDisabled => SyscallError::NotSupported,
+            // v0.15: IommuError живёт в kernel-hal и объявлен
+            // non_exhaustive — через границу крейта новый вариант не
+            // должен ломать ABI сисколлов: переводим в Internal.
+            _ => SyscallError::Internal,
         }
     }
 }

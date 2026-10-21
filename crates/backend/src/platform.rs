@@ -10,8 +10,8 @@ use alloc::vec::Vec;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use pkg_generic_interface::hal::traits::kmap::{IsolationPolicy, KernelRegion};
-use pkg_generic_interface::hal::traits::mmap::{MMAPMemoryFlags, MemErrorCode, VirtualADDR};
+use kernel_hal::traits::kmap::{IsolationPolicy, KernelRegion};
+use kernel_hal::traits::mmap::{MMAPMemoryFlags, MemErrorCode, VirtualADDR};
 use pkg_generic_interface::syscall::debug::DebugSink;
 use pkg_generic_interface::syscall::system::TimeSource;
 

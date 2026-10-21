@@ -17,6 +17,7 @@ test = false
 
 [dependencies]
 pkg_generic_interface = { workspace = true }
+kernel_hal = { workspace = true }
 arch = { workspace = true }
 boot_info = { workspace = true }
 startup = { path = "../startup" }

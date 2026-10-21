@@ -19,12 +19,12 @@ use llfree::{Alloc, Class, Request, TREE_ORDER};
 use xmas_elf::ElfFile;
 use xmas_elf::program::Type;
 
-use pkg_generic_interface::GCTL;
-use pkg_generic_interface::hal::traits::asid::ASIDInterface;
-use pkg_generic_interface::hal::traits::kmap::KMAPInterface;
-use pkg_generic_interface::hal::traits::mmap::{
+use kernel_hal::traits::asid::ASIDInterface;
+use kernel_hal::traits::kmap::KMAPInterface;
+use kernel_hal::traits::mmap::{
     MMAPInterface, MMAPMemoryFlags, MemErrorCode, PhysADDR, VirtualADDR,
 };
+use pkg_generic_interface::GCTL;
 use pkg_generic_interface::mem::{ARCPool, Arc, FacadeBox, MemoryManager};
 use pkg_generic_interface::task::TaskId;
 

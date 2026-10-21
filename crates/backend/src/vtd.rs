@@ -43,10 +43,8 @@ use intel_iommu::irte::{DeliveryMode, Irte, SourceQualifier, SourceValidationTyp
 use intel_iommu::qi::{Granularity, QiCc, QiDesc, QiIec, QiIotlb, QiWait};
 use intel_iommu::regs::{self, Cap, Ecap, Gcmd, Gsts, Irta, Version};
 
-use pkg_generic_interface::hal::traits::iommu::{
-    ANIOMMUInterface, DeviceId, IommuError, LIOMMUInterface,
-};
-use pkg_generic_interface::hal::types::{Bdf, DevicePath, IommuProt};
+use kernel_hal::traits::iommu::{ANIOMMUInterface, DeviceId, IommuError, LIOMMUInterface};
+use kernel_hal::types::{Bdf, DevicePath, IommuProt};
 use pkg_generic_interface::syscall::iommu::IommuService;
 
 use crate::iommu::{Mmio, free_page, zero_page};
@@ -961,15 +959,15 @@ impl VtdDriver {
 }
 
 impl ANIOMMUInterface for VtdDriver {
-    fn iommu_id(&self) -> pkg_generic_interface::hal::traits::iommu::IommuId {
-        pkg_generic_interface::hal::traits::iommu::IommuId(self.id)
+    fn iommu_id(&self) -> kernel_hal::traits::iommu::IommuId {
+        kernel_hal::traits::iommu::IommuId(self.id)
     }
 
     fn map_pages(
         &mut self,
         dev: DeviceId,
         iova: u64,
-        phys: pkg_generic_interface::hal::types::PhysAddr,
+        phys: kernel_hal::types::PhysAddr,
         count: usize,
         prot: IommuProt,
     ) -> Result<(), IommuError> {

@@ -3,7 +3,7 @@ use core::{alloc::Layout, ptr::NonNull};
 use alloc::alloc::{alloc_zeroed, dealloc};
 use bitflags::bitflags;
 
-use crate::hal::{
+use crate::{
     traits::iommu::IommuError,
     types::{DeviceInfo, PAGE_SIZE, PhysAddr},
 };

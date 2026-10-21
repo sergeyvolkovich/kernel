@@ -45,11 +45,9 @@ static GLOBAL_ALLOC: pkg_generic_interface::mem::gallocator::KernelAllocator =
 
 use llfree::Alloc;
 
-use pkg_generic_interface::hal::traits::asid::{
-    ASIDInterface, AddressSpaceMode, AsidPair, FlushMode, TlbOp,
-};
-use pkg_generic_interface::hal::traits::kmap::{KMAPInterface, KernelRegion, KernelRegionKind};
-use pkg_generic_interface::hal::traits::mmap::{
+use kernel_hal::traits::asid::{ASIDInterface, AddressSpaceMode, AsidPair, FlushMode, TlbOp};
+use kernel_hal::traits::kmap::{KMAPInterface, KernelRegion, KernelRegionKind};
+use kernel_hal::traits::mmap::{
     MMAPInterface, MMAPMemoryFlags, MemErrorCode, PAGE_SIZE, PageInfo, PhysADDR, VirtualADDR,
 };
 use pkg_generic_interface::mem::gallocator;

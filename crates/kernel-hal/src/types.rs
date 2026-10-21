@@ -9,9 +9,9 @@ use core::fmt;
 
 use bitflags::bitflags;
 
-use crate::hal::traits::dma::Direction;
-use crate::hal::traits::iommu::IommuId;
-use crate::hal::traits::irq::MsiSource;
+use crate::traits::dma::Direction;
+use crate::traits::iommu::IommuId;
+use crate::traits::irq::MsiSource;
 
 pub const PAGE_SIZE: usize = 4096;
 

@@ -29,10 +29,10 @@ extern crate alloc;
 use alloc::{boxed::Box, string::String, vec::Vec};
 
 use boot_info::BootInfo;
+use kernel_hal::traits::asid::{ASIDInterface, AddressSpaceMode, FlushMode};
+use kernel_hal::traits::kmap::{IsolationPolicy, KMAPInterface, KernelRegion};
+use kernel_hal::traits::mmap::{MMAPInterface, MemErrorCode, VirtualADDR};
 use pkg_generic_interface::GCTL;
-use pkg_generic_interface::hal::traits::asid::{ASIDInterface, AddressSpaceMode, FlushMode};
-use pkg_generic_interface::hal::traits::kmap::{IsolationPolicy, KMAPInterface, KernelRegion};
-use pkg_generic_interface::hal::traits::mmap::{MMAPInterface, MemErrorCode, VirtualADDR};
 use pkg_generic_interface::syscall::debug::DebugSink;
 use pkg_generic_interface::syscall::system::TimeSource;
 use pkg_generic_interface::syscall::types::{SyscallArgs, SyscallRet};

@@ -87,7 +87,7 @@ use core::cell::UnsafeCell;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-use pkg_generic_interface::hal::traits::kmap::IsolationPolicy;
+use kernel_hal::traits::kmap::IsolationPolicy;
 use pkg_generic_interface::task::scheduler::{
     BlockQueueId, CpuId, SchedulerError, SchedulerInterface,
 };

@@ -74,6 +74,7 @@ dependencies = [
  "boot_info",
  "cc",
  "intel-iommu",
+ "kernel-hal",
  "llfree",
  "pkg_generic_interface",
  "raw-cpuid",
@@ -209,6 +210,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dbf779187422bc7017cd7ab32523a7fd7457b2ba29ff4b204b80fd855c0e51dd"
 
 [[package]]
+name = "kernel-hal"
+version = "0.1.0"
+dependencies = [
+ "aligned_box",
+ "attachable-slab-allocator",
+ "bitflags",
+ "llfree",
+ "thiserror",
+]
+
+[[package]]
 name = "llfree"
 version = "0.2.0"
 source = "git+https://github.com/luhsra/llfree-rs.git#4990fc7c0d6c138da8d1dd899888c8d7acb783a0"
@@ -256,6 +268,7 @@ dependencies = [
  "embedded-qr",
  "heapless",
  "intrusive-collections",
+ "kernel-hal",
  "llfree",
  "spin",
  "talc",
@@ -371,6 +384,7 @@ name = "startup"
 version = "0.5.0"
 dependencies = [
  "boot_info",
+ "kernel-hal",
  "llfree",
  "pkg_generic_interface",
  "spin",

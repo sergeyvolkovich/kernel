@@ -15,7 +15,7 @@
 // единицы AMD (в порядке IVRS; QEMU кладёт 10h/11h одной единицы —
 // дедуп по базе в драйверах). Индексация ENUM — сквозная и стабильна.
 
-use pkg_generic_interface::hal::traits::iommu::IommuError;
+use kernel_hal::traits::iommu::IommuError;
 use pkg_generic_interface::syscall::iommu::{IommuInfo, IommuService};
 
 use crate::amd::AMD0;

@@ -23,7 +23,7 @@
 //    не значит без пары с `IommuId`; пара (`IommuId`, `DeviceId`) глобально
 //    идентифицирует устройство в подсистеме remapping.
 
-use crate::hal::types::{DevicePath, IommuProt, PhysAddr};
+use crate::types::{DevicePath, IommuProt, PhysAddr};
 
 // ==== Идентификаторы ====
 

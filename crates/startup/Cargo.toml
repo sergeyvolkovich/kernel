@@ -6,6 +6,7 @@ description = "ARCH-INDEPENDENT kernel startup sequence: pools -> GCTL -> init E
 
 [dependencies]
 pkg_generic_interface = { workspace = true }
+kernel_hal = { workspace = true }
 boot_info = { workspace = true }
 xmas-elf = { workspace = true }
 llfree = { git = "https://github.com/luhsra/llfree-rs.git" }

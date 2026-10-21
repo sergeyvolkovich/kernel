@@ -17,7 +17,7 @@
 // ской таблице дешевле — нет перезагрузки TLB на границе режимов.
 //
 // Обе стратегии выражаются одной таблицей регионов ядра
-// ([`crate::mem::kmap::KMap`]) и политикой [`IsolationPolicy`]:
+// (KMap ядра) и политикой [`IsolationPolicy`]:
 //   - таблица описывает, ЧТО вообще существует в адресном пространстве ядра;
 //   - политика решает, какая часть таблицы обязана попасть в каждую
 //     пользовательскую таблицу страниц.
@@ -28,7 +28,7 @@
 
 use core::fmt;
 
-use crate::hal::traits::mmap::{MMAPMemoryFlags, MemErrorCode, VirtualADDR};
+use crate::traits::mmap::{MMAPMemoryFlags, MemErrorCode, VirtualADDR};
 
 // ───────────────────────────── Вид региона ─────────────────────────────
 
@@ -117,7 +117,7 @@ impl IsolationPolicy {
     /// разных таблицах, вход/выход syscall и переключение контекста
     /// обязаны переключать таблицы (`ASIDInterface::activate`); при
     /// наличии PCID/ASID — тегированно, без сброса TLB
-    /// (`FlushMode::NoFlush`, пара [`crate::hal::traits::asid::AsidPair`]). `MapFullKernel` — нет:
+    /// (`FlushMode::NoFlush`, пара [`crate::traits::asid::AsidPair`]). `MapFullKernel` — нет:
     /// одна таблица на всё, переключение не нужно (и теги не нужны).
     #[inline]
     pub const fn requires_table_switch(self) -> bool {
@@ -129,7 +129,7 @@ impl IsolationPolicy {
     /// Тавтология `requires_table_switch` с точки зрения семантики, но
     /// разная аудитория: первое читает код гейта/планировщика (когда
     /// переключать), второе — код памяти (чем метить). См.
-    /// [`crate::hal::traits::asid`].
+    /// [`crate::traits::asid`].
     #[inline]
     pub const fn requires_asid_pair(self) -> bool {
         self.requires_table_switch()
@@ -303,8 +303,7 @@ impl KernelRegion {
     /// Размер региона в байтах; `None` при переполнении.
     #[inline]
     pub const fn size_bytes(&self) -> Option<usize> {
-        self.pages_count
-            .checked_mul(crate::hal::traits::mmap::PAGE_SIZE)
+        self.pages_count.checked_mul(crate::traits::mmap::PAGE_SIZE)
     }
 
     /// Первый адрес за регионом; `None` при переполнении.
@@ -345,7 +344,7 @@ impl fmt::Display for KernelRegion {
 /// пользовательскую таблицу страниц.
 ///
 /// Реализуется платформенным кодом ВНЕ крейта (тот же исполнитель, что у
-/// [`crate::hal::traits::mmap::MMAPInterface`]). Контракт реализации:
+/// [`crate::traits::mmap::MMAPInterface`]). Контракт реализации:
 ///
 /// 1. Страницы [`KernelRegionKind::Kernel`] и [`KernelRegionKind::EntryTrampoline`]
 ///    ставятся supervisor-only: пользователь не имеет к ним доступа при
@@ -360,7 +359,7 @@ impl fmt::Display for KernelRegion {
 ///    снятие неотображённого — `Err(NotMapped)`.
 /// 5. Реализация НЕ обязана выделять/освобождать физическую память: регион
 ///    уже существует в ядре, речь только о строках таблиц страниц.
-/// 6. Тегированные бекенды (реализуют [`crate::hal::traits::asid::ASIDInterface`])
+/// 6. Тегированные бекенды (реализуют [`crate::traits::asid::ASIDInterface`])
 ///    ставят строки с учётом назначенной пары тегов (вызов
 ///    `ASIDInterface::assign_asid_pair` фасадом гарантированно ПРОИСХОДИТ
 ///    РАНЬШЕ первого `map_kernel_region` этого фасада) и бита

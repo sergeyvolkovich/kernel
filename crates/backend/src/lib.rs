@@ -1,6 +1,6 @@
 // ==== BACKEND: платформенный крейт x86_64 ====
 //
-// Исполнитель контрактов ядра (`pkg_generic_interface::hal::traits`,
+// Исполнитель контрактов ядра (контракты `kernel-hal`,
 // `task::SchedulerInterface`, `startup::Platform`) на x86_64-железе:
 //
 //   * console  — COM1 (DebugSink + kprint!; SMP-спин лок с v0.6);

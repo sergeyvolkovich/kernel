@@ -7,7 +7,7 @@ use core::fmt;
 use llfree::{FRAME_SIZE, LLFree};
 use thiserror::Error;
 
-use crate::hal::traits::asid::{ASIDError, TlbOp};
+use crate::traits::asid::{ASIDError, TlbOp};
 
 /// Размер страницы в байтах (совпадает с размером фрейма LLFree).
 pub const PAGE_SIZE: usize = FRAME_SIZE;
@@ -304,7 +304,7 @@ pub trait MMAPInterface {
     ///
     /// Переопределяется бекендами с поддержкой PCID/ASID (INVPCID на x86,
     /// TLBI ASID на ARM): только они получают от фасадов пары тегов
-    /// ([`crate::hal::traits::asid::ASIDInterface`]).
+    /// ([`crate::traits::asid::ASIDInterface`]).
     fn invalidate_tlb(&mut self, _op: TlbOp) -> Result<(), MemErrorCode> {
         Err(MemErrorCode::InvalidArgument(
             "backend: tagged TLB invalidation not implemented",

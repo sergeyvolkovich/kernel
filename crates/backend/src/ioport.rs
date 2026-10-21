@@ -5,7 +5,7 @@
 // in/out происходит здесь, в контексте ядра (IOPL пользовательских
 // контекстов = 0: прямых обращений не существует). Ширины 1/2/4 байта.
 
-use pkg_generic_interface::hal::traits::ioport::IoPortOps;
+use kernel_hal::traits::ioport::IoPortOps;
 
 /// Сервис портов x86_64 (единственный экземпляр; ставится в run()).
 pub struct X86Ports;
