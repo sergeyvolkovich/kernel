@@ -120,7 +120,7 @@ pub fn service() -> Option<&'static dyn IommuService> {
 // ───────────────────── Ошибки ─────────────────────
 
 impl SyscallError {
-    fn from_iommu(e: IommuError) -> Self {
+    pub(crate) fn from_iommu(e: IommuError) -> Self {
         // IommuError не в системной таблице errno — переводим в
         // ближайшие значения; расширение таблицы — при появлении
         // реальных драйверов.

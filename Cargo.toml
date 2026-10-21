@@ -11,6 +11,7 @@ members = [
     "crates/init",
     "crates/userlib",
     "crates/rogue",
+    "crates/pie",
 ]
 
 # Хост-сборка (cargo build / cargo test без --target) — только
@@ -28,6 +29,7 @@ default-members = [
     "crates/bootcfg",
     "crates/kernel",
     "crates/arch",
+    "crates/pie",
 ]
 
 # Общие настройки зависимостей для крейтов платформы.
@@ -54,6 +56,10 @@ uefi = "0.41"
 
 # iommu-rs (VT-d / AMD-Vi): форматы таблиц + карта регистров, no_std.
 # Драйвер (MMIO, последовательности включения, QI) — наш бекенд.
+#
+# v0.11: секция [patch] на локальный чекаут УДАЛЕНА — фиксы IVRS
+# BLOCKS_OFFSET (44->48) и DTE IntCtl/IRTE-аксессоры влиты в апстрим
+# sergeyvolkovich/iommu-rs; зависимость идёт прямо из git.
 intel-iommu = { git = "https://github.com/sergeyvolkovich/iommu-rs.git" }
 amd-iommu = { git = "https://github.com/sergeyvolkovich/iommu-rs.git" }
 
@@ -67,10 +73,3 @@ panic = "abort"
 panic = "abort"
 lto = true
 codegen-units = 1
-
-# ВРЕМЕННО (локальная верификация): iommu-rs с фиксом IVRS BLOCKS_OFFSET
-# (44 -> 48); патч для https://github.com/sergeyvolkovich/iommu-rs приложен
-# отдельно — после его применения секцию [patch] удалить.
-[patch."https://github.com/sergeyvolkovich/iommu-rs"]
-amd-iommu = { path = "../../iommu-rs/amd-iommu" }
-intel-iommu = { path = "../../iommu-rs/intel-iommu" }

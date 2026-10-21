@@ -275,6 +275,31 @@ extern "C" fn timer_c(frame: *mut TickFrame) {
     sched::preempt_step(boxed);
 }
 
+// ───────────────────── Внешние линии (v0.11) ─────────────────────
+
+/// Внешнее прерывание IOAPIC (asm: irq_entry_N -> irq_common -> сюда).
+///
+/// Дисциплина BKL: под замком IF=0 — сюда НЕЛЬЗЯ попасть с depth != 0
+/// (контракт klock); пояс безопасности считает потерю (не паника).
+/// EOI сразу (QEMU по TMR-вектору рассылает широковещательный EOI
+/// IOAPIC — remote_irr level-линий гасится эмулятором).
+///
+/// Доставка: BKL -> glue.on_external_irq(gsi) -> IrqRouter -> signal-слово
+/// (= gsi) в endpoint драйвера; склейки/пробуждения — внутренности IPC.
+/// Переключения контекста НЕТ: разбуженный поток подберёт ближайший
+/// sysret/тик (нужен resched-флаг — его ставят пути пробуждения).
+#[unsafe(no_mangle)]
+extern "C" fn irq_c(_frame: *mut TickFrame, gsi: u32) {
+    lapic::eoi();
+    if crate::klock::held() {
+        crate::ioapic::note_dropped();
+        return;
+    }
+    crate::klock::acquire();
+    kernel_glue().on_external_irq(gsi);
+    crate::klock::release();
+}
+
 // ───────────────────── Фолты ─────────────────────
 
 /// Фрейм фолта: 15 GPR + [err] + CPU-фрейм.
@@ -311,6 +336,34 @@ extern "C" fn fault_c(frame: *mut FaultFrame, vec: u8) -> ! {
 
     if (f.cs & 3) != 3 {
         // Фолт в ядре — баг ядра: паника (стек/таблицы могли умереть).
+        // Диагностика (v0.11) — ДО паники: вектор/ошибка/CR2/RIP/RSP и ВСЕ
+        // GPR фрейма — баг-репорт без этих слов бесполезен.
+        let addr = cpu::cr2();
+        let msg = alloc::format!(
+            "\r\n[kernel] KERNEL FAULT vec={:#x} err={:#x} cr2={:#x} rip={:#x} rsp={:#x}\r\n\
+             [kernel]   rax={:#x} rcx={:#x} rdx={:#x} rbx={:#x} rbp={:#x} rsi={:#x} rdi={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}\r\n",
+            vec,
+            f.err,
+            addr,
+            f.rip,
+            f.rsp,
+            f.rax,
+            f.rcx,
+            f.rdx,
+            f.rbx,
+            f.rbp,
+            f.rsi,
+            f.rdi,
+            f.r8,
+            f.r9,
+            f.r10,
+            f.r11,
+            f.r12,
+            f.r13,
+            f.r14,
+            f.r15,
+        );
+        crate::console::kprint_str(&msg);
         kpanic("gate: KERNEL FAULT (bug) — see serial log");
     }
 

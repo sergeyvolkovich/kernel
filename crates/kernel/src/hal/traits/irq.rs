@@ -172,3 +172,30 @@ pub trait InterruptRemapper: Send + Sync {
     /// Формирует address и data для конфигурирования MSI/MSI-X в устройстве.
     fn compose_msi(&self, idx: IrteIndex) -> MsiMessage;
 }
+
+// ==== Trait: IrqLineOps (внешние линии, v0.11) ====
+
+/// Включение/выключение ВНЕШНИХ линий прерываний платформы
+/// (x86_64: IOAPIC из MADT; IRQ_ATTACH возводит линию этим сервисом).
+///
+/// Модель L4: драйвер привязывает линию устройства к endpoint'у
+/// (IrqRouter), ядро просит платформу «включить линию» — вектор и
+/// целевой LAPIC выбирает ПЛАТФОРМА (x86_64: `VEC_EXTERNAL_BASE + pin`,
+/// BSP), прерывание приходит в общий asm-вход и доставляется
+/// glue-хуком `on_external_irq` как signal-слово (= gsi) в endpoint.
+///
+/// IOMMU: если IRQ-ремаппинг включён, платформа заводит IRTE под линию
+/// (Intel: remapped-формат RTE по зарезервированному слоту 0x10+pin;
+/// AMD: per-device IntTab IOAPIC, индекс = вектор) — семантика
+/// прозрачна для сискол-слоя.
+pub trait IrqLineOps: Send + Sync {
+    /// Возвести линию GSI (размаскировать + запрограммировать RTE/IRTE).
+    /// Возврат — назначенный вектор (для аудита; доставка — по маске
+    /// векторов платформы). Триггер/полярность — из ресурса устройства;
+    /// платформа сверяет их с Interrupt Source Overrides (MADT).
+    fn enable_line(&self, gsi: u32, level: bool, active_low: bool) -> Result<u8, IommuError>;
+
+    /// Замаскировать линию (IRQ_DETACH: событий больше нет, но конфиг
+    /// линии сохраняется до следующего включения).
+    fn disable_line(&self, gsi: u32) -> Result<(), IommuError>;
+}

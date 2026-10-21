@@ -31,6 +31,7 @@ checksum = "c880a97d28a3681c0267bd29cff89621202715b065127cd445fa0f0fe0aa2880"
 [[package]]
 name = "amd-iommu"
 version = "0.1.0"
+source = "git+https://github.com/sergeyvolkovich/iommu-rs.git#721606e9f6b66a550b49d07e88fa582ed036c114"
 dependencies = [
  "bitflags",
  "log",
@@ -170,10 +171,14 @@ dependencies = [
 [[package]]
 name = "init"
 version = "0.5.0"
+dependencies = [
+ "pie",
+]
 
 [[package]]
 name = "intel-iommu"
 version = "0.1.0"
+source = "git+https://github.com/sergeyvolkovich/iommu-rs.git#721606e9f6b66a550b49d07e88fa582ed036c114"
 dependencies = [
  "bitflags",
  "log",
@@ -227,6 +232,10 @@ dependencies = [
  "bit_field",
  "bitflags",
 ]
+
+[[package]]
+name = "pie"
+version = "0.5.0"
 
 [[package]]
 name = "pkg_generic_interface"

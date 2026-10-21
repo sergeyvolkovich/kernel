@@ -373,10 +373,32 @@ impl SyscallHandler for DeviceMapRegionHandler {
 
 // ==== IRQ-хендлеры: прерывания как сообщения (L4 irq_attach) ====
 
+// ───────────────────── Сервис внешних линий (v0.11) ─────────────────────
+
+use crate::hal::traits::irq::IrqLineOps;
+
+static IRQ_LINES: spin::Once<&'static dyn IrqLineOps> = spin::Once::new();
+
+/// Установка платформенного сервиса внешних линий (x86_64: IOAPIC —
+/// backend ставит в ioapic::init; до установки IRQ_ATTACH работает,
+/// но линия не возводится — события не придут).
+pub fn install_irq_line_service(ops: &'static dyn IrqLineOps) {
+    IRQ_LINES.call_once(|| ops);
+}
+
+/// Установленный сервис (None — платформа без внешних линий).
+fn irq_lines() -> Option<&'static dyn IrqLineOps> {
+    IRQ_LINES.get().copied()
+}
+
 /// Привязка IRQ устройства к notification-endpoint'у.
 ///
 /// ABI: arg1 = хендл DeviceReference, arg2 = gsi,
 /// arg3 = хендл Gate (endpoint с буфером). Возврат: 0.
+///
+/// v0.11: после привязки ядро возводит линию платформой (IOAPIC RTE +
+/// IRTE ремаппинга, если IOMMU IR включён): прерывание становится
+/// signal-сообщением в endpoint. Отказ возведения откатывает привязку.
 pub struct IrqAttachHandler;
 
 impl IrqAttachHandler {
@@ -400,11 +422,46 @@ impl SyscallHandler for IrqAttachHandler {
         };
 
         irq.attach(devices, ctx.task, &path, gsi, *gate_id)?;
+
+        // v0.11: платформа возводит линию. Триггер/полярность — из
+        // ресурса устройства (шину переспрашивать не нужно: ресурс
+        // декодирован перечислителем; MADT ISO в бекенде уточнит).
+        let (level, active_low) = match devices.get_alive(&path) {
+            Some(rec) => {
+                let mut l = false;
+                let mut al = false;
+                for r in rec.resources.iter() {
+                    if let crate::hal::device::traits::DeviceResource::Irq {
+                        gsi: g,
+                        trigger,
+                        active_low: a,
+                    } = r
+                    {
+                        if *g == gsi {
+                            l = matches!(trigger, crate::hal::traits::irq::TriggerMode::Level);
+                            al = *a;
+                        }
+                    }
+                }
+                (l, al)
+            }
+            None => (false, false),
+        };
+        if let Some(ops) = irq_lines() {
+            if let Err(e) = ops.enable_line(gsi, level, active_low) {
+                // Линия не встала — привязка бессмысленна (события
+                // не придут): откат и честный отказ.
+                let _ = irq.detach(gsi, ctx.task);
+                return Err(SyscallError::from_iommu(e));
+            }
+        }
         Ok(0)
     }
 }
 
 /// Снятие привязки (владелец). ABI: arg1 = gsi.
+///
+/// v0.11: привязки нет — линия платформы маскируется.
 pub struct IrqDetachHandler;
 
 impl IrqDetachHandler {
@@ -416,6 +473,9 @@ impl SyscallHandler for IrqDetachHandler {
         let irq: &IrqRouter = ctx.irq.ok_or(SyscallError::NotSupported)?;
         let gsi = args.arg(1) as u32;
         irq.detach(gsi, ctx.task)?;
+        if let Some(ops) = irq_lines() {
+            let _ = ops.disable_line(gsi);
+        }
         Ok(0)
     }
 }

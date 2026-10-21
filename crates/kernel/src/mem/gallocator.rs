@@ -253,9 +253,18 @@ unsafe impl Source for GAlocatorInterface {
     }
 }
 
-#[global_allocator]
-static GLOBAL_ALLOC: TalcLock<Mutex<()>, GAlocatorInterface, DefaultBinning> =
-    TalcLock::new(GAlocatorInterface::new());
+// Тип боевого аллокатора (talc поверх llfree). САМ #[global_allocator]
+// объявляет БЕКЕНД (crates/backend): это связывающий символ образа, а
+// не generic-интерфейса ядра. Host-тесты (наши и зависимых крейтов)
+// без него линкуются аллокатором std — llfree там не поднят (v0.11:
+// до этого cfg(test) не действует на зависимости, и backend-тесты
+// падали на первом же выделении тест-рантайма).
+pub type KernelAllocator = TalcLock<Mutex<()>, GAlocatorInterface, DefaultBinning>;
+
+/// Конструктор боевого аллокатора (const): статик объявляет бекенд.
+pub const fn kernel_allocator() -> KernelAllocator {
+    TalcLock::new(GAlocatorInterface::new())
+}
 
 // ===========================================================================
 // Вспомогательные функции

@@ -258,6 +258,147 @@ global_asm!(
     "1:",
     "hlt",
     "jmp 1b",
+    // ───────────────────── внешние линии IOAPIC (v0.11) ─────────────────────
+    // Процессор НЕ сообщает вектор прерывания: на каждую линию — своя
+    // точка входа (стаб кладёт gsi и уходит в общий кадр). Кадр — как у
+    // тика; обработчик никогда не переключает контекст (только доставка
+    // signal — вытеснение доделает ближайший sysret/тик), поэтому
+    // возврат всегда iretq в прерванного.
+    ".globl irq_entry_0",
+    "irq_entry_0:",
+    "push 0",
+    "jmp irq_common",
+    ".globl irq_entry_1",
+    "irq_entry_1:",
+    "push 1",
+    "jmp irq_common",
+    ".globl irq_entry_2",
+    "irq_entry_2:",
+    "push 2",
+    "jmp irq_common",
+    ".globl irq_entry_3",
+    "irq_entry_3:",
+    "push 3",
+    "jmp irq_common",
+    ".globl irq_entry_4",
+    "irq_entry_4:",
+    "push 4",
+    "jmp irq_common",
+    ".globl irq_entry_5",
+    "irq_entry_5:",
+    "push 5",
+    "jmp irq_common",
+    ".globl irq_entry_6",
+    "irq_entry_6:",
+    "push 6",
+    "jmp irq_common",
+    ".globl irq_entry_7",
+    "irq_entry_7:",
+    "push 7",
+    "jmp irq_common",
+    ".globl irq_entry_8",
+    "irq_entry_8:",
+    "push 8",
+    "jmp irq_common",
+    ".globl irq_entry_9",
+    "irq_entry_9:",
+    "push 9",
+    "jmp irq_common",
+    ".globl irq_entry_10",
+    "irq_entry_10:",
+    "push 10",
+    "jmp irq_common",
+    ".globl irq_entry_11",
+    "irq_entry_11:",
+    "push 11",
+    "jmp irq_common",
+    ".globl irq_entry_12",
+    "irq_entry_12:",
+    "push 12",
+    "jmp irq_common",
+    ".globl irq_entry_13",
+    "irq_entry_13:",
+    "push 13",
+    "jmp irq_common",
+    ".globl irq_entry_14",
+    "irq_entry_14:",
+    "push 14",
+    "jmp irq_common",
+    ".globl irq_entry_15",
+    "irq_entry_15:",
+    "push 15",
+    "jmp irq_common",
+    ".globl irq_entry_16",
+    "irq_entry_16:",
+    "push 16",
+    "jmp irq_common",
+    ".globl irq_entry_17",
+    "irq_entry_17:",
+    "push 17",
+    "jmp irq_common",
+    ".globl irq_entry_18",
+    "irq_entry_18:",
+    "push 18",
+    "jmp irq_common",
+    ".globl irq_entry_19",
+    "irq_entry_19:",
+    "push 19",
+    "jmp irq_common",
+    ".globl irq_entry_20",
+    "irq_entry_20:",
+    "push 20",
+    "jmp irq_common",
+    ".globl irq_entry_21",
+    "irq_entry_21:",
+    "push 21",
+    "jmp irq_common",
+    ".globl irq_entry_22",
+    "irq_entry_22:",
+    "push 22",
+    "jmp irq_common",
+    ".globl irq_entry_23",
+    "irq_entry_23:",
+    "push 23",
+    "jmp irq_common",
+    "irq_common:",
+    "push rax",
+    "push rcx",
+    "push rdx",
+    "push rsi",
+    "push rdi",
+    "push r8",
+    "push r9",
+    "push r10",
+    "push r11",
+    "push rbp",
+    "push rbx",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "mov rdi, rsp",         // кадр (не читается — семантика дока irq_c)
+    "mov rsi, [rsp + 120]", // gsi: слово под 15 регистрами
+    "mov rbx, rsp",         // якорь выравнивания (callee-saved)
+    "and rsp, -16",
+    "call irq_c", // EOI внутри; всегда возвращается
+    "mov rsp, rbx",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop rbx",
+    "pop rbp",
+    "pop r11",
+    "pop r10",
+    "pop r9",
+    "pop r8",
+    "pop rdi",
+    "pop rsi",
+    "pop rdx",
+    "pop rcx",
+    "pop rax",
+    "add rsp, 8", // слово gsi от стаба
+    "iretq",
     // ───────────────────────── вход в пользователя ─────────────────────────
     // enter_user(ctx: *mut UserCtx) -> !  (iretq-фрейм; порядок загрузки
     // GPR свободен — rsp/rax восстанавливает iretq)
@@ -309,6 +450,61 @@ unsafe extern "C" {
     pub fn ipi_shoot_entry();
     /// IPI halt (VEC_IPI_HALT; не возвращается).
     pub fn ipi_halt_entry();
+    /// Внешние линии IOAPIC (v0.11): по одной точке на GSI 0..=23
+    /// (VEC_EXTERNAL_BASE + N); стаб кладёт N и уходит в irq_common.
+    pub fn irq_entry_0();
+    pub fn irq_entry_1();
+    pub fn irq_entry_2();
+    pub fn irq_entry_3();
+    pub fn irq_entry_4();
+    pub fn irq_entry_5();
+    pub fn irq_entry_6();
+    pub fn irq_entry_7();
+    pub fn irq_entry_8();
+    pub fn irq_entry_9();
+    pub fn irq_entry_10();
+    pub fn irq_entry_11();
+    pub fn irq_entry_12();
+    pub fn irq_entry_13();
+    pub fn irq_entry_14();
+    pub fn irq_entry_15();
+    pub fn irq_entry_16();
+    pub fn irq_entry_17();
+    pub fn irq_entry_18();
+    pub fn irq_entry_19();
+    pub fn irq_entry_20();
+    pub fn irq_entry_21();
+    pub fn irq_entry_22();
+    pub fn irq_entry_23();
     /// Вход в пользователя по контексту (не возвращается).
     pub fn enter_user(ctx: *mut crate::sched::UserCtx) -> !;
 }
+
+/// Таблица входов внешних линий (индекс = GSI относительно базы
+/// контроллера; cpu.rs заполняет IDT по VEC_EXTERNAL_BASE + индекс).
+pub const IRQ_ENTRIES: [unsafe extern "C" fn(); arch::boot::EXTERNAL_GSI_COUNT] = [
+    irq_entry_0,
+    irq_entry_1,
+    irq_entry_2,
+    irq_entry_3,
+    irq_entry_4,
+    irq_entry_5,
+    irq_entry_6,
+    irq_entry_7,
+    irq_entry_8,
+    irq_entry_9,
+    irq_entry_10,
+    irq_entry_11,
+    irq_entry_12,
+    irq_entry_13,
+    irq_entry_14,
+    irq_entry_15,
+    irq_entry_16,
+    irq_entry_17,
+    irq_entry_18,
+    irq_entry_19,
+    irq_entry_20,
+    irq_entry_21,
+    irq_entry_22,
+    irq_entry_23,
+];

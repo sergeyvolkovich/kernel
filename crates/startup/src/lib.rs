@@ -75,6 +75,17 @@ pub trait Platform: Sync {
     /// Тип адресного пространства пользователя бекенда.
     type Mmap: MMAPInterface + KMAPInterface + ASIDInterface + 'static;
 
+    /// Легаси-шина платформы (v0.11): фиксированные устройства, которые
+    /// не обходит PCI/ACPI-перечислитель (x86_64: ISA — COM1/PIT).
+    /// kinit регистриует её в реестре устройств и выдаёт init'у
+    /// DeviceReference на всё найденное — root-сервер устройств.
+    /// None — у платформы нет легаси-устройств.
+    fn legacy_bus(
+        &self,
+    ) -> Option<&'static dyn pkg_generic_interface::hal::device::traits::BusEnumerator> {
+        None
+    }
+
     /// Ранняя консоль (побайтово; до установки DebugSink).
     fn console_write(&self, s: &str);
 
@@ -209,6 +220,17 @@ pub trait KernelGlue: Send + Sync {
     /// доменов (вызывает бекенд планировщика под BKL; потоки из
     /// троттл-листа в готовность возвращает сам бекенд).
     fn on_cpu_period(&self) {}
+
+    /// v0.11, внешние линии: событие на линии GSI (IOAPIC; бекенд — из
+    /// обработчика прерываний под BKL). Ядро доставляет его драйверу —
+    /// signal-слово в endpoint привязки (IrqRouter). Возврат `true` —
+    /// событие учтено (линия привязана), `false` — линии нет (spurious).
+    ///
+    /// Дефолт — `false` (платформа без внешних линий работает как
+    /// раньше: IRQ_ATTACH не возводит линию).
+    fn on_external_irq(&self, _gsi: u32) -> bool {
+        false
+    }
 }
 
 static GLUE: spin::Once<&'static dyn KernelGlue> = spin::Once::new();
@@ -464,6 +486,23 @@ impl<MMAP: MMAPInterface + KMAPInterface + ASIDInterface + 'static> KernelGlue f
     fn on_cpu_period(&self) {
         self.gctl.task_manager().on_cpu_period();
     }
+
+    /// v0.11: событие внешней линии (IOAPIC) — IrqRouter кладёт
+    /// signal-слово (= gsi) в endpoint привязки. ok(true) — линия
+    /// привязана; Ok(false) — spurious (событий больше не будет);
+    /// Err — роутер в непригодном состоянии (аудит драйвера бекенда).
+    fn on_external_irq(&self, gsi: u32) -> bool {
+        let router = self.gctl.irq_router();
+        matches!(
+            router.irq_event(
+                self.gctl.task_manager(),
+                self.gctl.capability_manager(),
+                self.gctl.ipc_manager(),
+                gsi
+            ),
+            Ok(true)
+        )
+    }
 }
 
 // ───────────────────────────── Идентификаторы init ─────────────────────────────
@@ -583,6 +622,57 @@ pub fn kinit<P: Platform + 'static>(bi: &BootInfo, platform: &'static P) -> ! {
                 platform,
                 &alloc::format!("kinit: FATAL init IommuAdmin grant: {e:?}\r\n"),
             );
+        }
+
+        // 8.3 Легаси-шина платформы (v0.11): фиксированные устройства
+        // (x86_64: ISA COM1/PIT) — реестр + DeviceReference init'у на
+        // каждое живое: init — root-сервер устройств (claim/IRQ/
+        // IOMMU-гейты у него уже есть; порождённые песочницы грантов НЕ
+        // получают — права не протекают вниз по дереву задач).
+        if let Some(bus) = platform.legacy_bus() {
+            if let Err(e) = gctl.device_manager_mut().register_bus(bus) {
+                fatal(
+                    platform,
+                    &alloc::format!("kinit: FATAL legacy bus register: {e:?}\r\n"),
+                );
+            }
+            match gctl.device_manager_mut().enumerate() {
+                Ok(report) => {
+                    let dm = gctl.device_manager();
+                    let mut granted = 0usize;
+                    for rec in dm.records().iter() {
+                        if !rec.functional || dm.get_alive(&rec.path).is_none() {
+                            continue;
+                        }
+                        let _ = dm.export_capability(
+                            gctl.task_manager(),
+                            gctl.capability_manager(),
+                            init_task,
+                            &rec.path,
+                            ActionPermissions::all(),
+                            CapabilityBadge::FULL,
+                        );
+                        granted += 1;
+                    }
+                    log(
+                        platform,
+                        &alloc::format!(
+                            "kinit: legacy bus \"{}\": {} discovered, {} granted to init\r\n",
+                            bus.bus_name(),
+                            report.discovered,
+                            granted
+                        ),
+                    );
+                }
+                Err(e) => {
+                    // Шина опциональна: отказ перечисления — НЕ фатален
+                    // (устройств не будет, демо честно пропустится).
+                    log(
+                        platform,
+                        &alloc::format!("kinit: legacy bus enumerate failed: {e:?}\r\n"),
+                    );
+                }
+            }
         }
     }
 

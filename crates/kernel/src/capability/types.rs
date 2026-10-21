@@ -202,6 +202,21 @@ pub enum ContainerACCCapability {
     IommuAdmin,
 }
 
+impl ContainerACCCapability {
+    /// Слово-вид для аудита дерева деривации (no_std без fmt::Debug в
+    /// консоли): 1=DeviceReference, 2=TaskTCB, 3=Gate, 4=Irq,
+    /// 5=IommuAdmin (v0.11).
+    pub fn kind_word(&self) -> u64 {
+        match self {
+            ContainerACCCapability::DeviceReference { .. } => 1,
+            ContainerACCCapability::TaskTCB { .. } => 2,
+            ContainerACCCapability::Gate { .. } => 3,
+            ContainerACCCapability::Irq { .. } => 4,
+            ContainerACCCapability::IommuAdmin => 5,
+        }
+    }
+}
+
 /// Состояние IPC-endpoint'а: буфер сообщений + очереди блокировки.
 ///
 /// Живёт в `GateObj` (таблица гейтов [`crate::capability::CapabilityManager`]);

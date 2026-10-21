@@ -33,6 +33,9 @@ const CMD_PING: u64 = 1;
 const CMD_ATTACK: u64 = 2;
 const CMD_READY: u64 = 0x5259; // "RY"
 const REPORT_MAGIC: u64 = 0xB10C;
+/// v0.11: доказательство релокации — [PIE_MAGIC, SELF_PTRS[0]] сразу
+/// после READY: значение патченного .data-указателя (загрузчик init).
+const PIE_MAGIC: u64 = 0x1E11;
 
 // errno-ожидания атак (Linux-конвенция ядра): -1 EPERM (capability-
 // модель), -122 EDQUOT (квоты GTCB), -9 EBADF (угаданный хендл).
@@ -86,6 +89,22 @@ extern "C" fn flood_worker() -> ! {
         let _ = userlib::l4_thread_yield();
     }
 }
+
+// ───────────────────── PIE-верификация (v0.11) ─────────────────────
+
+/// Адреса в .data: линкер описывает их R_X86_64_RELATIVE; загрузчик
+/// init патчит под выбранную базу инстанса. Значение [0] отправляется
+/// родителю (PIE_PTR) и печатается — по нему видно, ГДЕ образ живёт.
+/// (Обёртка: fn-item кастится в `*const ()` (advice компилятора), а
+/// Sync мы объявляем сами — по адресам никто не зовёт, только читает.)
+pub struct FnPtr(pub *const ());
+unsafe impl Sync for FnPtr {}
+
+pub static SELF_PTRS: [FnPtr; 3] = [
+    FnPtr(flood_worker as *const ()),
+    FnPtr(main as *const ()),
+    FnPtr(puts as *const ()),
+];
 
 // ───────────────────────── main ─────────────────────────
 
@@ -149,8 +168,15 @@ pub extern "C" fn main(argc: i32, _argv: *const *const i8) -> i32 {
             }
         }
 
-        // 5. READY родителю (fast-path по его tid).
+        // 5. READY родителю (fast-path по его tid) + PIE_PTR: значение
+        //    статического указателя ПОСЛЕ релокации (v0.11) — родитель
+        //    сверит его с базой, на которую нас положил. Read_volatile
+        //    обязателен: без него LTO «вшивает» массив адресов в lea и
+        //    релокаций в образе нет — а с ним .data обязан существовать.
+        let self_ptr = unsafe { core::ptr::read_volatile(&SELF_PTRS[0]) }.0 as u64;
         let _ = userlib::l4_ipc_send_thread(parent_tid as u64, 0, CMD_READY as u64, ports, 2);
+        let _ = userlib::l4_ipc_send_thread(parent_tid as u64, 0, PIE_MAGIC as u64, self_ptr, 2);
+        put_hex("rogue: self .data ptr (relocated) = ", self_ptr as i64);
         puts("rogue: ready; awaiting ping-pong");
 
         // 6. PING x3: родитель шлёт [PING, round] — отвечаем [round, crc].

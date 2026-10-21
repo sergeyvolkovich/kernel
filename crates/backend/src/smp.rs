@@ -280,6 +280,166 @@ pub fn madt_cpus(madt: &[u8]) -> Result<CpuList, AcpiError> {
     Ok(out)
 }
 
+// ───────────────────── Топология внешних прерываний (v0.11) ─────────────────────
+//
+// Для IOAPIC-драйвера нужны записи MADT двух типов:
+//   * тип 1 «I/O APIC»: [type][len][id][rsvd][phys u32][gsi_base u32];
+//   * тип 2 «Interrupt Source Override»: [type][len][bus][source][gsi u32]
+//     [flags u16] — маппинг ISA-IRQ -> GSI (QEMU: IRQ0 -> GSI2 и
+//     триггер/полярность по ELCR), без неё линия ISA N приходит на GSI N
+//     с EISA-дефолтами (edge/active-high).
+// Flags ISO (ACPI): биты 1:0 — полярность (00=спека шины/01=высокий/
+// 10=резерв/11=низкий), биты 3:2 — триггер (00=спека шины/01=edge/10=
+// резерв/11=level); для ISA спека шины = active-high + edge.
+
+/// Максимум IOAPIC-контроллеров в системе (больше одного — мульти-PCIe-сегмент).
+pub const MAX_IOAPICS: usize = 2;
+/// Максимум записей Interrupt Source Override (ISA-линии 0..15 + HPET).
+pub const MAX_ISOS: usize = 16;
+
+/// Запись MADT типа 1: контроллер IOAPIC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IoApicEntry {
+    /// Идентификатор IOAPIC (ACPI id; QEMU q35: 0).
+    pub id: u8,
+    /// Физический адрес MMIO-регистров (q35: 0xFEC0_0000).
+    pub phys: u64,
+    /// Базовый GSI линий этого контроллера (первый блок — 0).
+    pub gsi_base: u32,
+}
+
+/// Запись MADT типа 2: переназначение ISA-источника.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IsoEntry {
+    /// Шина источника (0 = ISA).
+    pub bus: u8,
+    /// ISA IRQ источника.
+    pub src_irq: u8,
+    /// Глобальный GSI, на который он реально приходит.
+    pub gsi: u32,
+    /// Level-triggered (иначе edge).
+    pub level: bool,
+    /// Активный низкий (иначе высокий).
+    pub active_low: bool,
+}
+
+/// Топология внешних линий из MADT (slice-based, host-тестируемый).
+#[derive(Clone, Copy, Debug)]
+pub struct IrqTopology {
+    pub ioapics: [Option<IoApicEntry>; MAX_IOAPICS],
+    pub n_ioapics: usize,
+    pub isos: [Option<IsoEntry>; MAX_ISOS],
+    pub n_isos: usize,
+}
+
+impl IrqTopology {
+    fn empty() -> Self {
+        Self {
+            ioapics: [None; MAX_IOAPICS],
+            n_ioapics: 0,
+            isos: [None; MAX_ISOS],
+            n_isos: 0,
+        }
+    }
+
+    /// ISA-IRQ -> (gsi, level, active_low). Без ISO — identity c
+    /// EISA-дефолтами (edge/высокий); с ISO — переадресация и флаги.
+    pub fn legacy(&self, isa_irq: u8) -> (u32, bool, bool) {
+        for iso in self.isos[..self.n_isos].iter().flatten() {
+            if iso.bus == 0 && iso.src_irq == isa_irq {
+                return (iso.gsi, iso.level, iso.active_low);
+            }
+        }
+        (isa_irq as u32, false, false)
+    }
+
+    /// Параметры линии по GSI: если это ISA-источник (есть ISO с этим
+    /// GSI) — вернуть флаги ISO, иначе — как задал вызывающий (PCI INTx
+    /// триггер объявляет драйвер/шина).
+    pub fn line_flags(&self, gsi: u32, level: bool, active_low: bool) -> (bool, bool) {
+        for iso in self.isos[..self.n_isos].iter().flatten() {
+            if iso.gsi == gsi {
+                return (iso.level, iso.active_low);
+            }
+        }
+        (level, active_low)
+    }
+}
+
+/// Разобрать записи IOAPIC/ISO из MADT (тот же формат входа, что и
+/// [`madt_cpus`]; host-тестируемый, без кучи).
+pub fn madt_irq_topology(madt: &[u8]) -> Result<IrqTopology, AcpiError> {
+    if madt.len() < 44 {
+        return Err(AcpiError::Truncated);
+    }
+    if &madt[0..4] != b"APIC" {
+        return Err(AcpiError::NotFound);
+    }
+    let len = table_len(&madt[0..8])?;
+    if madt.len() < len {
+        return Err(AcpiError::Truncated);
+    }
+    let mut out = IrqTopology::empty();
+    let mut off = 44;
+    while off + 2 <= len {
+        let etype = madt[off];
+        let elen = madt[off + 1] as usize;
+        if elen < 2 || off + elen > len {
+            return Err(AcpiError::Truncated);
+        }
+        // Тип 1 = I/O APIC: [type][len][id][rsvd][phys u32][gsi_base u32].
+        if etype == 1 && elen >= 12 && out.n_ioapics < MAX_IOAPICS {
+            out.ioapics[out.n_ioapics] = Some(IoApicEntry {
+                id: madt[off + 2],
+                phys: u32::from_le_bytes([
+                    madt[off + 4],
+                    madt[off + 5],
+                    madt[off + 6],
+                    madt[off + 7],
+                ]) as u64,
+                gsi_base: u32::from_le_bytes([
+                    madt[off + 8],
+                    madt[off + 9],
+                    madt[off + 10],
+                    madt[off + 11],
+                ]),
+            });
+            out.n_ioapics += 1;
+        }
+        // Тип 2 = ISO: [type][len][bus][source][gsi u32][flags u16].
+        if etype == 2 && elen >= 10 && out.n_isos < MAX_ISOS {
+            let flags = u16::from_le_bytes([madt[off + 8], madt[off + 9]]);
+            out.isos[out.n_isos] = Some(IsoEntry {
+                bus: madt[off + 2],
+                src_irq: madt[off + 3],
+                gsi: u32::from_le_bytes([
+                    madt[off + 4],
+                    madt[off + 5],
+                    madt[off + 6],
+                    madt[off + 7],
+                ]),
+                // Полярность: 11b = активный низкий; 00/01 = высокий.
+                active_low: flags & 0x3 == 0x3,
+                // Триггер: 11b = level; 00/01 = edge.
+                level: (flags >> 2) & 0x3 == 0x3,
+            });
+            out.n_isos += 1;
+        }
+        off += elen;
+    }
+    Ok(out)
+}
+
+/// Топология внешних линий текущей машины (MADT bring_up; None — без
+/// MADT/IOAPIC-записей: драйвер не поднимется, IRQ_ATTACH будет
+/// возвращать отказ возведения).
+static IRQ_TOPO: spin::Once<IrqTopology> = spin::Once::new();
+
+/// Доступ к разобранной топологии (после bring_up).
+pub fn irq_topology() -> Option<&'static IrqTopology> {
+    IRQ_TOPO.get()
+}
+
 // ───────────────────── Трамплин (position-fixed блоб) ─────────────────────
 
 // Секции .tramp16/.tramp32/.tramp64/.trampgdt собираются линкером в
@@ -548,6 +708,14 @@ pub fn bring_up(bi: &boot_info::BootInfo) {
                 }
                 Err(e) => crate::kprintln!("smp: MADT parse failed: {:?} — single CPU", e),
             }
+            // v0.11: топология внешних линий (IOAPIC + ISO) — тем же
+            // проходом MADT; поднимет её драйвер ioapic::init позже.
+            match madt_irq_topology(phys_slice(madt_phys, len)) {
+                Ok(topo) => {
+                    let _ = IRQ_TOPO.call_once(|| topo);
+                }
+                Err(e) => crate::kprintln!("smp: MADT irq-topology parse failed: {:?}", e),
+            }
         }
         Err(e) => crate::kprintln!("smp: MADT not found ({:?}) — single CPU", e),
     }
@@ -771,17 +939,23 @@ pub fn halt_others() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Бекенд — no_std; тесты на хосте линкуют std явно (Vec/vec! для
+    // сборки синтетических ACPI-таблиц).
+    extern crate std;
+    use std::vec::Vec;
 
     /// Сборка ACPI-заголовка (36 байт): сигнатура + длина + нули.
     fn hdr(sig: &[u8; 4], len: usize) -> Vec<u8> {
-        let mut v = vec![0u8; 36];
+        let mut v = Vec::new();
+        v.resize(36, 0);
         v[0..4].copy_from_slice(&sig[..]);
         v[4..8].copy_from_slice(&(len as u32).to_le_bytes());
         v
     }
 
     fn rsdp(rev: u8, rsdt: u32, xsdt: u64) -> Vec<u8> {
-        let mut v = vec![0u8; 36];
+        let mut v: Vec<u8> = Vec::new();
+        v.resize(36, 0);
         v[0..8].copy_from_slice(b"RSD PTR ");
         v[8] = 0; // checksum (тесты не проверяют)
         v[9] = rev;
@@ -803,7 +977,8 @@ mod tests {
     #[test]
     fn find_table_via_rsdt() {
         // Память: RSDP@0x100 -> RSDT@0x200 -> MADT@0x300, DMAR@0x400.
-        let mut mem = vec![0u8; 0x1000];
+        let mut mem: Vec<u8> = Vec::new();
+        mem.resize(0x1000, 0);
         mem[0x100..0x100 + 36].copy_from_slice(&rsdp(1, 0x200, 0));
         let mut rsdt = hdr(b"RSDT", 36 + 8);
         rsdt.extend_from_slice(&0x300u32.to_le_bytes());
@@ -815,15 +990,16 @@ mod tests {
         mem[0x400..0x400 + dmar.len()].copy_from_slice(&dmar);
 
         let r = reader(&mem);
-        assert_eq!(find_table(0x100, b"APIC", r), Ok((0x300, 44)));
-        assert_eq!(find_table(0x100, b"DMAR", r), Ok((0x400, 36)));
-        assert_eq!(find_table(0x100, b"HPET", r), Err(AcpiError::NotFound));
-        assert_eq!(find_table(0x500, b"APIC", r), Err(AcpiError::BadRsdp));
+        assert_eq!(find_table(0x100, b"APIC", &r), Ok((0x300, 44)));
+        assert_eq!(find_table(0x100, b"DMAR", &r), Ok((0x400, 36)));
+        assert_eq!(find_table(0x100, b"HPET", &r), Err(AcpiError::NotFound));
+        assert_eq!(find_table(0x500, b"APIC", &r), Err(AcpiError::BadRsdp));
     }
 
     #[test]
     fn find_table_prefers_xsdt() {
-        let mut mem = vec![0u8; 0x1000];
+        let mut mem: Vec<u8> = Vec::new();
+        mem.resize(0x1000, 0);
         // rev 2 + валидный XSDT — RSDT-поле обязано игнорироваться.
         mem[0x100..0x100 + 36].copy_from_slice(&rsdp(2, 0xDEAD, 0x200));
         let mut xsdt = hdr(b"XSDT", 36 + 8);
@@ -864,10 +1040,73 @@ mod tests {
                 online_capable: false
             })
         );
-        assert!(list.cpus[1].is_none()); // lapic 0 dup? нет: lapic 0 и 2 и 3 — уникальны
+        // Три записи (lapic 0/2/3 — уникальны; disabled тоже занимает
+        // слот: enabled/online_capable — атрибуты, а не фильтр).
         assert_eq!(list.cpus[1].unwrap().lapic_id, 2);
         assert_eq!(list.cpus[2].unwrap().lapic_id, 3);
         assert!(!list.cpus[2].unwrap().enabled);
+    }
+
+    #[test]
+    fn madt_irq_topology_parse() {
+        // Мини-мадт: IOAPIC(тип 1) + ISO(тип 2) — как их кладёт QEMU q35
+        // (IRQ0 -> GSI2 edge/high; COM1 IRQ4 -> GSI4 edge/high;
+        // лин-триггерная ISA-линия 11 -> GSI11 level/low).
+        let mut madt = hdr(b"APIC", 44);
+        madt.extend_from_slice(&0xFEE00000u32.to_le_bytes()); // lapic addr
+        madt.extend_from_slice(&0u32.to_le_bytes()); // flags
+        // I/O APIC: id=0, phys=FEC00000, gsi_base=0.
+        madt.extend_from_slice(&[0x01, 12, 0x00, 0x00]);
+        madt.extend_from_slice(&0xFEC0_0000u32.to_le_bytes());
+        madt.extend_from_slice(&0u32.to_le_bytes());
+        // ISO: bus 0, IRQ0 -> GSI2, flags 0 (edge/high).
+        madt.extend_from_slice(&[0x02, 10, 0x00, 0x00]);
+        madt.extend_from_slice(&2u32.to_le_bytes());
+        madt.extend_from_slice(&0u16.to_le_bytes());
+        // ISO: bus 0, IRQ11 -> GSI11, flags 0xF (level/low — биты 1:0=11,
+        // 3:2=11).
+        madt.extend_from_slice(&[0x02, 10, 0x00, 0x0B]);
+        madt.extend_from_slice(&11u32.to_le_bytes());
+        madt.extend_from_slice(&0xFu16.to_le_bytes());
+        let len = madt.len();
+        madt[4..8].copy_from_slice(&(len as u32).to_le_bytes());
+
+        let topo = madt_irq_topology(&madt).expect("topo");
+        assert_eq!(topo.n_ioapics, 1);
+        assert_eq!(
+            topo.ioapics[0],
+            Some(IoApicEntry {
+                id: 0,
+                phys: 0xFEC0_0000,
+                gsi_base: 0
+            })
+        );
+        assert_eq!(topo.n_isos, 2);
+        // Переадресация ISA0 -> GSI2 с дефолтами.
+        assert_eq!(topo.legacy(0), (2, false, false));
+        // Level/low из ISO (ELCR-класс ISA).
+        assert_eq!(topo.legacy(11), (11, true, true));
+        // Без ISO — identity, edge/high.
+        assert_eq!(topo.legacy(4), (4, false, false));
+        // line_flags по GSI: ISO-флаги каноничнее аргументов драйвера.
+        assert_eq!(topo.line_flags(11, false, false), (true, true));
+        assert_eq!(topo.line_flags(16, true, false), (true, false));
+    }
+
+    #[test]
+    fn madt_irq_topology_rejects_garbage() {
+        assert!(madt_irq_topology(&[0u8; 44]).is_err());
+        let mut madt = hdr(b"APIC", 46);
+        madt.extend_from_slice(&0xFEE00000u32.to_le_bytes());
+        madt.extend_from_slice(&0u32.to_le_bytes());
+        // Обрезанная запись IOAPIC (elen=12, доступно 4 байта).
+        madt.extend_from_slice(&[0x01, 12, 0x00, 0x00]);
+        let len = madt.len() as u32;
+        madt[4..8].copy_from_slice(&len.to_le_bytes());
+        assert!(matches!(
+            madt_irq_topology(&madt),
+            Err(AcpiError::Truncated)
+        ));
     }
 
     #[test]
@@ -893,6 +1132,6 @@ mod tests {
         madt.extend_from_slice(&[0x00, 16, 0, 0]); // len=16, но данных нет
         let len = madt.len();
         madt[4..8].copy_from_slice(&(len as u32).to_le_bytes());
-        assert_eq!(madt_cpus(&madt), Err(AcpiError::Truncated));
+        assert!(matches!(madt_cpus(&madt), Err(AcpiError::Truncated)));
     }
 }

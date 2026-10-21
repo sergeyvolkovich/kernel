@@ -76,7 +76,13 @@ const IOVA_LIMIT: u64 = 1 << 48;
 const INV_ALL_ADDR: u64 = 0x000f_ffff_ffff_f000;
 /// Размер v1 huge-листа (лист уровня 2, NextLevel=0).
 const V1_HUGEP: u64 = 512 * 4096;
-/// Записей IRTE в per-device таблице (IntTabLen=4 → 2^4 = 16 × 16 байт).
+/// QEMU-инвариант: sb-devid «устройства IOAPIC» для ремаппинга линий
+/// (hw/i386/amd_iommu.h: AMDVI_IOAPIC_SB_DEVID = PCI_BUILD_BDF(0, 0x14<<3));
+/// спека AMD берёт его из IVHD-special 48h (variety 01h) — что QEMU и
+/// кладёт. Дефолт — на случай записи без special.
+const IOAPIC_SB_DEVID: u16 = 0x00A0;
+/// Записей IRTE в per-device таблице устройств (IntTabLen=4 → 2^4 = 16,
+/// базовый 32-битный формат — 64 байта).
 const IRTE_PER_DEV: usize = 16;
 
 // ───────────────────── v1-таблицы (4 уровня, NextLevel) ─────────────────────
@@ -204,6 +210,13 @@ pub struct AmdVi {
     /// IntTabPtr/IntCtl=10b (v1 IRTE — базовая архитектура, гейт только
     /// успешность attach с такими DTE на данном железе/эмуляторе).
     ir_enabled: bool,
+    /// v0.11: DeviceID «устройства IOAPIC» — через его DTE IOMMU ремапит
+    /// линии (QEMU кладёт в IVHD-special 00:14.0 — AMDVI_IOAPIC_SB_DEVID;
+    /// спека — handle записи 48h, variety 01h).
+    ioapic_devid: u16,
+    /// v0.11: IntTab «устройства IOAPIC» (ленивая страница; индекс в ней —
+    /// ВЕКТОР линии, QEMU читает по (data & 0x7ff) << 2).
+    ioapic_irq_phys: u64,
     /// v0.8: v1-листья уровня 2 (huge 2 МиБ) — спека v1: размер листа
     /// задаётся уровнем (NextLevel=0 на уровне 2).
     huge_ok: bool,
@@ -370,10 +383,12 @@ impl AmdVi {
         );
 
         // Покрытие: device-записи IVHD (Select/Range/Alias; All = сегмент).
-        // Special (IOAPIC/HPET) и ACPI-HID — не DMA-агенты, пропускаем.
+        // ACPI-HID — не DMA-агент; Special 48h — тоже, НО запись IOAPIC
+        // (variety 01h) — исключение для ремаппинга линий (v0.11).
         let mut coverage = Vec::new();
         let mut coverage_all = false;
         let mut range_start: Option<u16> = None;
+        let mut ioapic_devid: Option<u16> = None;
         for dev in ivhd.devices() {
             match dev {
                 DeviceEntry::Short {
@@ -409,10 +424,41 @@ impl AmdVi {
                     device_id,
                     ..
                 } => range_start = Some(device_id),
-                // Special (48h)/ACPI-HID (F0h)/Unknown — не DMA-агенты.
+                // Special 48h: IOAPIC (variety 01h) — его DeviceID идёт в
+                // DTE-ремаппинг линий; HPET (02h) и прочие — мимо.
+                //
+                // DevID спец-записи — байт 5 (payload[1], спека: биты
+                // 47:40), НЕ DevIDa-поле байтов 1..3 — оно для 48h
+                // зарезервировано (общий device_id-аксессор крейта читает
+                // ровно его — для спец-записей это 0). QEMU кладёт сюда
+                // AMDVI_IOAPIC_SB_DEVID (acpi-build.c: IOAPIC_SB_DEVID =
+                // BDF(0, 00:14.0) = 0x00A0), и тот же devid подставляет
+                // в RUNTIME-запросе ремаппинга линий (amd_iommu.c: sid =
+                // AMDVI_IOAPIC_SB_DEVID при неспецифицированном attrs).
+                // Прошлая версия читала DevIDa → devid=0 → QEMU находил
+                // IR-off в DTE[0xA0] и ПРОПУСКАЛ линию мимо IRTE
+                // (беззвучный passthrough — ремаппинг не упражнялся).
+                DeviceEntry::Long {
+                    ty: DeviceType::Special,
+                    payload,
+                    ..
+                } => {
+                    // payload = байты 4..8 записи: [handle][devid lo][devid
+                    // hi][variety]. Variety 01h — IOAPIC.
+                    if payload[3] == 1 {
+                        ioapic_devid = Some(u16::from_le_bytes([payload[1], payload[2]]));
+                    }
+                }
+                // ACPI-HID (F0h)/Unknown — не DMA-агенты.
                 _ => {}
             }
         }
+        if let Some(d) = ioapic_devid {
+            crate::kprintln!("amdvi: IVHD special: IOAPIC devid={:#06x}", d);
+        }
+        // Дефолт — инвариант QEMU (AMDVI_IOAPIC_SB_DEVID = 00:14.0): без
+        // записи 48h линии ремапятся «от него» (hw/i386/amd_iommu.h).
+        let ioapic_devid = ioapic_devid.unwrap_or(IOAPIC_SB_DEVID);
         crate::kprintln!(
             "amdvi: IVHD coverage: all={} entries={}",
             coverage_all,
@@ -496,6 +542,8 @@ impl AmdVi {
             next_domid: 1,
             next_dev: 1,
             ir_enabled: true,
+            ioapic_devid,
+            ioapic_irq_phys: 0,
             huge_ok: true,
         };
         // Чистый старт кэшей (глобальная инвалидация) + первый sync.
@@ -791,19 +839,22 @@ impl AmdVi {
 
     // ==== IRQ-ремаппинг (v0.8) ====
 
-    /// Записать 128-битную v1-IRTE по индексу per-device таблицы.
+    /// Записать БАЗОВУЮ (32-битную) v1-IRTE по индексу per-device таблицы.
+    ///
+    /// Спека (amd-iommu/irte.rs, table 20) и QEMU (amdvi_get_irte: читает
+    /// слово по смещению `(data & 0x7ff) << 2`) — запись таблицы имеет
+    /// stride 4 байта, не 16. Баг v0.8: запись шла с 16-байтным шагом
+    /// (скан занятости читал по правильному) — не проявлялся, пока
+    /// доставка прерываний ЧЕРЕЗ IRTE не упражнялась; исправлено в v0.11
+    /// перед первым реальным прогоном (IOAPIC).
     fn write_irte(&self, irq_phys: u64, idx: usize, irte: Option<Irte>) {
-        let words = match irte {
-            Some(i) => i.words(),
-            None => [0u32; 4],
+        let word = match irte {
+            Some(i) => i.words()[0],
+            None => 0,
         };
-        // SAFETY: IRTE-таблица — наша страница, 16 байт на запись.
+        // SAFETY: IRTE-таблица — наша страница, 4 байта на запись.
         unsafe {
-            let p = phys_ptr::<u32>(irq_phys).add(idx * 4);
-            p.write_volatile(words[0]);
-            p.add(1).write_volatile(words[1]);
-            p.add(2).write_volatile(words[2]);
-            p.add(3).write_volatile(words[3]);
+            phys_ptr::<u32>(irq_phys).add(idx).write_volatile(word);
         }
     }
 
@@ -824,8 +875,7 @@ impl AmdVi {
         let mut idx = None;
         for i in 1..IRTE_PER_DEV {
             // SAFETY: IRTE-таблица — наша страница.
-            let used =
-                unsafe { phys_ptr::<u32>(bind.irq_phys).add(i * 4).read_volatile() & 1 != 0 };
+            let used = unsafe { phys_ptr::<u32>(bind.irq_phys).add(i).read_volatile() & 1 != 0 };
             if !used {
                 idx = Some(i);
                 break;
@@ -871,7 +921,7 @@ impl AmdVi {
             return Err(IommuError::InvalidConfig);
         }
         // SAFETY: IRTE-таблица — наша страница.
-        let used = unsafe { phys_ptr::<u32>(bind.irq_phys).add(idx * 4).read_volatile() & 1 != 0 };
+        let used = unsafe { phys_ptr::<u32>(bind.irq_phys).add(idx).read_volatile() & 1 != 0 };
         if !used {
             return Err(IommuError::InvalidConfig);
         }
@@ -880,6 +930,72 @@ impl AmdVi {
             device_id: bind.devid,
         }));
         self.cmd_sync()
+    }
+
+    // ==== IOAPIC-ремаппинг линий (v0.11) ====
+
+    /// Лениво возвести DTE «устройства IOAPIC»: IV=1 + IntTabLen=7
+    /// (128 базовых 32-битных записей — до вектора 0x7F) + IntCtl=10b
+    /// (remap). IOAPIC — не DMA-агент: поля трансляции не заполняются.
+    fn ioapic_inttab_setup(&mut self) -> Result<u64, IommuError> {
+        if self.ioapic_irq_phys != 0 {
+            return Ok(self.ioapic_irq_phys);
+        }
+        let phys = zero_page().ok_or(IommuError::OutOfMemory)?;
+        let dte = DeviceTableEntry::new()
+            .with_valid(true)
+            .with_interrupt_map_valid(true)
+            .with_interrupt_table_len(7)
+            .with_interrupt_table_ptr(phys)
+            .with_int_ctl(2); // IntCtl=10b: remap on
+        self.write_dte(self.ioapic_devid, dte);
+        // Видимость DTE до инвалидации кэша.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.cmd_submit(&Command::InvalidateDevTabEntry(InvalidateDevTabEntry {
+            device_id: self.ioapic_devid,
+        }));
+        self.cmd_sync()?;
+        self.ioapic_irq_phys = phys;
+        crate::kprintln!(
+            "amdvi: ioapic inttab devid={:#06x} phys={:#x} entries=128",
+            self.ioapic_devid,
+            phys
+        );
+        Ok(phys)
+    }
+
+    /// IRTE линии IOAPIC: индекс = ВЕКТОР (QEMU: `(data & 0x7ff) << 2` от
+    /// сообщения линии; спека: IntTab «устройства IOAPIC», базовый формат).
+    /// Триггер/полярность линия несёт в обычном формате RTE — тут только
+    /// вектор/назначение.
+    fn ioapic_irte(&mut self, vector: u8, dest: u8) -> Result<(), IommuError> {
+        if !self.ir_enabled {
+            return Err(IommuError::RemappingDisabled);
+        }
+        if !(0x10..=0x7F).contains(&vector) {
+            return Err(IommuError::InvalidConfig);
+        }
+        let irq_phys = self.ioapic_inttab_setup()?;
+        let irte = Irte::new()
+            .with_remap_enable(true)
+            .with_int_type(IntType::Fixed)
+            .with_destination_mode(false)
+            .with_destination(dest)
+            .with_vector(vector);
+        self.write_irte(irq_phys, vector as usize, Some(irte));
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        // IRCache — INVALIDATE_INTERRUPT_TABLE устройства-IOAPIC + sync.
+        self.cmd_submit(&Command::InvalidateInterruptTable(InvalidateDevTabEntry {
+            device_id: self.ioapic_devid,
+        }));
+        self.cmd_sync()?;
+        crate::kprintln!(
+            "amdvi: ioapic irte devid={:#06x} vec={:#x} dst={:#x}",
+            self.ioapic_devid,
+            vector,
+            dest
+        );
+        Ok(())
     }
 }
 
@@ -1256,4 +1372,23 @@ pub fn try_init() -> bool {
     // конкурентов нет).
     AMD0.mark_ready();
     true
+}
+
+// ───────────────────── IOAPIC-поверхность драйвера (v0.11) ─────────────────────
+
+/// Завести IRTE для линии IOAPIC (единый интерфейс для ioapic.rs; единица
+/// 0 — QEMU amd-iommu один, линия ремапится первым контроллером).
+pub fn ioapic_irte(vector: u8, dest: u8) -> Result<(), IommuError> {
+    let mut g = AMD0.inner.lock();
+    match g.get_mut(0) {
+        Some(v) => v.ioapic_irte(vector, dest),
+        None => Err(IommuError::IommuNotPresent),
+    }
+}
+
+/// IRQ-ремаппинг включён хоть на одной единице AMD (ioapic.rs выбирает
+/// вендора ремаппинга; Intel приоритетнее — remapped-RTE формат).
+pub fn irq_remap_enabled() -> bool {
+    let g = AMD0.inner.lock();
+    g.first().is_some_and(|v| v.ir_enabled)
 }

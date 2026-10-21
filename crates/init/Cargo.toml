@@ -8,3 +8,7 @@ description = "Init server: first user task (static ELF @ 0x40000000) — receiv
 name = "init"
 path = "src/main.rs"
 
+
+[dependencies]
+# v0.11: PIE-загрузчик спавна: разбор образа rogue (ET_DYN + RELATIVE).
+pie = { path = "../pie" }

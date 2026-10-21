@@ -11,6 +11,9 @@ path = "src/lib.rs"
 [[bin]]
 name = "kernel"
 path = "src/bin/kernel.rs"
+# Host-тесты бинаря не собираются (наш panic_impl против тест-рантайма
+# std); lib-тесты (парсеры MADT/ACPI) гоняются как обычно.
+test = false
 
 [dependencies]
 pkg_generic_interface = { workspace = true }

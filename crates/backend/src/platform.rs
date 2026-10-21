@@ -84,6 +84,12 @@ impl X86Platform {
 }
 
 impl startup::Platform for X86Platform {
+    fn legacy_bus(
+        &self,
+    ) -> Option<&'static dyn pkg_generic_interface::hal::device::traits::BusEnumerator> {
+        // v0.11: ISA q35 — COM1/PIT (линии — GSI через MADT-ISO).
+        Some(crate::ioapic::legacy_isa_bus())
+    }
     type Mmap = UserTables;
 
     fn console_write(&self, s: &str) {
@@ -185,6 +191,10 @@ impl startup::Platform for X86Platform {
             // IOMMU (Intel VT-d / AMD-Vi): DMAR/IVRS -> драйверы + сервис
             // сисколов (агрегатор). До release_aps — конкуренции нет.
             crate::iommu::init_and_install();
+            // IOAPIC (v0.11): MADT-топология -> контроллер + сервис
+            // внешних линий (IRQ_ATTACH возводит линии). После IOMMU —
+            // IRTE-ремаппинг линий видит включённый IR.
+            crate::ioapic::init();
         }
         if startup::glue().is_some() {
             // APы из парковки в планировщик (resched-IPI будит hlt).

@@ -2600,4 +2600,106 @@ mod tests {
         assert_eq!(msg.word(5), 2);
         assert_eq!(msg.payload(), Some(&[0xAAAA, 0xBBBB][..]));
     }
+
+    /// Репродукция v0.11-сценария «два инстанса → два reap → выход init»:
+    /// kinit-гранты (TaskTCB(себя), IommuAdmin, 2× DeviceReference), на
+    /// каждый инстанс — EP_CREATE + TaskTCB(ребёнка) + CAP_MINT(port и
+    /// TCB → ребёнку), гибель ребёнка по контракту reaper'а
+    /// (revoke_all → destroy), затем выход init (revoke_all(4 корней +
+    /// 4 инстансных корня)). На v0.11-прогоне QEMU этот сценарий ловил
+    /// KERNEL FAULT в CapabilityManager::revoke_node (children-голова
+    /// указывала на уже отвязанный узел — UNLINKED_MARKER=1 в
+    /// intrusive-collections): тест обязан проходить с активными
+    /// debug-ассертами дерева деривации.
+    #[test]
+    fn two_instance_spawn_reap_cycle_then_init_revoke_all() {
+        use crate::capability::{ActionPermissions, CapabilityBadge, CapabilityGate, MintSpec};
+        use crate::hal::types::{AcpiPath, DevicePath};
+
+        let tasks: &'static TcbManager = Box::leak(Box::new(TcbManager::new().unwrap()));
+        let caps: &'static CapabilityManager =
+            Box::leak(Box::new(CapabilityManager::new().unwrap()));
+
+        // init (права от kinit): TaskTCB(себя) + IommuAdmin + 2× DeviceReference.
+        let init = uuid_next();
+        tasks.create(init, TaskPriority::DEFAULT).unwrap();
+        grant_tcb(caps, tasks, init, init);
+        caps.grant(
+            tasks,
+            init,
+            CapabilityGate::new(
+                ContainerACCCapability::IommuAdmin,
+                ActionPermissions::all(),
+                CapabilityBadge::FULL,
+            ),
+        )
+        .unwrap();
+        for path in ["\\_SB.COM1", "\\_SB.PIT0"] {
+            caps.grant(
+                tasks,
+                init,
+                CapabilityGate::new(
+                    ContainerACCCapability::DeviceReference {
+                        dev_path: DevicePath::Acpi(AcpiPath::new(path)),
+                    },
+                    ActionPermissions::all(),
+                    CapabilityBadge::FULL,
+                ),
+            )
+            .unwrap();
+        }
+
+        // Два инстанса ПОДРЯД (v0.11: один и тот же образ, разные базы —
+        // для дерева деривации важно: свои гейты/TCB-гранты на каждый).
+        for _inst in 0..2 {
+            let child = uuid_next();
+            tasks.create(child, TaskPriority::DEFAULT).unwrap();
+
+            // Демо spawn-сервера: EP_CREATE + TaskTCB(ребёнка) у init.
+            let gate = caps
+                .create_gate(tasks, init, ActionPermissions::all(), CapabilityBadge::FULL)
+                .unwrap();
+            let tcb_child = grant_tcb(caps, tasks, init, child);
+
+            // CAP_MINT порта и TCB ребёнку (своя кухня + fast-path ответов).
+            caps.mint(tasks, init, gate, child, &MintSpec::UNCHANGED)
+                .unwrap();
+            caps.mint(tasks, init, tcb_child, child, &MintSpec::UNCHANGED)
+                .unwrap();
+
+            // Гибель ребёнка — контракт Glue::reap_thread: домен Dead,
+            // затем revoke_all → destroy («revoke_all -> destroy»).
+            tasks.set_state(&child, TaskState::Dead).unwrap();
+            let child_report = caps.revoke_all(tasks, child).unwrap();
+            assert_eq!(child_report.revoked_slots, 2, "порт + TCB у ребёнка");
+            // Инвариант 2 БЕЗ призраков (v0.11-баг): отвязка производной
+            // от списка родителя обязна работать и в release — иначе в
+            // children остаётся freed-слот, и повторное использование
+            // адреса (второй инстанс) даёт KERNEL FAULT в intrusive-unlink.
+            assert_eq!(
+                caps.child_count_of(tasks, init, gate).unwrap(),
+                0,
+                "гейт {}: дети-призраки после отзыва",
+                _inst
+            );
+            assert_eq!(
+                caps.child_count_of(tasks, init, tcb_child).unwrap(),
+                0,
+                "tcb {}: дети-призраки после отзыва",
+                _inst
+            );
+            tasks.destroy(child).unwrap();
+        }
+
+        // Выход init: домен Dead (TASK_EXIT), затем revoke_all корней:
+        // 1×TaskTCB(self), IommuAdmin, 2×DeviceReference, 2×gate,
+        // 2×TaskTCB(child) = 8.
+        tasks.set_state(&init, TaskState::Dead).unwrap();
+        let report = caps.revoke_all(tasks, init).unwrap();
+        assert_eq!(
+            report.revoked_slots, 8,
+            "корни init: tcb-self, iommu, 2 dev, 2 gates, 2 tcb-child"
+        );
+        tasks.destroy(init).unwrap();
+    }
 }

@@ -153,6 +153,15 @@ pub const VEC_IPI_SHOOTDOWN: u8 = 0x22;
 pub const VEC_IPI_HALT: u8 = 0x23;
 /// Spurious-прерывание LAPIC (без EOI; вектор из SVR).
 pub const VEC_SPURIOUS: u8 = 0xFF;
+/// v0.11, IOAPIC: база векторов внешних линий прерываний.
+///
+/// GSI-линия `pin` IOAPIC входит по вектору `VEC_EXTERNAL_BASE + pin`
+/// (24 линии q35 -> 0x40..0x57; тик 0x20, IPI 0x21..0x23 — не пересекаются).
+/// Каждый вектор — своя asm-точка входа (процессор номер не сообщает):
+/// стабы irq_entry_N кладут pin на стек и уходят в общий кадр (ctxswitch).
+pub const VEC_EXTERNAL_BASE: u8 = 0x40;
+/// Число поддерживаемых внешних линий (q35 ICH9: 24 GSI).
+pub const EXTERNAL_GSI_COUNT: usize = 24;
 /// Частота тика планировщика, Гц (10 мс квант).
 pub const SCHED_HZ: u64 = 100;
 

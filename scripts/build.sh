@@ -38,12 +38,20 @@ echo "== [2/6] userlib (C-ABI staticlib+rlib) =="
 cargo build -p userlib --target x86_64-unknown-none $R
 USERLIB=$OUT/x86_64-unknown-none/release/libuserlib.a
 
-echo "== [3/6] rogue (дочерний образ песочницы v0.9, ELF @ 0x40000000) =="
-cargo build -p rogue --target x86_64-unknown-none $R
-# Абсолютный путь: build-скрипт init'а исполняется с CWD=crates/init —
-# относительный target/... оттуда не виден, и при standalone-пересборке
-# init демо-песочницы молча получали пустой child.bin (баг v0.9).
-ROGUE=$WS/$OUT/x86_64-unknown-none/release/rogue
+echo "== [3/6] rogue (дочерний образ песочницы v0.11: static-PIE, ET_DYN + RELA) =="
+# PIE-режим (v0.11): rust-lld --pie — ET_DYN с базой ~0 и
+# R_X86_64_RELATIVE в .rela.dyn; init при спавне накатывает релокации
+# под выбранную базу (крейт crates/pie). RUSTFLAGS задаёт PIC-модель
+# ВСЕМ крейтам этой сборки (единый LTO-мир с userlib); CARGO_TARGET_DIR
+# отдельный — не смешивать PIC-объекты с host/legacy-артефактами.
+# Легаси-статический режим (отладка загрузчика): ROGUE_PIE= ./build.sh.
+ROGUE_PIE=1 RUSTFLAGS="-C relocation-model=pic" CARGO_TARGET_DIR="$OUT/pic" \
+    cargo build -p rogue --target x86_64-unknown-none $R
+ROGUE=$WS/$OUT/pic/x86_64-unknown-none/release/rogue
+# Контроль типа: ET_DYN обязателен — спавн на выборных базах.
+readelf -h "$ROGUE" | grep -q "DYN (Position-Independent" \
+    || { echo "FATAL: rogue is not static-PIE (ET_DYN)"; exit 1; }
+echo "rogue PIE relocs: $(readelf -rW "$ROGUE" | grep -c R_X86_64_RELATIVE)"
 
 echo "== [4/6] init (static user ELF @ 0x40000000; вшитый образ rogue) =="
 # ROGUE_ELF: build-скрипт init копирует бинарь rogue в OUT_DIR/child.bin,

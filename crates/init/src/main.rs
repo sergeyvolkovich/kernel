@@ -422,41 +422,43 @@ unsafe fn smp_stress(cpu_count: u64) {
     }
 }
 
-// ==== S4 (v0.9): ПЕСОЧНИЦА — спавн rogue-домена из встроенного образа ====
+// ==== S4 (v0.9→v0.11): ПЕСОЧНИЦА + PIE-СПАВН ====
 //
 // Порядок (спавн-сервер в юзерспейсе, L4):
-//   1. Разбор залинкованного ELF64 rogue (вшит байтами ниже): точка
-//      входа + PT_LOAD-план (линк-адреса — фиксированные, 0x40000000).
-//   2. Подготовка ПАМЯТИ РОДИТЕЛЕМ (к этому моменту всё аллоцировано
-//      юзерспейсом): по региону MEM_ALLOC на сегмент (+ копия байтов),
-//      стек (16 стр), argv-блок, дескриптор спавна. Ядро потом
-//      принимает ТОЛЬКО указатели — данные не пересылаются, кадры
-//      мапятся в ребёнка как external-окна (L4 pager-модель: собственник
-//      — init до самого конца).
-//   3. TASK_SPAWN_IMAGE: домен + пространство + ПЕСОЧНИЦА (лимиты
+//   1. Разбор образа rogue (вшит байтами ниже) — крейт pie: точка входа,
+//      PT_LOAD-план и (v0.11) таблица R_X86_64_RELATIVE из PT_DYNAMIC.
+//   2. Подготовка ПАМЯТИ РОДИТЕЛЕМ: по региону MEM_ALLOC на сегмент
+//      (+ копия байтов), стек (16 стр), argv-блок, дескриптор спавна.
+//   3. v0.11, PIE: выбор БАЗЫ инстанса — образ линкуется ET_DYN; init
+//      накатывает релокации в свои staging-копии (store: линк-адрес X ->
+//      base + X), контрольный readback каждой записи, и лишь потом
+//      отдаёт ядру УЖЕ залинкованный образ (контракт v0.9: ядро знает
+//      про ELF ровно ничего — только указатели).
+//   4. TASK_SPAWN_IMAGE: домен + пространство + ПЕСОЧНИЦА (лимиты
 //      применяются ДО первого потока) + главный поток + стартовое IPC
 //      [argc, argv] — атомарно. Возврат — хендл TaskTCB(ребёнка).
-//   4. Порты: EP_CREATE(ёмкость 4) у init; CAP_SEND(порт -> ребёнок) +
-//      CAP_MINT(TaskTCB(ребёнка) -> ребёнок): у rogue появляется
-//      ровно два права — порт родителя и своя кухня.
-//   5. GO -> ребёнку (IPC_SEND_THREAD, fast-path): [cmd, parent_tid].
-//   6. Обмен: READY -> PING x3 (эхо + контрольная сумма) -> ATTACK.
-//   7. Отчёт rogue [REPORT_MAGIC, blocked] -> exit-уведомление на
-//      порт init (TASK_SET_EXIT_EP ребёнка) -> MEM_FREE всех
-//      staging-регионов -> вердикт.
+//   5. Порты: EP_CREATE(ёмкость 4) у init; CAP_SEND нет — CAP_MINT
+//      (порт -> ребёнок) + CAP_MINT(TaskTCB(ребёнка) -> ребёнок).
+//   6. GO -> ребёнку (IPC_SEND_THREAD, fast-path): [cmd, parent_tid].
+//   7. Обмен: READY (+ PIE_PTR: значение статического указателя ребёнка
+//      — сверка с базой) -> PING x3 (эхо + контрольная сумма) -> ATTACK.
+//   8. Отчёт rogue [REPORT_MAGIC, blocked] -> exit-уведомление на порт
+//      init -> MEM_FREE всех staging-регионов -> вердикт инстанса.
+//
+// PIE-вердикт: ОДИН И ТОТ ЖЕ образ исполняется на ДВУХ базах
+// (0x40000000 и 0x50000000) с полным протоколом песочницы на каждой.
 
 /// Образ дочерней задачи: байты залинкованного rogue-ELF (вшил
-/// build-скрипт из $ROGUE_ELF; пусто — демо пропускается).
+/// build-скрипт из $ROGUE_ELF; пусто — демо пропускается). Сборка
+/// build.sh линкует rogue как static-pie (ET_DYN + RELATIVE-релоки).
 static CHILD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/child.bin"));
 
 // Геометрия ребёнка — выбор init (всё в дескрипторе; ядро мапит куда
-// сказано). Образ линкуется к 0x40000000; стек/argv — рядом.
-const CHILD_STACK_TOP: u64 = 0x4002_0000;
+// сказано). Для PIE стек/argv кладутся ЗА образом (относительно базы);
+// для статического образа (легаси-режим сборки rogue) база — 0, адреса
+// абсолютные.
 const CHILD_STACK_PAGES: u64 = 16;
-const CHILD_ARGV_DST: u64 = 0x4003_0000;
 const CHILD_ARGV_PAGES: u64 = 1;
-const CHILD_TASK_ID: u128 = 0x2000_0000;
-const CHILD_THREAD_ID: u128 = 0x2000_0001;
 
 // Атрибуты песочницы (GTCB ребёнка): жёсткие, но живые.
 const CHILD_MAX_PAGES_HEADROOM: u64 = 40; // сверх образа+стека+argv
@@ -481,6 +483,9 @@ const CMD_PING: u64 = 1;
 const CMD_ATTACK: u64 = 2;
 const CMD_READY: u64 = 0x5259;
 const REPORT_MAGIC: u64 = 0xB10C;
+/// v0.11: доказательство релокации — ребёнок шлёт ЗНАЧЕНИЕ статического
+/// указателя из своего .data (patched загрузчиком под базу инстанса).
+const PIE_MAGIC: u64 = 0x1E11;
 
 // Дескриптор спавна (ABI syscall::nums::TASK_SPAWN_IMAGE).
 const SPAWN_HDR: usize = 0x70;
@@ -488,91 +493,52 @@ const SPAWN_SEG: usize = 32;
 /// Максимум сегментов в дескрипторе (ядро: SPAWN_MAX_SEGMENTS).
 const SPAWN_SEGS_MAX: usize = 16;
 
-/// PT_LOAD-сегмент залинкованного образа (линк-адреса).
-#[derive(Clone, Copy)]
-struct SegPlan {
-    dst: u64,    // линк-адрес (4K-выровнен)
-    pages: u64,  // страниц (memsz, округлённо вверх)
-    in_seg: u64, // смещение p_vaddr внутри региона
-    offset: u64, // файловое смещение сегмента (p_offset)
-    filesz: u64,
-    flags: u64, // MMAPMemoryFlags (RO/RW/RX)
+/// Конфигурация инстанса ребёнка: где живёт и как представляется.
+struct InstanceCfg {
+    /// База загрузки (PIE). Для статического образа поле игнорируется.
+    base: u64,
+    /// TaskId/ThreadId домена и главного потока (128-бит L4-идентификаторы).
+    task: u128,
+    thread: u128,
+    /// Метка argv (различает инстансы в выводе и протоколе).
+    tag: &'static str,
 }
 
-/// Минимальный разбор ELF64 (только то, что нужно спавну): entry +
-/// PT_LOAD-план. Библиотека не нужна — несколько машинных слов.
-fn elf64_plan(blob: &[u8]) -> Option<(u64, [SegPlan; SPAWN_SEGS_MAX], usize)> {
-    if blob.len() < 64 || &blob[0..4] != b"\x7fELF" {
-        return None;
-    }
-    let r64 = |o: usize| -> u64 {
-        let mut w = [0u8; 8];
-        w.copy_from_slice(&blob[o..o + 8]);
-        u64::from_le_bytes(w)
-    };
-    let r16 = |o: usize| -> u64 {
-        let mut w = [0u8; 2];
-        w.copy_from_slice(&blob[o..o + 2]);
-        u16::from_le_bytes(w) as u64
-    };
-    let r32 = |o: usize| -> u64 {
-        let mut w = [0u8; 4];
-        w.copy_from_slice(&blob[o..o + 4]);
-        u32::from_le_bytes(w) as u64
-    };
-    let entry = r64(0x18);
-    let phoff = r64(0x20) as usize;
-    let phentsize = r16(0x36) as usize;
-    let phnum = r16(0x38) as usize;
-    let mut segs = [SegPlan {
-        dst: 0,
-        pages: 0,
-        in_seg: 0,
-        offset: 0,
-        filesz: 0,
-        flags: 0,
-    }; SPAWN_SEGS_MAX];
-    let mut n = 0usize;
-    for i in 0..phnum {
-        let ph = phoff + i * phentsize;
-        if ph + 0x38 > blob.len() {
-            return None;
-        }
-        if r32(ph) != 1 {
-            continue; // PT_LOAD (p_type — u32, не u64!)
-        }
-        let p_flags = r32(ph + 4) as u8;
-        let offset = r64(ph + 0x08);
-        let vaddr = r64(ph + 0x10);
-        let filesz = r64(ph + 0x20);
-        let memsz = r64(ph + 0x28);
-        if memsz == 0 || n == segs.len() {
-            continue;
-        }
-        let vstart = vaddr & !0xFFF;
-        let vend = (vaddr + memsz + 0xFFF) & !0xFFF;
-        // W^X-перевод (тот же протокол, что у elfload ядра).
-        let flags: u64 = if p_flags & 0x2 != 0 {
-            0b011 // RW
-        } else if p_flags & 0x1 != 0 {
-            0b101 // RX
-        } else {
-            0b001 // RO
-        };
-        segs[n] = SegPlan {
-            dst: vstart,
-            pages: (vend - vstart) / 0x1000,
-            in_seg: vaddr - vstart,
-            offset,
-            filesz,
-            flags,
-        };
-        n += 1;
-    }
-    if entry == 0 || n == 0 {
-        return None;
-    }
-    Some((entry, segs, n))
+/// Два инстанса ОДНОГО образа на разных базах — позиционная
+/// независимость видна и в адресах, и в идентификаторах доменов.
+const INSTANCES: [InstanceCfg; 2] = [
+    InstanceCfg {
+        base: 0x4000_0000,
+        task: 0x2000_0000,
+        thread: 0x2000_0001,
+        tag: "inst=a",
+    },
+    InstanceCfg {
+        base: 0x5000_0000,
+        task: 0x2200_0000,
+        thread: 0x2200_0001,
+        tag: "inst=b",
+    },
+];
+
+/// Итог прогона инстанса (собирается по ходу протокола; без аллокаций).
+struct ChildOutcome {
+    /// Ребёнок доложил READY.
+    ready: bool,
+    /// Значение статического указателя из READY-дополнения (PIE_PTR).
+    self_ptr: u64,
+    /// Указатель совпал с base+addend какой-то релокации образа.
+    self_ptr_verified: bool,
+    /// PING-эхо прошло все 3 раунда.
+    ping_ok: u64,
+    /// Ребёнок прислал отчёт об атаках.
+    reported: bool,
+    /// Число заблокированных попыток выхода/DoS.
+    blocked: u64,
+    /// Чистый exit (tag=1, код 0x5A).
+    clean_exit: bool,
+    /// CPU-квота сработала (был троттлинг).
+    cpu_held: bool,
 }
 
 /// Запись u64 little-endian в свою память (регион MEM_ALLOC).
@@ -582,6 +548,17 @@ unsafe fn put64(buf: *mut u8, off: usize, v: u64) {
         for i in 0..8 {
             buf.add(off + i).write_volatile(b[i]);
         }
+    }
+}
+
+/// Чтение u64 little-endian из своей памяти (readback релокаций).
+unsafe fn read64(buf: *mut u8, off: usize) -> u64 {
+    unsafe {
+        let mut w = [0u8; 8];
+        for i in 0..8 {
+            w[i] = buf.add(off + i).read_volatile();
+        }
+        u64::from_le_bytes(w)
     }
 }
 
@@ -614,67 +591,93 @@ unsafe fn copy_str(dst: *mut u8, s: &[u8]) -> usize {
     }
 }
 
-unsafe fn sandbox_demo() {
+/// Адрес staging-слова для линк-адреса образа (релокации).
+unsafe fn staging_ptr_of(plan: &pie::Plan, srcs: &[u64], vaddr: u64) -> Option<(*mut u8, usize)> {
+    let (i, seg) = plan.seg_of(vaddr)?;
+    let ptr = srcs[i] as *mut u8;
+    Some((ptr, (vaddr - seg.vstart) as usize))
+}
+
+/// Полный прогон одного инстанса: staging (+релоки) -> спавн -> обмен
+/// -> атаки -> exit -> возврат staging пулу. None — фатальный сбой
+/// (диагностика уже напечатана; вердикт S4 соберёт отказ).
+unsafe fn spawn_and_run_child(
+    plan: &pie::Plan,
+    inst: &InstanceCfg,
+    tcb_self: u64,
+) -> Option<ChildOutcome> {
     unsafe {
-        puts("=== init: S4 sandbox demo (spawn from embedded image) ===");
-
-        if CHILD_ELF.is_empty() {
-            puts("init: sandbox: no embedded child image (set ROGUE_ELF at build), skipped");
-            return;
-        }
-        let (entry, segs, n_segs) = match elf64_plan(CHILD_ELF) {
-            Some(v) => v,
-            None => {
-                puts("init: sandbox: embedded image is not a valid ELF64, skipped");
-                return;
-            }
-        };
-        debug_word_line("init: sandbox: child entry = ", entry);
-        debug_word_line("init: sandbox: PT_LOAD segments = ", n_segs as u64);
-
-        // Право творца init: TaskTCB(себя) — от kinit.
-        let tcb_self = match find_tcb_handle() {
-            Some(h) => h,
-            None => {
-                puts("init: sandbox: no creator TCB (kinit grant missing?) — skipped");
-                return;
-            }
-        };
+        let is_pie = plan.kind == pie::ImageKind::Pie;
+        // База: PIE — выбранная; статический образ — 0 (адреса абсолютны).
+        let base = if is_pie { inst.base } else { 0 };
+        let image_end = plan.image_end();
+        // Геометрия за образом: стек и argv (4K-выровнены от базы).
+        let stack_dst = (base + image_end + 0xFFF) & !0xFFF;
+        let stack_top = stack_dst + CHILD_STACK_PAGES * 0x1000;
+        let argv_dst = (stack_top + 0xFFF) & !0xFFF;
+        debug_word_line("init: pie: base          = ", base);
+        debug_word_line("init: pie: image end     = ", base + image_end);
+        debug_word_line("init: pie: entry (link)  = ", plan.entry);
 
         // ---- (2) Подготовка памяти РОДИТЕЛЕМ: сегменты образа ----
-        // Staging-регионы init: их адреса пойдут в дескриптор; после
-        // смерти ребёнка init вернёт страницы пулу (MEM_FREE).
         let mut srcs = [0u64; SPAWN_SEGS_MAX + 2]; // сегменты + стек + argv
         let mut image_pages = 0u64;
+        let n_segs = plan.n_segs;
         for i in 0..n_segs {
-            let seg = segs[i];
+            let seg = plan.segs[i];
             let v = syscall6(SYS_MEM_ALLOC, seg.pages, 0b011, 0, 0, 0, 0);
             if v <= 0 {
-                puts("init: sandbox: staging MEM_ALLOC failed — abort");
-                return;
+                puts("init: pie: staging MEM_ALLOC failed — abort");
+                return None;
             }
             let region = v as u64 as *mut u8;
-            // Нули по memsz-окну, затем файл (BSS-хвост остаётся нулевым).
+            // Нули по всему окну (BSS-хвост чист), затем файл.
             zero(region, 0, seg.pages as usize * 0x1000);
-            let file_end = seg.in_seg as usize + seg.filesz as usize;
-            if seg.filesz > 0
-                && seg.offset + seg.filesz <= CHILD_ELF.len() as u64
-                && file_end <= seg.pages as usize * 0x1000
-            {
-                copy_bytes(
-                    region.add(seg.in_seg as usize),
-                    &CHILD_ELF[seg.offset as usize..(seg.offset + seg.filesz) as usize],
-                );
+            if seg.filesz > 0 {
+                let file_end = seg.in_seg as u64 + seg.filesz;
+                if seg.file_off + file_end <= CHILD_ELF.len() as u64 {
+                    copy_bytes(
+                        region.add(seg.in_seg as usize),
+                        &CHILD_ELF[seg.file_off as usize..(seg.file_off + seg.filesz) as usize],
+                    );
+                }
             }
             srcs[i] = region as u64;
             image_pages += seg.pages;
         }
 
+        // ---- (3) v0.11: РЕЛОКАЦИИ — накат RELATIVE в staging ----
+        // Контракт: ядро получает УЖЕ залинкованный образ; позиционной
+        // независимостью занимается загрузчик (этот код) — как в L4.
+        let mut reloc_ok = !is_pie; // статике накатывать нечего
+        if is_pie {
+            let applied = plan.apply_rela(base, |vaddr, val| {
+                if let Some((ptr, off)) = staging_ptr_of(plan, &srcs, vaddr) {
+                    unsafe { put64(ptr, off, val) };
+                }
+            });
+            // Readback: каждая запись обязана читаться как base+addend.
+            let mut bad = 0u64;
+            for r in &plan.relas[..plan.n_relas] {
+                if let Some((ptr, off)) = staging_ptr_of(plan, &srcs, r.offset) {
+                    let expect = base.wrapping_add(r.addend);
+                    if read64(ptr, off) != expect {
+                        bad += 1;
+                    }
+                } else {
+                    bad += 1;
+                }
+            }
+            debug_word_line("init: pie: relocs applied   = ", applied as u64);
+            debug_word_line("init: pie: relocs bad      = ", bad);
+            reloc_ok = applied == plan.n_relas && bad == 0;
+        }
+
         // ---- Стек ребёнка (16 стр RW, нули) ----
         let stack_v = syscall6(SYS_MEM_ALLOC, CHILD_STACK_PAGES, 0b011, 0, 0, 0, 0);
         if stack_v <= 0 {
-            puts("init: sandbox: stack staging failed — abort");
-            return;
+            puts("init: pie: stack staging failed — abort");
+            return None;
         }
         zero(
             stack_v as u64 as *mut u8,
@@ -682,91 +685,78 @@ unsafe fn sandbox_demo() {
             CHILD_STACK_PAGES as usize * 0x1000,
         );
         srcs[n_segs] = stack_v as u64;
-        let stack_dst = CHILD_STACK_TOP - CHILD_STACK_PAGES * 0x1000;
 
         // ---- argv-блок: [argc][ptr0][ptr1][NULL][pad][asciiz...] ----
         let argv_v = syscall6(SYS_MEM_ALLOC, CHILD_ARGV_PAGES, 0b011, 0, 0, 0, 0);
         if argv_v <= 0 {
-            puts("init: sandbox: argv staging failed — abort");
-            return;
+            puts("init: pie: argv staging failed — abort");
+            return None;
         }
         let argv_region = argv_v as u64 as *mut u8;
         zero(argv_region, 0, CHILD_ARGV_PAGES as usize * 0x1000);
-        // argc = 2; строки со смещения (1+2+2)*8 = 40.
+        // argc = 2 ("rogue" + метка инстанса); строки со смещения 40.
         put64(argv_region, 0, 2);
-        put64(argv_region, 8, CHILD_ARGV_DST + 40);
-        put64(argv_region, 16, CHILD_ARGV_DST + 40 + 6);
+        put64(argv_region, 8, argv_dst + 40);
+        put64(argv_region, 16, argv_dst + 40 + 6);
         put64(argv_region, 24, 0); // NULL
         put64(argv_region, 32, 0); // pad
         let mut off = 40usize;
         off += copy_str(argv_region.add(off), b"rogue");
-        off += copy_str(argv_region.add(off), b"sandbox=v09");
+        off += copy_str(argv_region.add(off), inst.tag.as_bytes());
         let argv_bytes = off;
         srcs[n_segs + 1] = argv_v as u64;
-
-        // ---- «Приманка» для атак: собственный SHM-регион init (id=1) ----
-        // rogue будет пытаться разрушить ЕГО (owner-гейт) и флудить свои.
-        let shm_bait = syscall6(0x61, 1, 0, 0, 0, 0, 0);
-        debug_word_line("init: sandbox: bait shm region id = ", shm_bait as u64);
-        if shm_bait <= 0 {
-            puts("init: sandbox: bait SHM_CREATE failed — attack demo degraded");
-        }
 
         // ---- Дескриптор спавна (свой регион; ядро читает по указателю) ----
         let desc_v = syscall6(SYS_MEM_ALLOC, 1, 0b011, 0, 0, 0, 0);
         if desc_v <= 0 {
-            puts("init: sandbox: desc staging failed — abort");
-            return;
+            puts("init: pie: desc staging failed — abort");
+            return None;
         }
         let desc = desc_v as u64 as *mut u8;
         let total_pages = image_pages + CHILD_STACK_PAGES + CHILD_ARGV_PAGES;
         let max_pages = total_pages + CHILD_MAX_PAGES_HEADROOM;
         zero(desc, 0, 0x1000);
-        put64(desc, 0x00, entry); // entry
-        put64(desc, 0x08, CHILD_STACK_TOP); // stack_top
-        put64(desc, 0x10, CHILD_THREAD_ID as u64); // thread_id lo
-        put64(desc, 0x18, (CHILD_THREAD_ID >> 64) as u64); // hi
+        put64(desc, 0x00, base + plan.entry); // entry ( relocated )
+        put64(desc, 0x08, stack_top); // stack_top
+        put64(desc, 0x10, inst.thread as u64); // thread_id lo
+        put64(desc, 0x18, (inst.thread >> 64) as u64); // hi
         // n_segments = образ + стек; argv — отдельные поля дескриптора.
-        put64(desc, 0x20, (n_segs + 1) as u64 | (CHILD_ARGV_PAGES << 32)); // n_seg | argv_pages
+        put64(desc, 0x20, (n_segs + 1) as u64 | (CHILD_ARGV_PAGES << 32));
         put64(desc, 0x28, argv_v as u64); // argv_src (у родителя)
-        put64(desc, 0x30, CHILD_ARGV_DST); // argv_dst
+        put64(desc, 0x30, argv_dst); // argv_dst (у ребёнка)
         put64(desc, 0x38, argv_bytes as u64);
         put64(desc, 0x40, 2); // argc
         put64(desc, 0x48, max_pages); // limits[0]: max_pages
-        // limits[1]: max_threads | max_endpoints << 32
         put64(desc, 0x50, CHILD_MAX_THREADS | (CHILD_MAX_ENDPOINTS << 32));
-        // limits[2]: max_shm | max_caps << 32
         put64(desc, 0x58, CHILD_MAX_SHM | (CHILD_MAX_CAPS << 32));
-        // limits[3]: max_prio | may_spawn<<8 (0 — гасим право творца)
-        put64(desc, 0x60, CHILD_MAX_PRIO as u64);
+        put64(desc, 0x60, CHILD_MAX_PRIO as u64); // may_spawn = 0
         let b = CHILD_PRIORITY.to_le_bytes();
         for i in 0..b.len() {
             desc.add(0x68 + i).write_volatile(b[i]);
         }
-        // v0.10: CPU-квота ребёнка — u32 @ 0x6C хвоста заголовка. Без
-        // неё yield-флуд воркеров и mem-флуд кружили бы CPU безнаказанно;
-        // с ней домен регулярно уходит в троттлинг до границы периода.
+        // v0.10: CPU-квота ребёнка — u32 @ 0x6C хвоста заголовка.
         let q = CHILD_CPU_QUOTA.to_le_bytes();
         for i in 0..4 {
             desc.add(0x6C + i).write_volatile(q[i]);
         }
-        // Сегменты: образ (по плану) + стек.
+        // Сегменты: образ (dst = base + vstart) + стек.
         for i in 0..n_segs {
-            let base = SPAWN_HDR + i * SPAWN_SEG;
-            put64(desc, base, srcs[i]); // src у родителя
-            put64(desc, base + 8, segs[i].dst); // dst у ребёнка
-            put64(desc, base + 16, segs[i].pages);
-            put64(desc, base + 24, segs[i].flags);
+            let seg = plan.segs[i];
+            let at = SPAWN_HDR + i * SPAWN_SEG;
+            put64(desc, at, srcs[i]); // src у родителя
+            put64(desc, at + 8, base + seg.vstart); // dst у ребёнка
+            put64(desc, at + 16, seg.pages);
+            put64(desc, at + 24, seg.flags);
         }
-        let base = SPAWN_HDR + n_segs * SPAWN_SEG;
-        put64(desc, base, srcs[n_segs]); // src стека
-        put64(desc, base + 8, stack_dst);
-        put64(desc, base + 16, CHILD_STACK_PAGES);
-        put64(desc, base + 24, 0b011); // RW
+        let at = SPAWN_HDR + n_segs * SPAWN_SEG;
+        put64(desc, at, srcs[n_segs]); // src стека
+        put64(desc, at + 8, stack_dst);
+        put64(desc, at + 16, CHILD_STACK_PAGES);
+        put64(desc, at + 24, 0b011); // RW
         let desc_len = SPAWN_HDR + (n_segs + 1) * SPAWN_SEG;
 
-        // ---- (3) СПАВН: ядро принимает только указатели ----
-        let cv = CHILD_TASK_ID;
+        // ---- (4) СПАВН: ядро принимает только указатели ----
+        let cv = inst.task;
         let r = syscall6(
             SYS_TASK_SPAWN_IMAGE,
             tcb_self,
@@ -776,25 +766,22 @@ unsafe fn sandbox_demo() {
             desc_len as u64,
             0,
         );
-        debug_word_line("init: sandbox: spawn_image ret = ", r as u64);
+        debug_word_line("init: pie: spawn_image ret = ", r as u64);
         if r <= 0 {
-            puts("init: sandbox: SPAWN FAILED, aborting demo");
-            return;
+            return None;
         }
         let tcb_child = r as u64;
-        debug_word_line("init: sandbox: child TaskTCB handle = ", tcb_child);
         // v0.10: подтверждение квоты — слово 6 (cpu_quota) сразу после
         // спавна: ребёнок родился в CPU-песочнице (дескриптор, u32 @ 0x6C).
         let qw = syscall6(SYS_TASK_LIMITS_INFO, tcb_child, 6, 0, 0, 0, 0);
-        debug_word_line("init: sandbox: child cpu_quota word = ", qw as u64);
+        debug_word_line("init: pie: child cpu_quota word = ", qw as u64);
 
-        // ---- (4) Порты и права ----
+        // ---- (5) Порты и права ----
         let gate = syscall6(SYS_EP_CREATE, 4, 0, 0, 0, 0, 0);
         if gate <= 0 {
-            puts("init: sandbox: EP_CREATE failed — abort");
-            return;
+            puts("init: pie: EP_CREATE failed — abort");
+            return None;
         }
-        debug_word_line("init: sandbox: my port handle = ", gate as u64);
         // Копия порта родителя -> cspace ребёнка (CAP_MINT, не CAP_SEND:
         // send ПЕРЕДАЁТ хендл и гасит его у источника — init оставляет
         // копию себе для IPC_RECV exit-уведомления).
@@ -807,7 +794,7 @@ unsafe fn sandbox_demo() {
             0xFFFF_FFFF_FFFF_FFFF,
             0,
         );
-        debug_word_line("init: sandbox: cap_mint(port->child) = ", s1 as u64);
+        let _ = s1;
         // Производная TaskTCB(ребёнка) -> ребёнку: «своя кухня» — на ней
         // rogue и покажет, что квоты держат даже хозяина собственного TCB.
         let s2 = syscall6(
@@ -819,11 +806,11 @@ unsafe fn sandbox_demo() {
             0xFFFF_FFFF_FFFF_FFFF,
             0,
         );
-        debug_word_line("init: sandbox: cap_mint(tcb->child) = ", s2 as u64);
+        let _ = s2;
 
-        // ---- (5) GO: ребёнок ждёт в recv_any ----
+        // ---- (6) GO: ребёнок ждёт в recv_any ----
         let self_tid = syscall6(SYS_SELF_INFO, 2, 0, 0, 0, 0, 0);
-        let tv = CHILD_THREAD_ID;
+        let tv = inst.thread;
         let go = syscall6(
             SYS_IPC_SEND_THREAD,
             tv as u64,
@@ -833,20 +820,48 @@ unsafe fn sandbox_demo() {
             2,
             0,
         );
-        debug_word_line("init: sandbox: GO -> ", go as u64);
+        debug_word_line("init: pie: GO -> ", go as u64);
 
-        // ---- (6) Обмен: READY -> PING x3 -> ATTACK ----
-        let mut ready = false;
+        // ---- (7) Обмен: READY + PIE_PTR -> PING x3 -> ATTACK ----
+        let mut out = ChildOutcome {
+            ready: false,
+            self_ptr: 0,
+            self_ptr_verified: false,
+            ping_ok: 0,
+            reported: false,
+            blocked: 0,
+            clean_exit: false,
+            cpu_held: false,
+        };
         if recv_any(0) >= 0 && msg_word(0) as u64 == CMD_READY {
-            ready = true;
-            let ports = msg_word(1) as u64;
-            debug_word_line("init: sandbox: child READY; ports opened = ", ports);
+            out.ready = true;
+            debug_word_line("init: pie: child READY, ports = ", msg_word(1) as u64);
         }
-        if !ready {
-            puts("init: sandbox: child did not report READY, aborting");
-            return;
+        if !out.ready {
+            puts("init: pie: child did not report READY, aborting instance");
+            return Some(out);
         }
-        let mut ping_ok = 0u64;
+        // PIE_PTR: значение статического указателя ребёнка (отправляется
+        // ВСЕГДА — иначе сообщение осталось бы в ящике и сместило бы эхо
+        // PING). Проверка — только в PIE-режиме: значение обязано быть
+        // base + addend одной из релокаций (загрузчик патчил .data).
+        if recv_any(0) >= 0 && msg_word(0) as u64 == PIE_MAGIC {
+            out.self_ptr = msg_word(1) as u64;
+            debug_word_line("init: pie: child self-ptr   = ", out.self_ptr);
+            if is_pie && out.self_ptr >= base && out.self_ptr < base + image_end {
+                for r in &plan.relas[..plan.n_relas] {
+                    if base.wrapping_add(r.addend) == out.self_ptr {
+                        out.self_ptr_verified = true;
+                        break;
+                    }
+                }
+            }
+        }
+        debug_word_line(
+            "init: pie: self-ptr verified = ",
+            out.self_ptr_verified as u64,
+        );
+
         for round in 1..=3u64 {
             let p = syscall6(
                 SYS_IPC_SEND_THREAD,
@@ -865,19 +880,17 @@ unsafe fn sandbox_demo() {
             let crc = msg_word(1) as u64;
             let expect = round.wrapping_mul(31).wrapping_add(7);
             if echo == round && crc == expect {
-                ping_ok += 1;
-                debug_word_line("init: sandbox: info exchange round ok: ", echo);
+                out.ping_ok += 1;
             } else {
-                debug_word_line("init: sandbox: BAD EXCHANGE, echo = ", echo);
+                debug_word_line("init: pie: BAD EXCHANGE, echo = ", echo);
             }
         }
-        debug_word_line("init: sandbox: ping-pong rounds ok = ", ping_ok);
-        if ping_ok != 3 {
-            puts("init: sandbox: ping-pong FAILED, aborting");
-            return;
+        debug_word_line("init: pie: ping-pong rounds ok = ", out.ping_ok);
+        if out.ping_ok != 3 {
+            return Some(out);
         }
 
-        puts("init: sandbox: ordering the attack (child will try to escape)");
+        puts("init: pie: ordering the attack (child will try to escape)");
         let a = syscall6(
             SYS_IPC_SEND_THREAD,
             tv as u64,
@@ -890,44 +903,28 @@ unsafe fn sandbox_demo() {
         let _ = a;
 
         // Отчёт: [REPORT_MAGIC, blocked].
-        let mut blocked = 0u64;
-        let mut reported = false;
         if recv_any(0) >= 0 && msg_word(0) as u64 == REPORT_MAGIC {
-            blocked = msg_word(1) as u64;
-            reported = true;
+            out.blocked = msg_word(1) as u64;
+            out.reported = true;
         }
-        if reported {
-            debug_word_line(
-                "init: sandbox: child report: violations blocked = ",
-                blocked,
-            );
-        } else {
-            puts("init: sandbox: NO REPORT from child (broken protocol)");
+        if !out.reported {
+            puts("init: pie: NO REPORT from child (broken protocol)");
         }
 
-        // ---- (7) Exit-уведомление на порт init (TASK_SET_EXIT_EP ребёнка) ----
-        // ExitPayload-протокол: w0 = tag (1=Exit), w1..2 = task id,
-        // w3 = код выхода (0x5A — «честная сдача» rogue).
+        // ---- (8) Exit-уведомление на порт init (TASK_SET_EXIT_EP) ----
         let exit_tag = syscall6(SYS_IPC_RECV, gate as u64, 0, 0, 0, 0, 0);
-        debug_word_line("init: sandbox: exit notification tag = ", exit_tag as u64);
         let exit_code = msg_word(3);
-        debug_word_line("init: sandbox: child exit code = ", exit_code as u64);
-        // v0.10: CPU-статистика домена в exit-уведомлении (w4/w5) —
-        // вердикт квоты без гонок с reaper'ом (ядро разрушает GTCB до
-        // того, как init успел бы опросить TASK_LIMITS_INFO мёртвого).
         let cpu_used = msg_word(4);
         let throttle_events = msg_word(5);
-        debug_word_line("init: sandbox: child cpu_used (ticks) = ", cpu_used as u64);
+        debug_word_line("init: pie: exit notification tag = ", exit_tag as u64);
+        debug_word_line("init: pie: child exit code = ", exit_code as u64);
+        debug_word_line("init: pie: child cpu_used (ticks) = ", cpu_used as u64);
         debug_word_line(
-            "init: sandbox: child cpu throttle events = ",
+            "init: pie: child cpu throttle events = ",
             throttle_events as u64,
         );
-        let clean_exit = exit_tag == 1 && exit_code == 0x5A;
-        let cpu_held = throttle_events > 0;
-
-        // Приманка отработала: уничтожаем СВОЙ регион (владелец — init).
-        let bait_gone = syscall6(0x65, shm_bait as u64, 0, 0, 0, 0, 0);
-        debug_word_line("init: sandbox: bait shm destroyed = ", bait_gone as u64);
+        out.clean_exit = exit_tag == 1 && exit_code == 0x5A;
+        out.cpu_held = throttle_events > 0;
 
         // Staging-страницы — назад пулу (кадры принадлежали init).
         let mut freed = 0u64;
@@ -940,16 +937,183 @@ unsafe fn sandbox_demo() {
             }
         }
         let _ = syscall6(SYS_MEM_FREE, desc_v as u64, 0, 0, 0, 0, 0);
-        debug_word_line("init: sandbox: staging regions returned = ", freed);
+        debug_word_line("init: pie: staging regions returned = ", freed);
+        out.self_ptr_verified = out.self_ptr_verified && reloc_ok;
+        Some(out)
+    }
+}
+
+/// S4: песочница + PIE. Спавнит ВСТРОЕННЫЙ образ как домен(ы) с полной
+/// песочницей GTCB; PIE-сборка — дважды, на разных базах.
+unsafe fn sandbox_pie_demo() {
+    unsafe {
+        puts("=== init: S4 sandbox + pie spawn demo (embedded image) ===");
+
+        if CHILD_ELF.is_empty() {
+            puts("init: pie: no embedded child image (set ROGUE_ELF at build), skipped");
+            return;
+        }
+        let plan = match pie::Plan::parse(CHILD_ELF) {
+            Ok(p) => p,
+            Err(e) => {
+                puts("init: pie: embedded image rejected by loader (fail-closed)");
+                debug_word_line("init: pie: loader error code = ", e.code());
+                return;
+            }
+        };
+        match plan.kind {
+            pie::ImageKind::Pie => {
+                puts("init: pie: image is ET_DYN — relocatable, spawn at chosen bases")
+            }
+            pie::ImageKind::StaticFixed => {
+                puts("init: pie: image is ET_EXEC (legacy build) — single fixed-base spawn")
+            }
+        }
+        debug_word_line("init: pie: PT_LOAD segments = ", plan.n_segs as u64);
+        debug_word_line("init: pie: RELATIVE relocs = ", plan.n_relas as u64);
+
+        // Право творца init: TaskTCB(себя) — от kinit.
+        let tcb_self = match find_tcb_handle() {
+            Some(h) => h,
+            None => {
+                puts("init: pie: no creator TCB (kinit grant missing?) — skipped");
+                return;
+            }
+        };
+
+        // «Приманка» для атак: собственный SHM-регион init (id — как
+        // выдаст ядро) — оба инстанса будут пытаться разрушить ЧУЖОЙ
+        // регион (owner-гейт); гасим её ПОСЛЕ прогонов сами.
+        let shm_bait = syscall6(0x61, 1, 0, 0, 0, 0, 0);
+        debug_word_line("init: pie: bait shm region id = ", shm_bait as u64);
+
+        // Прогоны: PIE — оба инстанса (разные базы); статический образ —
+        // только первый (второй базе взяться неоткуда: адреса вшиты).
+        let only_first = plan.kind == pie::ImageKind::StaticFixed;
+        let mut verdict_ok = true;
+        for inst in INSTANCES.iter() {
+            puts("init: pie: === instance ===");
+            let outcome = spawn_and_run_child(&plan, inst, tcb_self);
+            let Some(out) = outcome else {
+                verdict_ok = false;
+                continue;
+            };
+            let inst_ok = out.ready
+                && out.ping_ok == 3
+                && out.reported
+                && out.blocked >= 8
+                && out.clean_exit
+                && out.cpu_held;
+            let pie_ok = match plan.kind {
+                pie::ImageKind::Pie => out.self_ptr_verified,
+                pie::ImageKind::StaticFixed => true,
+            };
+            debug_word_line("init: pie: instance verdict = ", inst_ok as u64);
+            verdict_ok &= inst_ok && pie_ok;
+            if only_first {
+                break;
+            }
+        }
+
+        // Приманка отработала: уничтожаем СВОЙ регион (владелец — init).
+        let bait_gone = syscall6(0x65, shm_bait as u64, 0, 0, 0, 0, 0);
+        debug_word_line("init: pie: bait shm destroyed = ", bait_gone as u64);
         // Проверка учёта: TASK_LIMITS_INFO(self): слово 1 = usage pages.
         let usage = syscall6(SYS_TASK_LIMITS_INFO, tcb_self, 1, 0, 0, 0, 0);
-        debug_word_line("init: sandbox: init page usage now = ", usage as u64);
+        debug_word_line("init: pie: init page usage now = ", usage as u64);
 
-        if reported && blocked >= 8 && ping_ok == 3 && clean_exit && cpu_held {
+        if verdict_ok {
             puts("init: sandbox VERDICT: sandbox HELD — all escape/DoS attempts blocked");
             puts("init: sandbox VERDICT: cpu quota HELD — child throttled by GTCB budget");
+            match plan.kind {
+                pie::ImageKind::Pie => {
+                    puts("init: pie VERDICT: PIE spawn OK — same image ran at two different bases")
+                }
+                pie::ImageKind::StaticFixed => {
+                    puts("init: pie VERDICT: static spawn OK (legacy image, single base)")
+                }
+            }
         } else {
             puts("init: sandbox VERDICT: demo finished with anomalies (see above)");
+        }
+    }
+}
+
+// ───────────────────────── S5 (v0.11): внешние линии ─────────────────────────
+
+const SYS_DEVICE_CLAIM: u64 = 0x41;
+const SYS_DEVICE_RELEASE: u64 = 0x42;
+const SYS_IRQ_ATTACH: u64 = 0x46;
+const SYS_IRQ_DETACH: u64 = 0x47;
+const SYS_IRQ_ACK: u64 = 0x48;
+
+/// S5: НАСТОЯЩАЯ линия железа как L4-сообщение (COM1, ISA IRQ4 -> GSI 4).
+///
+/// init — root-сервер устройств (kinit-гранты легаси-шины, v0.11):
+/// перебираем свои DeviceReference (CLAIM-try + IRQ_ATTACH(gsi=4)
+/// одобряет только владельца линии — COM1), ядро возводит линию
+/// (IOAPIC RTE; при включённом ремаппинге IOMMU — IRTE+remapped-RTE —
+/// аудит ядра в консоли), затем вывод консоли осушает передатчик —
+/// IRQ4 -> irq_c -> signal (=gsi) в наш endpoint. ACK -> detach ->
+/// вердикт: полный контур линии в сообщениях L4.
+unsafe fn ioapic_demo() {
+    unsafe {
+        puts("=== init: S5 external irq demo (real COM1 line, L4 signal) ===");
+        // Endpoint приёма сигналов линии.
+        let gate = syscall6(SYS_EP_CREATE, 4, 0, 0, 0, 0, 0);
+        if gate <= 0 {
+            puts("init: ioapic: EP_CREATE failed — skipped");
+            return;
+        }
+        // Перебор DeviceReference-хендлов: claim(try) + attach(4) —
+        // одобряет только владелец ресурса Irq{gsi=4} (COM1).
+        let n = syscall6(SYS_CAP_LIST, 0, 0, 0, 0, 0, 0);
+        if n <= 0 {
+            puts("init: ioapic: no capabilities (kinit grants missing?) — skipped");
+            return;
+        }
+        let mut dev_handle = 0u64;
+        let mut idx = 1u64;
+        for _ in 0..n {
+            let handle = syscall6(SYS_CAP_LIST, idx, 0, 0, 0, 0, 0);
+            let kind = syscall6(SYS_CAP_LIST, idx + 1, 0, 0, 0, 0, 0);
+            if kind == 1 && handle > 0 {
+                // try-claim: занято/чужое — не наше.
+                let claim = syscall6(SYS_DEVICE_CLAIM, handle as u64, 1, 0, 0, 0, 0);
+                if claim == 0 {
+                    let attach = syscall6(SYS_IRQ_ATTACH, handle as u64, 4, gate as u64, 0, 0, 0);
+                    if attach == 0 {
+                        dev_handle = handle as u64;
+                        break;
+                    }
+                }
+            }
+            idx += 2;
+        }
+        if dev_handle == 0 {
+            puts("init: ioapic: no device owns GSI 4 (legacy bus absent?) — skipped");
+            return;
+        }
+        debug_word_line("init: ioapic: com1 claimed, handle = ", dev_handle);
+        // Строка ниже осушает передатчик: THR-empty -> IRQ4 latch-ится
+        // (под BKL IF=0) и прибудет signal-ом на первом же sysret.
+        puts("init: ioapic: line up (ISA IRQ4 -> GSI 4); console drain fires it");
+        // Приём сигнала (edge: события до pending склеиваются одним
+        // словом — семантика уведомлений L4).
+        let r = syscall6(SYS_IPC_RECV, gate as u64, 0, 0, 0, 0, 0);
+        let word = msg_word(0);
+        debug_word_line("init: ioapic: signal word = ", word as u64);
+        let ack = syscall6(SYS_IRQ_ACK, 4, 0, 0, 0, 0, 0);
+        let detach = syscall6(SYS_IRQ_DETACH, 4, 0, 0, 0, 0, 0);
+        let _ = syscall6(SYS_DEVICE_RELEASE, dev_handle, 0, 0, 0, 0, 0);
+        debug_word_line("init: ioapic: irq_ack ret    = ", ack as u64);
+        debug_word_line("init: ioapic: irq_detach ret = ", detach as u64);
+        if r >= 0 && word == 4 && detach == 0 {
+            puts(
+                "init: ioapic VERDICT: real hw IRQ delivered as L4 signal (IOAPIC->LAPIC->endpoint)",
+            );
+        } else {
+            puts("init: ioapic VERDICT: demo finished with anomalies (see above)");
         }
     }
 }
@@ -1021,9 +1185,14 @@ fn main_loop() -> ! {
             // S3: SMP-стресс.
             smp_stress(cpu_count as u64);
 
-            // S4 (v0.9): песочница — спавн rogue-домена из встроенного
-            // образа, порты, обмен, атаки, вердикт.
-            sandbox_demo();
+            // S4 (v0.9→v0.11): песочница + PIE-спавн — образ rogue
+            // грузится на выборных базах (дважды для PIE), порты, обмен,
+            // атаки, вердикт.
+            sandbox_pie_demo();
+
+            // S5 (v0.11): настоящая линия железа (COM1 IRQ4 -> GSI 4)
+            // как L4-signal: полный контур IOAPIC->LAPIC->endpoint.
+            ioapic_demo();
         }
         puts("init: all demos done, exiting with code 0");
         sys_exit(0)

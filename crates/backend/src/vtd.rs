@@ -780,6 +780,88 @@ impl Vtd {
         }
         Ok(())
     }
+
+    /// v0.11, IOAPIC: IRTE линии `pin` в Зарезервированном слоте 0x10+pin
+    /// (спека VT-d: индексы 0x10..0x25 — IOxAPIC lines; irte_slot_free
+    /// их не выдаёт устройствам — слоты принадлежат этому пути).
+    ///
+    /// SVT=00b (NoValidation): у remapped-запроса от IOxAPIC нет
+    /// requester-id (источник — сам контроллер линий) — проверка
+    /// источника по спеке не выполняется. Вектор/назначение — как у
+    /// обычного remapped-прерывания: IOAPIC RTE в remapped-формате
+    /// несёт только handle (индекс этой записи) и триггер.
+    fn ioapic_irte(
+        &mut self,
+        pin: u8,
+        vector: u8,
+        dest: u8,
+        level: bool,
+    ) -> Result<(), IommuError> {
+        if !self.ir_enabled {
+            return Err(IommuError::RemappingDisabled);
+        }
+        if pin as u16 + 0x10 > 0x25 {
+            // Зарезервированный диапазон кончился (q35 хватает на все
+            // 22+2 линии; расширение — инвентарь слотов v0.12).
+            return Err(IommuError::InvalidConfig);
+        }
+        if !(0x10..=0xFE).contains(&vector) {
+            return Err(IommuError::InvalidConfig);
+        }
+        let idx = (0x10 + pin as u16) as usize;
+        let irte = Irte::new_remapped()
+            .with_present(true)
+            .with_trigger_mode_level(level)
+            .with_destination_mode_logical(false)
+            .with_delivery_mode(DeliveryMode::Fixed)
+            .with_vector(vector)
+            .with_destination(dest as u32)
+            // SVT=00b: источника (requester-id) у IOxAPIC-запроса нет.
+            .with_source_validation(SourceValidationType::NoValidation);
+        let w = irte.words();
+        // SAFETY: IRT — наша страница, 16 байт на IRTE.
+        unsafe {
+            let p = phys_ptr::<u64>(self.irta_phys).add(idx * 2);
+            p.write_volatile(w[0]);
+            p.add(1).write_volatile(w[1]);
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        // IEC — выборочная инвалидация одной записи.
+        self.qi_submit(&QiDesc::Iec(QiIec::new(false, idx as u16, 0)));
+        self.qi_sync()?;
+        self.ir_used[idx] = true;
+        crate::kprintln!(
+            "vtd: ioapic irte pin={} idx={} vec={:#x} dst={:#x} lvl={}",
+            pin,
+            idx,
+            vector,
+            dest,
+            level
+        );
+        Ok(())
+    }
+}
+
+// ───────────────────── IOAPIC-поверхность драйвера (v0.11) ─────────────────────
+
+/// Завести IRTE для линии IOAPIC (единый интерфейс для ioapic.rs).
+///
+/// Единица 0: QEMU intel-iommu перехватывает IOxAPIC-запросы единицей,
+/// охватывающей контроллер (в наших прогонах — первый DRHD); мульти-
+/// IOMMU с несколькими IOAPIC в разных сегментах — v0.12+ (инвентарь).
+pub fn ioapic_irte(pin: u8, vector: u8, dest: u8, level: bool) -> Result<(), IommuError> {
+    let mut g = VTD0.inner.lock();
+    match g.get_mut(0) {
+        Some(v) => v.ioapic_irte(pin, vector, dest, level),
+        None => Err(IommuError::IommuNotPresent),
+    }
+}
+
+/// IRQ-ремаппинг включён хоть на одной единице Intel (ioapic.rs решает,
+/// каким вендором ремапить линию; Intel приоритетнее: remapped-RTE).
+pub fn irq_remap_enabled() -> bool {
+    let g = VTD0.inner.lock();
+    g.first().is_some_and(|v| v.ir_enabled)
 }
 
 /// Дождаться установки битов GSTS (попытки по ~1 мс, TSC-таймаут).

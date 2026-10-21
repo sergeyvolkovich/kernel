@@ -1,0 +1,9 @@
+[package]
+name = "pie"
+version.workspace = true
+edition.workspace = true
+description = "Минимальный PIE-загрузчик: разбор ELF64 (PT_LOAD/PT_DYNAMIC/DT_RELA) + применение R_X86_64_RELATIVE. Спавн-сервер init использует его для спавна доменов на произвольной базе (v0.11)"
+
+[lib]
+# no_std-библиотека; host-тесты работают и без цели (переносимый парсер).
+name = "pie"

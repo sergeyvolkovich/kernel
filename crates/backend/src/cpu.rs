@@ -276,6 +276,12 @@ pub fn install_idt() {
             idt[boot::VEC_IPI_SHOOTDOWN].set_handler_addr(addr(crate::ctxswitch::ipi_shoot_entry));
             idt[boot::VEC_IPI_HALT].set_handler_addr(addr(crate::ctxswitch::ipi_halt_entry));
             idt[boot::VEC_SPURIOUS].set_handler_addr(addr(crate::ctxswitch::spurious_entry));
+            // v0.11: внешние линии IOAPIC — по точке входа на GSI
+            // (вектора VEC_EXTERNAL_BASE..+24; линии замаскированы в
+            // IOAPIC до первого IRQ_ATTACH).
+            for (gsi, entry) in crate::ctxswitch::IRQ_ENTRIES.iter().enumerate() {
+                idt[boot::VEC_EXTERNAL_BASE + gsi as u8].set_handler_addr(addr(*entry));
+            }
             idt.page_fault
                 .set_handler_addr(addr(crate::ctxswitch::pf_entry));
             idt.general_protection_fault

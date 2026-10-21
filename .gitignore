@@ -1,0 +1,4 @@
+# Сборочные артефакты (scripts/build.sh, scripts/run_qemu.sh)
+/target/
+crates/uefi_stub/kernel.bin
+boot/OVMF_VARS.fd

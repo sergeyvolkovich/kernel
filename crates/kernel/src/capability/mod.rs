@@ -475,7 +475,19 @@ impl CapabilityManager {
             if let Some(p) = old.parent {
                 // SAFETY: родитель жив, пока есть дети (инвариант 2).
                 let pm: &mut Cte = unsafe { &mut *(p.target.hdr_ptr().as_ptr() as *mut Cte) };
-                debug_assert!(remove_from_children(&mut pm.children, old_ptr));
+                // Отвязка ОБЯЗАНА исполняться и в release: v0.11-баг
+                // «debug_assert!(remove_from_children(..))» — в release
+                // debug_assert не вычисляет выражение, узел оставался в
+                // списке родителя «призраком» (freed-слот в чужой
+                // children-голове) — на повторном использовании адреса
+                // слота это даёт KERNEL FAULT в intrusive-unlink.
+                if !remove_from_children(&mut pm.children, old_ptr) {
+                    Self::audit_inconsistent_tree(
+                        "send: old not in parent list",
+                        p.target.hdr_ptr().cast::<Cte>(),
+                        old_ptr,
+                    );
+                }
                 pm.children
                     .push_back(unsafe { UnsafeRef::from_raw(new_ptr) });
             }
@@ -532,7 +544,15 @@ impl CapabilityManager {
             if let Some(p) = parent {
                 // SAFETY: родитель жив (инвариант 2).
                 let pm: &mut Cte = unsafe { &mut *(p.target.hdr_ptr().as_ptr() as *mut Cte) };
-                debug_assert!(remove_from_children(&mut pm.children, old_ptr));
+                // Отвязка ОБЯЗАНА исполняться и в release (см. send:
+                // debug_assert-обёртка не выполняла её — «призрак»).
+                if !remove_from_children(&mut pm.children, old_ptr) {
+                    Self::audit_inconsistent_tree(
+                        "delete: old not in parent list",
+                        p.target.hdr_ptr().cast::<Cte>(),
+                        old_ptr,
+                    );
+                }
             }
             old.parent = None;
         });
@@ -1082,6 +1102,26 @@ impl CapabilityManager {
             while let Some(child) = node.children.pop_front() {
                 // SAFETY: ребёнок — живой узел дерева деривации.
                 let child_ptr = unsafe { NonNull::new_unchecked(UnsafeRef::into_raw(child)) };
+                // Аудит дерева (v0.11): ребёнок, снятый с НАШЕГО якоря,
+                // обязан ссылаться на нас как на родителя (инвариант 2).
+                // Рассинхрон — баг дерева деривации: без аудита pop
+                // «призрака» (уже отвязанного/освобождённого узла) ловит
+                // KERNEL FAULT позже (intrusive unlink по мусорным
+                // указателям).
+                {
+                    // SAFETY: ребёнок — живой узел (проверка до рекурсии).
+                    let c: &Cte = unsafe { &*child_ptr.as_ptr() };
+                    let ok = c
+                        .parent
+                        .is_some_and(|p| p.target.hdr_ptr().as_ptr() as *mut Cte == raw.as_ptr());
+                    if !ok {
+                        Self::audit_inconsistent_tree(
+                            "pop: child.parent != popping node",
+                            raw,
+                            child_ptr,
+                        );
+                    }
+                }
                 revoked += self.revoke_node(tasks, child_ptr, false);
             }
             // 2. Снимаем узел с children его родителя — только если нас не
@@ -1096,13 +1136,83 @@ impl CapabilityManager {
         if let Some(p) = parent {
             // SAFETY: родитель жив (инвариант 2), эксклюзивно доступен.
             let pm: &mut Cte = unsafe { &mut *(p.target.hdr_ptr().as_ptr() as *mut Cte) };
-            debug_assert!(remove_from_children(&mut pm.children, raw));
+            if !remove_from_children(&mut pm.children, raw) {
+                // Аудит дерева (v0.11): ребёнок уходит из дерева, но в
+                // списке родителя его НЕТ — зеркальный рассинхрон
+                // (children-якорь родителя будет указывать на freed-слот,
+                // KERNEL FAULT при следующем pop). debug_assert в release
+                // молчал — аудит обязан попадать в консоль всегда.
+                Self::audit_inconsistent_tree(
+                    "detach: child not in parent list",
+                    p.target.hdr_ptr().cast::<Cte>(),
+                    raw,
+                );
+            }
         }
 
         // 3. Слот у владельца: generation вверх → drop (порядок из плана).
         let freed = tasks.with_caps_mut(&owner, |t| t.free(self_idx));
         debug_assert!(freed == Some(true), "слот CTE обязан быть живым");
+        if freed != Some(true) {
+            Self::audit_inconsistent_tree("free: CTE slot already dead", raw, raw);
+        }
         revoked + 1
+    }
+
+    /// Аудит рассинхронизации дерева деривации (v0.11): единственный
+    /// вывод — строка в DebugSink (ядро продолжает работу; аудит-ловушка
+    /// для отладки багов дерева, фатальные проверки остаются ассертами
+    /// отладочных сборок). Оба указателя — Cte-узлы (a — родитель/узел,
+    /// b — ребёнок/дубликат).
+    fn audit_inconsistent_tree(what: &str, a: NonNull<Cte>, b: NonNull<Cte>) {
+        // SAFETY: чтение идентичности для аудита — память узлов обязана
+        // быть доступной (иначе аудит не имеет смысла).
+        let (ka, oa) = unsafe {
+            let n: &Cte = a.as_ref();
+            (n.cap_ref.kind_word(), n.owner)
+        };
+        let (kb, ob) = unsafe {
+            let n: &Cte = b.as_ref();
+            (n.cap_ref.kind_word(), n.owner)
+        };
+        let line = alloc::format!(
+            "[kernel: captree] INCONSISTENT: {} a={:#x}(kind={:#x} owner={}) b={:#x}(kind={:#x} owner={})\r\n",
+            what,
+            a.as_ptr() as usize,
+            ka,
+            oa,
+            b.as_ptr() as usize,
+            kb,
+            ob,
+        );
+        if let Some(sink) = crate::syscall::debug::debug_sink() {
+            sink.write(line.as_bytes());
+        }
+    }
+
+    /// Число живых производных у CTE `handle` (длина children-списка).
+    /// Тест-хук инварианта 2: после отзыва производных у родителя
+    /// не должно оставаться «призраков» (freed-слотов в списке) —
+    /// v0.11-баг отвязки в release ловится именно здесь.
+    pub fn child_count_of(
+        &self,
+        tasks: &TcbManager,
+        task: TaskId,
+        handle: CapHandle,
+    ) -> Option<usize> {
+        // LinkedList не даёт len (низкоуровневая коллекция) — считаем
+        // курсором (тест-хук, редкий путь).
+        let mut count = 0usize;
+        let got = tasks.with_caps(&task, |t| {
+            let cte = t.get(handle.idx(), handle.generation())?;
+            let mut cur = cte.children.front();
+            while !cur.is_null() {
+                count += 1;
+                cur.move_next();
+            }
+            Some(())
+        });
+        got.flatten().map(|()| count)
     }
 
     /// Дренаж cspace задачи: revoke всех корней её таблицы (сами корни

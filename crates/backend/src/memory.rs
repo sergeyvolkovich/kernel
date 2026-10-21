@@ -23,11 +23,25 @@
 // закреплены за пространством до его гибели). Цена — несколько KiB на
 // задачу; корректность не страдает. Освобождение — v0.6 с подсчётом
 // ссылок записей.
+//
+// v0.11: ЗДЕСЬ (не в generic-крейте ядра) объявлен боевой
+// #[global_allocator] (talc поверх llfree) — это связывающий символ
+// ОБРАЗА. cfg(not(test)): host-тесты backend/lib (парсеры MADT/ACPI)
+// линкуются аллокатором std — llfree в них не поднят, а cfg(test) не
+// действует на зависимости (западал весь тест-рантайм на первом же
+// выделении). Образ (bin kernel) собирает lib без test-cfg — статик
+// активен, ядро аллоцирует через talc, как раньше.
 
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
 };
 use x86_64::{PhysAddr, VirtAddr};
+
+/// Боевой аллокатор ядра (talc поверх llfree) — см. комментарий файла.
+#[cfg(not(test))]
+#[global_allocator]
+static GLOBAL_ALLOC: pkg_generic_interface::mem::gallocator::KernelAllocator =
+    pkg_generic_interface::mem::gallocator::kernel_allocator();
 
 use llfree::Alloc;
 
