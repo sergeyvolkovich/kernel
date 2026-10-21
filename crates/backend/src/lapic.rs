@@ -6,12 +6,20 @@
 // идентичны; пересинкализрация по общему PIT из SMP — гонка на
 // разделяемом канале, сознательно не делаем).
 //
+// v0.13: приоритет LAPIC-таймера — режим TSC-deadline (при наличии
+// CPUID.01H:ECX[24]): one-shot по абсолютному TSC в IA32_TSC_DEADLINE.
+// Вытеснение назначается на точные границы (квант/бюджет домена/
+// CPU-период) вместо ближайшего периодического тика — субтик-точность
+// CPU-квот. Без фичи — прежний периодический тик (грубость ≤ 1 тика).
+// Периодический режим здесь же остаётся фолбэком; заряд квот циклами
+// работает в обоих режимах (учёт точен всегда, вытеснение — по режиму).
+//
 // IPI (v0.6): INIT-SIPI-SIPI запуск AP, resched/shootdown/halt
 // рассылки. EOI-адрес — константа (PHYSMAP + дефолтная база LAPIC —
 // инвариант, проверяемый init()); на этом стоит asm-обработчик
 // resched (см. ctxswitch.rs).
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 use arch::boot;
 use pkg_generic_interface::syscall::system::TimeSource;
@@ -26,6 +34,9 @@ const REG_ICR_HIGH: u32 = 0x310;
 const REG_LVT_TIMER: u32 = 0x320;
 const REG_LVT_MASKED: u32 = 1 << 16;
 const REG_TIMER_PERIODIC: u32 = 1 << 17;
+/// LVT Timer: режим TSC-deadline (bit 18; Intel SDM 10.5.4 — ICR/DCR
+/// в этом режиме не используются, divisor фиксированно 1).
+const REG_TIMER_TSC_DEADLINE: u32 = 1 << 18;
 const REG_TIMER_ICR: u32 = 0x380;
 const REG_TIMER_CCR: u32 = 0x390;
 const REG_TIMER_DCR: u32 = 0x3E0;
@@ -56,6 +67,9 @@ static APIC_BASE: AtomicU64 = AtomicU64::new(0);
 static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 /// Калиброванная частота LAPIC-таймера (после делителя), Гц.
 static LAPIC_HZ: AtomicU64 = AtomicU64::new(0);
+/// Режим таймера v0.13: 0 — периодический тик (легаси/фолбэк),
+/// 1 — TSC-deadline one-shot (CPUID-детект на BSP до старта SMP).
+static TIMER_TSC_DEADLINE_MODE: AtomicU8 = AtomicU8::new(0);
 
 #[inline]
 fn reg(off: u32) -> *mut u32 {
@@ -109,6 +123,47 @@ pub fn eoi() {
 
 // ───────────────────── Калибровка по PIT ─────────────────────
 
+/// CPUID.01H:ECX[24] — поддержка режима TSC-deadline LAPIC-таймера.
+fn has_tsc_deadline() -> bool {
+    let (_, _, ecx, _) = crate::cpu::cpuid_raw(1, 0);
+    ecx & (1 << 24) != 0
+}
+
+/// Таймер работает в режиме TSC-deadline? (решает BSP после
+/// калибровки; APы наследуют флаг — фича однородна на кристалле).
+pub fn using_tsc_deadline() -> bool {
+    TIMER_TSC_DEADLINE_MODE.load(Ordering::Acquire) == 1
+}
+
+/// Циклов TSC на один тик планировщика (единица квот: квота N тиков
+/// = N × tsc_per_tick() циклов потребления CPU).
+pub fn tsc_per_tick() -> u64 {
+    let hz = TSC_HZ.load(Ordering::Relaxed);
+    if hz == 0 {
+        return 1; // до калибровки (без квот в bring-up) — вырожденная
+    }
+    (hz / boot::SCHED_HZ).max(1)
+}
+
+/// Взвести one-shot TSC-deadline на абсолютном TSC `deadline`
+/// (СВОЙ CPU; режим LVT уже deadline). Запись 0 — погасить.
+pub fn arm_tsc_deadline(deadline: u64) {
+    use x86_64::registers::model_specific::Msr;
+    // SAFETY: привилегированный код ядра; MSR per-CPU — зову только
+    // владелец своего LAPIC.
+    unsafe { Msr::new(boot::MSR_IA32_TSC_DEADLINE).write(deadline) };
+}
+
+/// Перевести LVT-таймер в режим TSC-deadline (взвод потом —
+/// `arm_tsc_deadline`; до первого взвода — погашен нулём).
+fn enter_tsc_deadline_mode() {
+    // Intel SDM 10.5.4: DCR в TSC-deadline не используется — 0
+    // (divide by 1); ICR не пишется; LVT — vector|bit18, unmasked.
+    write(REG_TIMER_DCR, 0);
+    write(REG_LVT_TIMER, boot::VEC_TIMER as u32 | REG_TIMER_TSC_DEADLINE);
+    arm_tsc_deadline(0);
+}
+
 /// Прочитать порт u8.
 unsafe fn inb(port: u16) -> u8 {
     let v: u8;
@@ -161,6 +216,13 @@ fn rdtsc() -> u64 {
     ((hi as u64) << 32) | lo as u64
 }
 
+/// Публичный TSC (v0.13): метки диспетчеризации/заряда квот и база
+/// TSC-deadline. Калибровка — [`TSC_HZ`] (см. `start_timer`).
+#[inline]
+pub fn read_tsc() -> u64 {
+    rdtsc()
+}
+
 /// Калибровать TSC + LAPIC и запустить периодический таймер (VEC_TIMER)
 /// на BSP.
 ///
@@ -187,10 +249,18 @@ pub fn start_timer() -> Result<(), &'static str> {
     TSC_HZ.store(tsc_hz, Ordering::Relaxed);
     LAPIC_HZ.store(lapic_hz, Ordering::Release);
 
-    // Периодический тик: ICR = lapic_hz / SCHED_HZ.
-    let icr = (lapic_hz / boot::SCHED_HZ).max(1);
-    write(REG_LVT_TIMER, REG_TIMER_PERIODIC | boot::VEC_TIMER as u32);
-    write(REG_TIMER_ICR, icr as u32);
+    // Периодический тик ИЛИ TSC-deadline (v0.13): фича однородна на
+    // кристалле — решение BSP наследуют APы (`start_timer_shared`).
+    if has_tsc_deadline() {
+        TIMER_TSC_DEADLINE_MODE.store(1, Ordering::Release);
+        enter_tsc_deadline_mode();
+        // Первый взвод — потребитель (диспетчеризация/idle): вычислять
+        // границы здесь рано (нет ни потоков, ни glue).
+    } else {
+        let icr = (lapic_hz / boot::SCHED_HZ).max(1);
+        write(REG_LVT_TIMER, REG_TIMER_PERIODIC | boot::VEC_TIMER as u32);
+        write(REG_TIMER_ICR, icr as u32);
+    }
     Ok(())
 }
 
@@ -198,6 +268,12 @@ pub fn start_timer() -> Result<(), &'static str> {
 /// LAPIC_HZ; см. шапку модуля — перекалибровка по общему PIT из SMP
 //  была бы гонкой на разделяемом канале).
 pub fn start_timer_shared() {
+    if using_tsc_deadline() {
+        // Режим наследован от BSP: LVT своего CPU + погашенный MSR
+        // (первый взвод — своя диспетчеризация/idle).
+        enter_tsc_deadline_mode();
+        return;
+    }
     let hz = LAPIC_HZ.load(Ordering::Acquire);
     if hz == 0 {
         // Дегенерация (BSP не калибровал?): остаться без тика — AP будет

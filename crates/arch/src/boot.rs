@@ -113,6 +113,11 @@ pub const AP_STACK_PAGES: usize = 4;
 pub const MSR_IA32_GS_BASE: u32 = 0xC000_0101;
 /// IA32_APIC_BASE: база локального APIC (backend включает xAPIC).
 pub const MSR_IA32_APIC_BASE: u32 = 0x0000_001B;
+/// IA32_TSC_DEADLINE (v0.13): абсолютный TSC-deadline LAPIC-таймера
+/// (режим LVT bit18; запись ненулевого значения взводит one-shot,
+/// ноль — гасит). Точность CPU-квот: вытесление в момент исчерпания
+/// бюджета домена, а не на ближайшем тике.
+pub const MSR_IA32_TSC_DEADLINE: u32 = 0x0000_06E0;
 /// IA32_EFER: расширенные флаги (LME/LMA/NXE/SCE).
 pub const MSR_IA32_EFER: u32 = 0xC000_0080;
 /// IA32_STAR: селекторы входа syscall/sysret.

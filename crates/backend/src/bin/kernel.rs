@@ -83,6 +83,14 @@ pub extern "C" fn kmain(bootinfo_phys: u64) -> ! {
     if let Err(e) = backend::lapic::start_timer() {
         backend::gate::kpanic(e);
     }
+    // v0.13: режим таймера — диагностика точности квот (TSC-deadline
+    // взводится при CPUID-фиче; QEMU/TCG её вырезает — периодический
+    // фолбэк, заряд циклами и TSC-граница периода работают в обоих).
+    if backend::lapic::using_tsc_deadline() {
+        backend::console::kprint_str("kmain: timer mode: tsc-deadline (sub-tick quotas)\r\n");
+    } else {
+        backend::console::kprint_str("kmain: timer mode: periodic fallback (tsc-deadline not exposed)\r\n");
+    }
     backend::console::kprint_str("kmain: cpu+lapic+timer up\r\n");
 
     // 5.5 SMP: топология MADT + SIPI-запуск AP (ДО kinit — без кучи;

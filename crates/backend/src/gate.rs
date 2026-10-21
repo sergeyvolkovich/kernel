@@ -99,11 +99,17 @@ extern "C" fn syscall_c(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6
     // Повторного сохранения на блок-пути НЕТ: оно затёрло бы контекст
     // СЛЕДУЮЩЕГО блокирования потока после повторного входа и быстрого
     // повторного парка на другом CPU.
+    //
+    // v0.13: бокс — из per-CPU пула (без аллокатора), запись — в
+    // per-CPU слот планировщика (без локов; обычный сискол без
+    // блока/вытеснения дальше слота не идёт).
     {
         let frame =
             unsafe { &*(arch::percpu::read_u64(arch::percpu::OFF_FRAME) as *const SysFrame) };
         let user_rsp = unsafe { arch::percpu::read_u64(arch::percpu::OFF_USER_RSP) };
-        sched::scheduler().save_context(thread, Box::new(frame_to_ctx(frame, user_rsp, nr)));
+        let mut ctx = sched::alloc_ctx();
+        fill_ctx_from_frame(&mut ctx, frame, user_rsp, nr);
+        sched::scheduler().save_context(thread, ctx);
     }
 
     let ret = glue.dispatch(cpu_id, task, thread, nr, &args);
@@ -124,13 +130,16 @@ extern "C" fn syscall_c(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6
     // который раньше закрывал BKL).
     if pkg_generic_interface::syscall::take_block_latch(cpu_id) {
         if glue.thread_blocked(thread) {
-            // v0.10: блокировка — тоже конец отрезка исполнения: зарядить
-            // домену потреблённые тики (минимум 1 за проход, как у preempt-
-            // шага — иначе «вычислить-и-заблокироваться» жил бы вне квот;
-            // решением троттлить пренебрегаем: поток уже паркуется сам).
+            // v0.13: блокировка — тоже конец отрезка исполнения: заряд
+            // домену циклы отрезка (rdtsc-разность с метки
+            // диспетчеризации; анти-спин-пол — 1 тик за проход, как v0.10:
+            // «вычислить-и-заблокироваться» не дешевле честного кванта).
+            // Решением троттлить пренебрегаем: поток уже паркуется сам.
             if let Some(cur) = sched::scheduler().current_thread() {
-                let used = sched::scheduler().take_slice_used().max(1) as usize;
-                let _ = glue.on_timeslice_consumed(cur, used);
+                let cycles = sched::scheduler()
+                    .cycles_since_dispatch()
+                    .max(sched::min_charge_cycles());
+                let _ = glue.on_cpu_cycles_consumed(cur, cycles);
             }
         }
         // Поток ещё Blocked — обычный парк (контекст уже сохранён
@@ -141,20 +150,21 @@ extern "C" fn syscall_c(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6
         sched::schedule_next();
     }
 
-    // Вытеснение (квант истёк/yield/wrap-периода): единый preempt-шаг
-    // v0.10 — refill CPU-периода, заряд квоты домену, rotate или
-    // троттл-парк; не возвращается (вход следующего — свои локи).
+    // Вытеснение (квант истёк/yield/дедлайн/wrap-периода): единый
+    // preempt-шаг v0.10 — refill CPU-периода, заряд квоты домену
+    // (циклами v0.13), rotate или троттл-парк; не возвращается
+    // (вход следующего — свои локи).
     if sched::scheduler().take_need_resched() {
         let frame =
             unsafe { &*(arch::percpu::read_u64(arch::percpu::OFF_FRAME) as *const SysFrame) };
         let user_rsp = unsafe { arch::percpu::read_u64(arch::percpu::OFF_USER_RSP) };
-        let ctx = frame_to_ctx(frame, user_rsp, ret as u64);
         // ВНИМАНИЕ: frame.rip — это сохранённый syscall-гейтом rcx, т.е.
         // rip ПОСЛЕ инструкции syscall (+2 уже учтён железом). Баг v0.5:
         // здесь делали rip += 2 — двойное продвижение отправляло поток в
         // середину инструкции (SMP-вытеснение проявило: декод мусора,
-        // #PF на запись в RX). rcx-семантика уже выставлена frame_to_ctx.
-        let boxed: Box<UserCtx> = Box::new(ctx);
+        // #PF на запись в RX). rcx-семантика уже выставлена fill_ctx.
+        let mut boxed = sched::alloc_ctx();
+        fill_ctx_from_frame(&mut boxed, frame, user_rsp, ret as u64);
         sched::preempt_step(boxed); // не возвращается
     }
 
@@ -164,30 +174,28 @@ extern "C" fn syscall_c(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6
     ret as i64
 }
 
-/// Фрейм sys_entry -> UserCtx (rax = будущее возвращаемое значение;
-/// rcx/r11 пользователя = rip/rflags — семантика syscall).
-fn frame_to_ctx(frame: &SysFrame, user_rsp: u64, rax: u64) -> UserCtx {
-    let mut ctx = UserCtx {
-        rip: frame.rip,
-        rflags: frame.rflags,
-        rsp: user_rsp,
-        rax,
-        rbx: frame.rbx,
-        rcx: frame.rip,
-        rdx: frame.rdx,
-        rsi: frame.rsi,
-        rdi: frame.rdi,
-        rbp: frame.rbp,
-        r8: frame.r8,
-        r9: frame.r9,
-        r10: frame.r10,
-        r11: frame.rflags,
-        r12: frame.r12,
-        r13: frame.r13,
-        r14: frame.r14,
-        r15: frame.r15,
-        fx: [0; 512],
-    };
+/// Заполнить контекст из фрейма sys_entry (rax = будущее возвращаемое
+/// значение; rcx/r11 пользователя = rip/rflags — семантика syscall).
+/// v0.13: пишем в бокс из per-CPU пула (без аллокации на входе).
+fn fill_ctx_from_frame(ctx: &mut UserCtx, frame: &SysFrame, user_rsp: u64, rax: u64) {
+    ctx.rip = frame.rip;
+    ctx.rflags = frame.rflags;
+    ctx.rsp = user_rsp;
+    ctx.rax = rax;
+    ctx.rbx = frame.rbx;
+    ctx.rcx = frame.rip;
+    ctx.rdx = frame.rdx;
+    ctx.rsi = frame.rsi;
+    ctx.rdi = frame.rdi;
+    ctx.rbp = frame.rbp;
+    ctx.r8 = frame.r8;
+    ctx.r9 = frame.r9;
+    ctx.r10 = frame.r10;
+    ctx.r11 = frame.rflags;
+    ctx.r12 = frame.r12;
+    ctx.r13 = frame.r13;
+    ctx.r14 = frame.r14;
+    ctx.r15 = frame.r15;
     // FPU текущего потока: fxsave в чистую область контекста.
     // SAFETY: fx область выровнена (repr align 16), 512 байт.
     unsafe {
@@ -198,7 +206,6 @@ fn frame_to_ctx(frame: &SysFrame, user_rsp: u64, rax: u64) -> UserCtx {
             options(nostack)
         );
     }
-    ctx
 }
 
 // ───────────────────── Тик ─────────────────────
@@ -234,11 +241,11 @@ extern "C" fn timer_c(frame: *mut TickFrame) {
     let f = unsafe { &mut *frame };
     lapic::eoi();
 
-    // v0.10: глобальный тик CPU-периода — ДО развилки user/kernel:
-    // idle/ядровые тики тоже двигают период (иначе троттл-лист зависнет
-    // без будящего источника). Граница — плюс флаг перепланировки себе:
-    // preempt-путь закроет её (refill), idle — на будке.
-    if sched::scheduler().note_wall_tick() {
+    // v0.13: граница CPU-периода — TSC-часы (ТОЧНАЯ граница, а не
+    // ближайший тик). ЗДЕСЬ — только флаг: закрытие (refill — локи
+    // менеджеров) из прерывания ядра запрещено (см. ниже); снимут
+    // preempt-путь (первым шагом) или idle-будка после hlt.
+    if sched::period_due() {
         arch::percpu::set_need_resched();
     }
 
@@ -249,18 +256,36 @@ extern "C" fn timer_c(frame: *mut TickFrame) {
         // сам перепроверит) ИЛИ спин на локах ядра другого CPU (SMP
         // v0.12: вложение таймера в ядровый стек; дисциплина — см.
         // шапку; все локи — короткие, вложенный тик возвращается
-        // без единого захвата). Флаг need_resched от wrap останется —
-        // его снимет следующий вход в пользователя.
+        // без единого захвата). Локов менеджеров НЕ БРАТЬ: прерванный
+        // мог быть спиннером глубины 0 — его лок держит другой (IF=0),
+        // вложенный захват того же лока — дедлок (IPI не доставить).
+        // Флаг need_resched от границы останется — его снимет следующий
+        // вход в пользователя/preempt-шаг.
+        //
+        // v0.13 TSC-deadline: one-shot ПОГАШЕН этим срабатыванием —
+        // перевзвод (граница уже прошла — эпсилон: вытеснение первым
+        // же возвратом в пользователя; границы ядра короткие).
+        if crate::lapic::using_tsc_deadline() {
+            sched::rearm_deadline_from_kernel();
+        }
         return;
     }
 
-    // Тик планировщика: квант СВОЕГО CPU (GS, атомики per-CPU;
-    // ядро-структуры не трогаем).
-    use pkg_generic_interface::task::SchedulerInterface;
-    use pkg_generic_interface::task::SchedulerInterface as _;
-    sched::scheduler().perform_tick(1);
+    // Вытеснение по таймеру:
+    //   * периодический фолбэк — квант СВОЕГО CPU (GS, атомики per-CPU;
+    //     ядро-структуры не трогаем);
+    //   * TSC-deadline — срабатывание ЕСТЬ граница (квант RR/бюджет
+    //     домена/период — что ближе): немедленный флаг.
+    if crate::lapic::using_tsc_deadline() {
+        arch::percpu::set_need_resched();
+    } else {
+        // Тик планировщика: квант СВОЕГО CPU (GS, атомики per-CPU;
+        // ядро-структуры не трогаем).
+        use pkg_generic_interface::task::SchedulerInterface;
+        sched::scheduler().perform_tick(1);
+    }
 
-    // Вытеснение — только если просят (квант/IPI-resched): остальное
+    // Вытеснение — только если просят (квант/дедлайн/IPI-resched): остальное
     // требует ядра -> preempt-шаг. Быстрые тики (квант жив) — мимо.
     if !sched::scheduler().take_need_resched() {
         return;
@@ -278,28 +303,26 @@ extern "C" fn timer_c(frame: *mut TickFrame) {
     // v0.10: единый preempt-шаг работает и для ЕДИНСТВЕННОГО потока —
     // квота обязана парковать и его (старый выход «вытеснение
     // бессмысленно» кормил бы одиночного спиннера-DoS бессрочно).
-    let ctx = UserCtx {
-        rip: f.rip,
-        rflags: f.rflags,
-        rsp: f.rsp,
-        rax: f.rax,
-        rbx: f.rbx,
-        rcx: f.rcx,
-        rdx: f.rdx,
-        rsi: f.rsi,
-        rdi: f.rdi,
-        rbp: f.rbp,
-        r8: f.r8,
-        r9: f.r9,
-        r10: f.r10,
-        r11: f.r11,
-        r12: f.r12,
-        r13: f.r13,
-        r14: f.r14,
-        r15: f.r15,
-        fx: [0; 512],
-    };
-    let mut boxed: Box<UserCtx> = Box::new(ctx);
+    // v0.13: бокс — из per-CPU пула, без аллокации.
+    let mut boxed = sched::alloc_ctx();
+    boxed.rip = f.rip;
+    boxed.rflags = f.rflags;
+    boxed.rsp = f.rsp;
+    boxed.rax = f.rax;
+    boxed.rbx = f.rbx;
+    boxed.rcx = f.rcx;
+    boxed.rdx = f.rdx;
+    boxed.rsi = f.rsi;
+    boxed.rdi = f.rdi;
+    boxed.rbp = f.rbp;
+    boxed.r8 = f.r8;
+    boxed.r9 = f.r9;
+    boxed.r10 = f.r10;
+    boxed.r11 = f.r11;
+    boxed.r12 = f.r12;
+    boxed.r13 = f.r13;
+    boxed.r14 = f.r14;
+    boxed.r15 = f.r15;
     unsafe {
         core::arch::asm!(
             "fxsave64 [{fx}]",
@@ -457,10 +480,21 @@ pub fn reap_thread(thread: uuid::Uuid) {
 ///
 /// SMP v0.12: локов НЕ держим (контекст — единоличное владение после
 /// эксклюзивного pop из готовности; все гарды диспетчеризации отработали).
+///
+/// v0.13: метка диспетчеризации (rdtsc в GS: база заряда квот — отрезок
+/// до вытеснения/блокировки) + взвод TSC-deadline точного вытеснения
+/// (min(квант RR, бюджет домена, остаток периода); периодический
+/// фолбэк — квант уже в GS от pick_next).
+///
+/// Бокс контекста уходит в Box::leak (enter_user не возвращается);
+/// указатель помечен per-CPU «inflight» — рециклинг в пул на
+/// СЛЕДУЮЩЕЙ диспетчеризации этого CPU (утечка v0.12 демонтирована).
 pub fn finalize_and_enter(thread: uuid::Uuid, mut ctx: Box<UserCtx>) -> ! {
     if let Some(r) = kernel_glue().take_syscall_ret(thread) {
         ctx.rax = r as u64;
     }
+    arch::percpu::set_dispatch_tsc(crate::lapic::read_tsc());
+    sched::scheduler().arm_preempt_deadline(thread);
     let leaked: &'static mut UserCtx = alloc::boxed::Box::leak(ctx);
     // SAFETY: контекст валиден (построен/сохранён гейтом), вход не
     // возвращается.
@@ -492,25 +526,6 @@ pub fn idle_loop() -> ! {
         }
     };
     let live = glue.live_thread_count();
-    // ДИАГНОСТИКА v0.12 bring-up (первый вход в idle, один раз):
-    // снимок здоровья очереди готовности — enq/pop должны сходиться,
-    // stale — только легаси-записи задач и записи, протухшие между
-    // enqueue и pick (ленивый deschedule), markfail — 0 в норме.
-    {
-        static ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-        if !ONCE.swap(true, core::sync::atomic::Ordering::AcqRel) {
-            let d = sched::dbg_snapshot();
-            let line = alloc::format!(
-                "\r\n[kernel] sched dbg: enq={} pop={} stale={} markfail={} enter={}\r\n",
-                d[0],
-                d[1],
-                d[2],
-                d[3],
-                d[4]
-            );
-            crate::console::kprint_str(&line);
-        }
-    }
     let msg = if live == 0 {
         "\r\n[kernel] all user threads gone — halting (boot chain OK)\r\n"
     } else {
@@ -518,18 +533,24 @@ pub fn idle_loop() -> ! {
     };
     crate::console::kprint_str(msg);
     loop {
+        // v0.13: будка idle в TSC-deadline-режиме — one-shot на границу
+        // CPU-периода: троттл-лист вернётся в готовность ТОЧНО в срок
+        // (v0.10 будил ближайший тик; периодический фолбэк — тик сам
+        // разбудит, взвод не нужен).
+        if crate::lapic::using_tsc_deadline() {
+            sched::arm_idle_deadline();
+        }
         x86_64::instructions::interrupts::enable_and_hlt();
-        // v0.10: границу CPU-периода закрывает и idle — его тики
-        // двигают период (note_wall_tick без from_user), а preempt-пути
-        // в idle нет: троттл-лист разбудим сами, иначе замороженные
+        // Границу CPU-периода закрывает и idle: его пробуждение —
+        // легальный контекст для refill (локов не держим), а preempt-пути
+        // в idle нет — троттл-лист разбудим сами, иначе замороженные
         // домены проспали бы до чужого пользовательского входа.
-        if sched::scheduler().period_wrap_pending() {
-            sched::cpu_period_refill_if_due();
+        if sched::cpu_period_refill_if_due() {
             if sched::scheduler().has_ready() {
                 sched::schedule_next(); // не возвращается
             }
         }
-        // Проснулись (тик/IPI): появились готовые — в диспетчеризацию.
+        // Проснулись (дедлайн/тик/IPI): появились готовые — в диспетчеризацию.
         // Возврат из schedule_next сюда невозможен: он либо входит в
         // поток (не возвращается), либо сам возвращается в idle-цикл.
         if sched::scheduler().has_ready() {

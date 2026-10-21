@@ -1,4 +1,4 @@
-// ==== Планировщик-бекенд x86_64 (v0.12: SMP fine-grained; v0.10: CPU-квоты) ====
+// ==== Планировщик-бекенд x86_64 (v0.13: точность квот + per-CPU кэш; v0.12: SMP fine-grained) ====
 //
 // Реализация контракта `SchedulerInterface` ядра + собственные структуры
 // диспетчеризации (контексты пользовательских потоков, очередь готовности,
@@ -17,29 +17,75 @@
 //   * финальная защита от воскрешения — `mark_running` (Ready→Running
 //     под write-гардом TCB): провал = мимо, диспетчеризация берёт
 //     следующего (окно «валидация→запуск» между локами закрыто);
-//   * контексты/block-очереди/троттл-лист — короткий KSpin (лист);
+//   * block-очереди/троттл-лист — короткий KSpin (лист);
 //   * политика изоляции — атомик (запись один раз до старта SMP):
 //     `isolation_policy` читается из памяти-путей (под ops-локом KMEM),
 //     вложенность KMEM→SCHED исключена (лист);
 //   * текущий поток/квант/флаги — per-CPU (GS), как раньше;
 //   * eager FPU: fxsave/fxrstor на каждом переключении (без CR0.TS).
 //
-// CPU-квоты v0.10 (троттлинг песочницы) — семантика сохранена:
-//   * учёт — в GTCB доменов, решение — ядро через glue
-//     (`on_timeslice_consumed`), бекенд паркует поток в троттл-лист;
-//   * период — ГЛОБАЛЬНЫЙ счётчик тиков `CPU_TICKS` (атомик, все CPU);
-//   * граница периода — флаг `CPU_PERIOD_WRAP` (снимает preempt-путь/
-//     idle-будка), дренаж троттл-листа + resched-IPI;
-//   * заряд — при каждом вытеснении: max(1, slice_used) тиков.
+// v0.13-1: ЛЕГАСИ TASK-LEVEL ENQUEUE ДЕМОНТИРОВАН. Единица планирования —
+//   поток (L4): домены планировщику не адресуются (правка ядра —
+//   `TcbManager::create/set_state` больше не зовут хуки бекенда).
+//   Записи-призраки UUID задач в кольце (шум stale, отсев на pick,
+//   пустые resched-IPI на каждый спавн домена) исчезли по построению;
+//   временные bring-up счётчики v0.12 (DBG_*) и rotate_current
+//   («метод для диагностики») удалены вместе с once-печатью в idle.
 //
-// Инвариант IF (см. `kernel::sync`): держатели локов — IF=0; спин на
-// глубине 0 — IF=1 (доставка IPI: shootdown-ACK/resched).
+// v0.13-2: КОНТЕКСТЫ — per-CPU кэш + точная передача (демонтаж
+//   «карта под локом на каждом шаге»):
+//   * ГОРЯЧИЙ ПУТЬ — сискол-вход: контекст текущего потока пишется в
+//     per-CPU СЛОТ ([`slot`]) без единого лока и без аллокации (боксы
+//     рециклируются per-CPU пулом [`CTX_CPU`]). Обычный сискол без
+//     блокировки/вытеснения вообще не касается глобального состояния;
+//   * ПАРКИ (IPC-block, suspend, preempt-rotate, троттл) — контекст
+//     экспортируется слот -> глобальная карта (`INNER.contexts`) ДО
+//     публикации состояния потока (хуки enqueue/deschedule — они
+//     стреляют на CPU-владельце до фиксации перехода под write-гардом
+//     менеджера; вкладка локов менеджер->SCHED — односторонняя, без
+//     инверсии). Инвариант: поток Ready/Blocked => его контекст — в
+//     карте; Running => в слоте CPU-владельца (не более чем в одном
+//     месте, дублей нет);
+//   * ВЫБОР (pick) — контекст ИЗЫМАЕТСЯ из карты (remove, а не клон
+//     680 Б как в v0.12): zero-copy передача между CPU. Вошедший бокс
+//     помечается per-CPU «inflight» и рециклируется в пул на СЛЕДУЮЩЕЙ
+//     диспетчеризации этого CPU (asm-чтения enter_user давно завершены)
+//     — демонтаж Box::leak (утечка ~700 Б на каждое переключение v0.12);
+//   * ОТКАЗ ПУБЛИКАЦИИ (поток убит в окне вытеснения) — слот гасится
+//     release_slot_if: бокс в пул, утечки нет;
+//   * МЁРТВЫЕ ПАРКИ — записи потоков, чей TCB разрушен ядровыми
+//     kill-путями без гейт-reap, подметает sweep_dead_contexts на
+//     границе периода (v0.12 оставлял их в карте навсегда).
+//   SAFETY per-CPU кэша: свой элемент трогает ТОЛЬКО владелец CPU;
+//   прерывания, которые ВОЗВРАЩАЮТСЯ (тип !from_user, irq_c, IPI-флаг),
+//   кэш не трогают; пути вытеснения/фолта/смерти не возвращаются —
+//   взаимоисключение по потоку управления. Указатели inflight — сырые
+//   (Box::leak + from_raw-рециклинг, UserCtx без Drop).
+//
+// CPU-квоты v0.13 (троттлинг песочницы — точность TSC-deadline):
+//   * учёт — в GTCB доменов В ЦИКЛАХ TSC (`on_cpu_cycles_consumed`):
+//     отрезок = rdtsc(вытеснение) - rdtsc(диспетчеризация), субтик-
+//     точность, включая ядровые участки; «минимум 1 тик» заменён полом
+//     MIN_CHARGE_CYCLES (yield-цикл честно измерен и не дешевле кванта);
+//   * период — ГЛОБАЛЬНАЯ TSC-граница [`PERIOD_END`]: wall-время
+//     CPU_PERIOD_TICKS/(ncpu*SCHED_HZ) с — семантика v0.10 (суммарные
+//     тики всех CPU) сохранена, но граница ТОЧНАЯ, а не «на ближайшем
+//     тике»; закрытие — CAS (один победитель на границу): refill
+//     доменов + дренаж троттл-листа + resched-IPI + sweep мёртвых;
+//   * ВЫТЕСНЕНИЕ — LAPIC TSC-deadline (CPUID-детект, фолбэк — прежний
+//     периодический тик): each-диспетчеризация взводит one-shot на
+//     min(RR-квант, остаток бюджета домена, остаток периода) — домен
+//     перебирает квоту В ТОЧНЫЙ МОМЕНТ исчерпания, а не «до тика»;
+//   * idle-будка взводит deadline на границу периода — троттл-лист
+//     возвращается в готовность точно в срок.
 
 use alloc::{
     boxed::Box,
     collections::{BTreeMap, VecDeque},
 };
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use core::cell::UnsafeCell;
+use core::ptr::null_mut;
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use pkg_generic_interface::hal::traits::kmap::IsolationPolicy;
 use pkg_generic_interface::task::scheduler::{
@@ -106,10 +152,24 @@ pub mod off {
 impl UserCtx {
     /// Свежий контекст первого входа: entry + вершина стека, чистое FPU.
     pub fn fresh(entry: usize, stack_top: usize) -> Self {
-        let mut ctx = Self {
-            rip: entry as u64,
-            rflags: arch::boot::USER_RFLAGS,
-            rsp: stack_top as u64,
+        let mut ctx = Self::zeroed();
+        ctx.rip = entry as u64;
+        ctx.rflags = arch::boot::USER_RFLAGS;
+        ctx.rsp = stack_top as u64;
+        // Валидное чистое состояние x87/SSE для fxrstor: FCW=0x037F,
+        // MXCSR=0x1F80 (иначе #GP на fxrstor).
+        ctx.fx[0..2].copy_from_slice(&0x037Fu16.to_le_bytes());
+        let mxcsr_off = 24; // FXSAVE: MXCSR @ 24
+        ctx.fx[mxcsr_off..mxcsr_off + 4].copy_from_slice(&0x1F80u32.to_le_bytes());
+        ctx
+    }
+
+    /// Нулевой скелет (пул/аллокатор: вызывающий заполняет поля фрейма).
+    pub fn zeroed() -> Self {
+        Self {
+            rip: 0,
+            rflags: 0,
+            rsp: 0,
             rax: 0,
             rbx: 0,
             rcx: 0,
@@ -126,13 +186,7 @@ impl UserCtx {
             r14: 0,
             r15: 0,
             fx: [0; 512],
-        };
-        // Валидное чистое состояние x87/SSE для fxrstor: FCW=0x037F,
-        // MXCSR=0x1F80 (иначе #GP на fxrstor).
-        ctx.fx[0..2].copy_from_slice(&0x037Fu16.to_le_bytes());
-        let mxcsr_off = 24; // FXSAVE: MXCSR @ 24
-        ctx.fx[mxcsr_off..mxcsr_off + 4].copy_from_slice(&0x1F80u32.to_le_bytes());
-        ctx
+        }
     }
 }
 
@@ -149,7 +203,8 @@ const READY_CAPACITY: usize = 1024;
 /// (хуки TCB под write-гардом) и rotate собственного потока (per-CPU
 /// эксклюзив); повторный enqueue при живой записи возможен только через
 /// Suspended→Ready (запись отсеется на pick по состоянию) — дубли
-/// безопасны и коротложивущи.
+/// безопасны и короттоживущи. Легаси task-level записи (UUID доменов)
+/// в v0.13 не попадают сюда по построению (хуки ядра — только потоки).
 static READY: pkg_generic_interface::sync::MpmcQueue<ThreadId, READY_CAPACITY> =
     pkg_generic_interface::sync::MpmcQueue::new();
 
@@ -160,8 +215,9 @@ struct Inner {
     /// `cpu_quota`, — до границы периода. Контексты — в `contexts`
     /// (парковка как у Blocked), из готовности исключены.
     throttled: VecDeque<ThreadId>,
-    /// Контексты живых потоков (создаются при первом входе / сохраняются
-    /// при переключении).
+    /// Контексты ПАРКОВАННЫХ потоков (Blocked/Ready/Suspended/троттл —
+    /// v0.13: Running-контекст живёт в per-CPU слоте; карта — только
+    /// для не-исполняющихся, изымается на pick, а не клонируется).
     contexts: BTreeMap<u128, Box<UserCtx>>,
     /// Block-очереди (IPC-endpoint'ы, claims): FIFO.
     block_queues: BTreeMap<u64, VecDeque<ThreadId>>,
@@ -169,7 +225,8 @@ struct Inner {
 }
 
 /// Бекенд-состояние, НЕ попавшее в lock-free структуры: короткий
-/// спин-лок (лист: под ним другие ядровые локи не берутся).
+/// спин-лок (лист: под ним другие ядровые локи не берутся; вкладка из
+/// хуков TcbManager менеджер->SCHED — единственная, односторонняя).
 static INNER: pkg_generic_interface::sync::KSpin<Inner> =
     pkg_generic_interface::sync::KSpin::new(Inner {
         throttled: VecDeque::new(),
@@ -183,39 +240,152 @@ static INNER: pkg_generic_interface::sync::KSpin<Inner> =
 /// 0 = UserTableIsolation (conservative), 1 = MapFullKernel.
 static POLICY: AtomicU8 = AtomicU8::new(0);
 
-// ── ВРЕМЕННАЯ ДИАГНОСТИКА v0.12-bringup (убрать после отладки) ──
-pub static DBG_ENQ: AtomicU64 = AtomicU64::new(0);
-pub static DBG_POP: AtomicU64 = AtomicU64::new(0);
-pub static DBG_STALE: AtomicU64 = AtomicU64::new(0);
-pub static DBG_MARKFAIL: AtomicU64 = AtomicU64::new(0);
-pub static DBG_ENTER: AtomicU64 = AtomicU64::new(0);
+// ───────────────────── Per-CPU кэш контекстов (v0.13) ─────────────────────
 
-/// Снимок счётчиков (print в idle).
-pub fn dbg_snapshot() -> [u64; 5] {
-    [
-        DBG_ENQ.load(Ordering::Relaxed),
-        DBG_POP.load(Ordering::Relaxed),
-        DBG_STALE.load(Ordering::Relaxed),
-        DBG_MARKFAIL.load(Ordering::Relaxed),
-        DBG_ENTER.load(Ordering::Relaxed),
-    ]
+/// Глубина per-CPU пула боксов: покрывает слот + inflight + пик
+/// (save/save/load-паттерны) без аллокатора; излишки честно дропаются.
+const CTX_FREELIST_CAP: usize = 4;
+
+/// Per-CPU состояние контекстов. Элемент массива [`CTX_CPU`] трогает
+/// ТОЛЬКО владелец CPU (см. SAFETY в шапке модуля).
+#[repr(align(64))]
+struct CtxCpu {
+    /// Контекст текущего потока (ключ == GS current_thread): сискол-вход
+    /// пишет сюда без локов; парки экспортируют в карту ДО публикации.
+    slot_key: UnsafeCell<u128>,
+    slot: UnsafeCell<Option<Box<UserCtx>>>,
+    /// Бокс, отданный последнему enter_user этого CPU (Box::leak):
+    /// рециклинг на следующей диспетчеризации (0 — нет).
+    inflight: UnsafeCell<*mut UserCtx>,
+    /// Пул свободных боксов (raw-указатели протухших Box).
+    free: UnsafeCell<[*mut UserCtx; CTX_FREELIST_CAP]>,
+    free_len: UnsafeCell<usize>,
 }
 
-// ───────────────────── CPU-квоты v0.10: период и троттлинг ─────────────────────
+impl CtxCpu {
+    const fn new() -> Self {
+        Self {
+            slot_key: UnsafeCell::new(0),
+            slot: UnsafeCell::new(None),
+            inflight: UnsafeCell::new(null_mut()),
+            free: UnsafeCell::new([null_mut(); CTX_FREELIST_CAP]),
+            free_len: UnsafeCell::new(0),
+        }
+    }
+}
 
-/// Длина CPU-периода — ГЛОБАЛЬНЫХ тиков всех CPU (тик = 1/SCHED_HZ с).
-/// 2 CPU ≈ 100 тиков/с суммарно → период ≈ 1 с стена; квота домена —
-/// доля от этого бюджета (12 из 100 ≈ 12% CPU).
+// SAFETY: элемент CTX_CPU[i] доступен только CPU i (дисциплина шапки:
+// возвращающиеся прерывания кэш не трогают, невозвращающиеся пути
+// взаимоисключительны по потоку управления). Кросс-CPU доступ НЕТ —
+// обмен контекстами идёт через INNER.contexts.
+unsafe impl Sync for CtxCpu {}
+
+static CTX_CPU: [CtxCpu; crate::smp::MAX_CPUS] =
+    [const { CtxCpu::new() }; crate::smp::MAX_CPUS];
+
+/// Свой per-CPU кэш контекстов (cpu = GS cpu_id; индекс в границах —
+/// инвариант smp: cpu_id < MAX_CPUS).
+#[inline]
+fn ctx_cpu(cpu: usize) -> &'static CtxCpu {
+    debug_assert!(cpu < crate::smp::MAX_CPUS);
+    if cpu < crate::smp::MAX_CPUS {
+        &CTX_CPU[cpu]
+    } else {
+        &CTX_CPU[0] // недостижимо (инвариант); безопасный деград
+    }
+}
+
+/// Бокс контекста из per-CPU пула (или аллокатор при пустом пуле).
+/// Горячий путь сискол-входа: без локов, без аллокации в стационаре.
+pub fn alloc_ctx() -> Box<UserCtx> {
+    let c = ctx_cpu(arch::percpu::cpu_id() as usize);
+    // SAFETY: свой элемент; см. дисциплину шапки.
+    unsafe {
+        let len = *c.free_len.get();
+        if len > 0 {
+            let p = (*c.free.get())[len - 1];
+            *c.free_len.get() = len - 1;
+            Box::from_raw(p)
+        } else {
+            Box::new(UserCtx::zeroed())
+        }
+    }
+}
+
+/// Бокс в per-CPU пул (переполнение — честный drop в аллокатор).
+fn recycle_ctx(cpu: usize, b: Box<UserCtx>) {
+    let c = ctx_cpu(cpu);
+    // SAFETY: свой элемент.
+    unsafe {
+        let len = *c.free_len.get();
+        if len < CTX_FREELIST_CAP {
+            (*c.free.get())[len] = Box::into_raw(b);
+            *c.free_len.get() = len + 1;
+        }
+        // иначе: drop(b) — аллокатор
+    }
+}
+
+// ───────────────────── Часы CPU-квот v0.13 (TSC) ─────────────────────
+
+/// Длина CPU-периода в ЕДИНИЦАХ «суммарных тиков всех CPU» (семантика
+/// v0.10 сохранена): wall-время периода = CPU_PERIOD_TICKS/(ncpu*SCHED_HZ)
+/// секунд; 2 CPU ≈ 0.5 с стена. Квота домена — доля от общего бюджета.
 pub const CPU_PERIOD_TICKS: u64 = 100;
 
-/// Глобальный счётчик тиков периода (инкремент — `note_wall_tick`,
-/// вызывается из timer_c на КАЖДОМ тике: пользовательском, ядровом,
-/// idle — иначе троттл-лист зависнет без будящего источника).
-static CPU_TICKS: AtomicU64 = AtomicU64::new(0);
+/// RR-квант (как v0.10-v0.12: SCHED_HZ/10 тиков ≈ 100 мс на отрезок).
+const QUANTUM_TICKS: u64 = arch::boot::SCHED_HZ / 10;
 
-/// Флаг «период завершился — нужен refill». Ставит `note_wall_tick`,
-/// снимает (once) preempt-путь/idle-будка.
-static CPU_PERIOD_WRAP: AtomicBool = AtomicBool::new(false);
+/// Санитайзер джиттера TSC (низ пол заряда — НЕ анти-спин; см.
+/// [`min_charge_cycles`]).
+const MIN_CHARGE_CYCLES: u64 = 1024;
+
+/// Анти-спин-пол заряда за проход диспетчеризации (v0.10-семантика,
+/// v0.13-единицы): минимум 1 ТИК (unit циклов) за каждый отрезок
+/// «диспетчеризация -> парковка/вытеснение» — yield-цикл и
+/// «вычислить-и-заблокироваться» не дешевле честного кванта
+/// (болтливый IPC-DoS паркуется сотни раз за период — каждая
+/// парковка жжёт ядровое время и честно заряжается тиком).
+/// Длинные отрезки — ТОЧНЫЕ циклы: floor подхватывает только
+/// субтик-отрезки (v0.10 грубил и в другую сторону: 2.4 тика
+/// исполнения считались как 2).
+pub fn min_charge_cycles() -> u64 {
+    tsc_unit().max(MIN_CHARGE_CYCLES)
+}
+
+/// Перевзвод one-shot из ядра (!from_user): дедлайн прошёл — эпсилон
+/// (~десятки мкс на ГГц-классе): перезапуск после iret, ядровые
+/// секции короткие (инвариант IF-дисциплины).
+const EPSILON_CYCLES: u64 = 50_000;
+
+/// Глобальная TSC-граница текущего CPU-периода (v0.13). 0 — часы не
+/// инициализированы (лениво: первый refill-чек на BSP задаёт now+период).
+/// Продвижение — CAS: один победитель на границу (refill).
+static PERIOD_END: AtomicU64 = AtomicU64::new(0);
+
+/// Взведённый TSC-deadline СВОЕГО CPU (перевзвод из ядра — timer_c).
+static ARMED_DEADLINE: [AtomicU64; crate::smp::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::smp::MAX_CPUS];
+
+/// Циклов TSC на один тик планировщика (единица квот; калибровка BSP).
+#[inline]
+fn tsc_unit() -> u64 {
+    crate::lapic::tsc_per_tick()
+}
+
+/// RR-квант в циклах TSC.
+#[inline]
+fn quantum_cycles() -> u64 {
+    tsc_unit().saturating_mul(QUANTUM_TICKS)
+}
+
+/// Длина периода в циклах TSC (wall-семантика v0.10: суммарные тики
+/// всех CPU — делим на их число).
+#[inline]
+fn period_cycles() -> u64 {
+    let ncpu = (crate::smp::cpu_count() as u64).max(1);
+    (CPU_PERIOD_TICKS.saturating_mul(tsc_unit()) / ncpu).max(1)
+}
 
 /// Планировщик (единая статика; контракт-объект для TcbManager).
 pub struct X86Sched;
@@ -255,90 +425,103 @@ impl X86Sched {
 
     /// Сохранить контекст текущего потока (вытеснение/блокировка):
     /// гейт передаёт снятый с стека фрейм.
+    ///
+    /// v0.13: пишется в per-CPU СЛОТ (без локов/аллокаций; обычный
+    /// сискол без блока/вытесления дальше слота не идёт). Глобальная
+    /// карта получает контекст только на ПАРКЕ — [`Self::export_slot_if`]
+    /// (хуки enqueue/deschedule, троттл) ДО публикации состояния.
     pub fn save_context(&self, thread: ThreadId, ctx: Box<UserCtx>) {
-        INNER.lock().contexts.insert(thread.as_u128(), ctx);
+        debug_assert_eq!(
+            arch::percpu::current_thread(),
+            thread.as_u128(),
+            "save_context: поток не текущий (слот — только владельцу)"
+        );
+        let c = ctx_cpu(arch::percpu::cpu_id() as usize);
+        // SAFETY: свой элемент; см. дисциплину шапки.
+        unsafe {
+            *c.slot_key.get() = thread.as_u128();
+            let old = (*c.slot.get()).replace(ctx);
+            if let Some(old) = old {
+                recycle_ctx(arch::percpu::cpu_id() as usize, old);
+            }
+        }
+    }
+
+    /// Экспортировать слот потока в глобальную карту (парк: поток покидает
+    /// Running — его контекст обязан стать видимым pick'ерам ДО фиксации
+    /// перехода; хуки стреляют под write-гардом менеджера ДО коммита).
+    pub fn export_slot_if(&self, thread: ThreadId) {
+        let c = ctx_cpu(arch::percpu::cpu_id() as usize);
+        // SAFETY: свой элемент.
+        unsafe {
+            if *c.slot_key.get() != thread.as_u128() {
+                return; // контекст потока — не у нас (уже экспортирован/
+                // взят; кросс-CPU парки сюда не попадают — слот чужого
+                // CPU не читаем)
+            }
+            *c.slot_key.get() = 0;
+            if let Some(b) = (*c.slot.get()).take() {
+                // Вставка заменяет протухший хвост, если он был
+                // (инвариант «Running => в карте пусто» — защита от
+                // деградации, не норма).
+                INNER.lock().contexts.insert(thread.as_u128(), b);
+            }
+        }
+    }
+
+    /// Погасить слот потока без экспорта (публикация не состоялась:
+    /// requeue/throttle вернули false — поток убит в окне вытеснения;
+    /// контекст больше никому не нужен, бокс — в пул).
+    pub fn release_slot_if(&self, thread: ThreadId) {
+        let c = ctx_cpu(arch::percpu::cpu_id() as usize);
+        // SAFETY: свой элемент.
+        unsafe {
+            if *c.slot_key.get() != thread.as_u128() {
+                return;
+            }
+            *c.slot_key.get() = 0;
+            if let Some(b) = (*c.slot.get()).take() {
+                recycle_ctx(arch::percpu::cpu_id() as usize, b);
+            }
+        }
     }
 
     /// Перевыпуск нужен? (гейт проверяет на выходе из сискола; флаг
-    /// ставится тиком или resched-IPI — per-CPU, без блокировок).
+    /// ставится тиком/deadline/IPI — per-CPU, без блокировок).
     pub fn take_need_resched(&self) -> bool {
         arch::percpu::take_need_resched()
-    }
-
-    /// Квант текущего потока истёк? (тик уменьшает квант своего CPU;
-    /// сюда гейт заходит уже с need_resched — атомарное снятие).
-    pub fn quantum_expired(&self) -> bool {
-        arch::percpu::quantum() == 0
     }
 
     /// Выбрать следующий поток: lock-free pop из кольца готовности.
     /// None — пусто. Валидация живости (ленивый deschedule) — в
     /// [`schedule_next`] (нужен glue для чтения состояния TCB).
     ///
-    /// Квант СВОЕМУ CPU (GS); SCHED_HZ/10 тиков ~ 100 мс. v0.10:
-    /// и счётчик потреблённых тиков в ноль — заряд домену с чистого
-    /// листа (см. preempt_step: max(1, slice_used) за вытеснение).
+    /// Квант: периодический фолбэк — тики в GS (как v0.10); TSC-deadline
+    /// — квант взводится arms at finalize (точная граница, тики не нужны).
     pub fn pick_next(&self) -> Option<ThreadId> {
         let next = READY.pop()?;
-        DBG_POP.fetch_add(1, Ordering::Relaxed);
-        arch::percpu::set_quantum(arch::boot::SCHED_HZ / 10);
-        arch::percpu::set_slice_used(0);
+        if !crate::lapic::using_tsc_deadline() {
+            arch::percpu::set_quantum(arch::boot::SCHED_HZ / 10);
+        }
         Some(next)
     }
 
-    /// Вернуть текущий поток в хвост (rotate, RR) — гейт при вытеснении.
-    ///
-    /// SMP v0.12: публикация — ТОЛЬКО через автомат состояний
-    /// (`glue.requeue_thread`: Running -> Ready + enqueue-хук). Прямой
-    /// пуш в кольцо без перехода — баг bring-up: ленивая валидация pick
-    /// отсеивала записи по состоянию (Running) — вытесненные потоки
-    /// терялись навсегда. Метод сохранён для диагностики.
-    #[allow(dead_code)]
-    pub fn rotate_current(&self) {
-        if let Some(t) = self.current_thread() {
-            let _ = READY.push(t);
-        }
-    }
+    // ==== CPU-квоты v0.10/v0.13 (троттлинг песочницы) ====
 
-    // ==== CPU-квоты v0.10 (троттлинг песочницы) ====
-
-    /// Отметить глобальный тик периода (timer_c — КАЖДЫЙ тик ЛЮБОГО CPU,
-    /// ДО развилки user/kernel/idle: иначе троттл-лист зависнет без
-    /// будящего источника). Возврат `true` — период завершился:
-    /// вызывающий ставит need_resched/refill-обработку.
-    pub fn note_wall_tick(&self) -> bool {
-        let t = CPU_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-        if t % CPU_PERIOD_TICKS == 0 {
-            CPU_PERIOD_WRAP.store(true, Ordering::Release);
-            return true;
-        }
-        false
-    }
-
-    /// Есть ли незакрытая граница периода? (idle-будка — дешёвый peek
-    /// без локов; once-снятие — `take_period_wrap` в refill-пути.)
-    pub fn period_wrap_pending(&self) -> bool {
-        CPU_PERIOD_WRAP.load(Ordering::Acquire)
-    }
-
-    /// Снять флаг границы периода (кто снял — тот и делает refill).
-    pub fn take_period_wrap(&self) -> bool {
-        CPU_PERIOD_WRAP.swap(false, Ordering::AcqRel)
-    }
-
-    /// Тики, потреблённые текущим потоком с диспетчеризации, — снять
-    /// (сам заряд домену — в preempt-шаге через glue; минимум 1 — там).
-    pub fn take_slice_used(&self) -> u64 {
-        let v = arch::percpu::slice_used();
-        arch::percpu::set_slice_used(0);
-        v
+    /// Циклы, потреблённые текущим потоком с диспетчеризации (v0.13:
+    /// точный отрезок для заряда; метка — OFF_DISPATCH_TSC в GS,
+    /// ставится finalize_and_enter).
+    pub fn cycles_since_dispatch(&self) -> u64 {
+        crate::lapic::read_tsc().saturating_sub(arch::percpu::dispatch_tsc())
     }
 
     /// Запарковать текущий поток в троттл-лист (домен за пределом
     /// cpu_quota): НЕ возвращается в готовность до границы периода.
-    /// Контекст уже сохранён в `contexts` парком preempt-шага.
+    /// Слот экспортируется в карту (парк: pick после unthrottle возьмёт
+    /// контекст оттуда).
     pub fn throttle_current(&self) {
         if let Some(t) = self.current_thread() {
+            self.export_slot_if(t);
             INNER.lock().throttled.push_back(t);
         }
     }
@@ -360,51 +543,127 @@ impl X86Sched {
         INNER.lock().throttled.len()
     }
 
-    /// Контекст потока (первый вход — построить из start_info).
+    /// Контекст потока (zero-copy v0.13): свой слот (повторный выбор) ->
+    /// глобальная карта парковки (ИЗЪЯТИЕМ; пока поток Running, в карте
+    /// пусто — дублей нет) -> первый вход (start_info ядра). Прошлый
+    /// inflight-бокс рециклируется в пул (asm-чтения завершены).
     pub fn context_of(&self, thread: ThreadId) -> Option<Box<UserCtx>> {
-        {
-            let inner = INNER.lock();
-            if let Some(ctx) = inner.contexts.get(&thread.as_u128()) {
-                // Клонирование fx (680 Б) — переключение не горячее.
-                let mut copy: Box<UserCtx> = Box::new(UserCtx {
-                    rip: ctx.rip,
-                    rflags: ctx.rflags,
-                    rsp: ctx.rsp,
-                    rax: ctx.rax,
-                    rbx: ctx.rbx,
-                    rcx: ctx.rcx,
-                    rdx: ctx.rdx,
-                    rsi: ctx.rsi,
-                    rdi: ctx.rdi,
-                    rbp: ctx.rbp,
-                    r8: ctx.r8,
-                    r9: ctx.r9,
-                    r10: ctx.r10,
-                    r11: ctx.r11,
-                    r12: ctx.r12,
-                    r13: ctx.r13,
-                    r14: ctx.r14,
-                    r15: ctx.r15,
-                    fx: [0; 512],
-                });
-                copy.fx.copy_from_slice(&ctx.fx);
-                return Some(copy);
+        let cpu = arch::percpu::cpu_id() as usize;
+        let c = ctx_cpu(cpu);
+        let mut got: Option<Box<UserCtx>> = None;
+        // SAFETY: свой элемент.
+        unsafe {
+            // 1) собственный слот (поток пере-выбран тем же CPU до парка —
+            // редкий, но легальный путь: запись отсеялась бы по состоянию).
+            if *c.slot_key.get() == thread.as_u128() {
+                *c.slot_key.get() = 0;
+                got = (*c.slot.get()).take();
             }
         }
-        // Первый вход: (entry, stack) из ядра.
-        let (entry, stack) = gate::kernel_glue().thread_start_info(thread)?;
-        Some(Box::new(UserCtx::fresh(entry, stack)))
+        // 2) карта парковки: изъять (владение боксом переходит сюда).
+        if got.is_none() {
+            got = INNER.lock().contexts.remove(&thread.as_u128());
+        }
+        // 3) первый вход: (entry, stack) из ядра.
+        if got.is_none() {
+            let (entry, stack) = gate::kernel_glue().thread_start_info(thread)?;
+            let mut b = alloc_ctx();
+            *b = UserCtx::fresh(entry, stack);
+            got = Some(b);
+        }
+        let b = got?;
+        // Рециклинг прошлого inflight + пометка нового: бокс уйдёт в
+        // Box::leak (finalize), указатель помним сами.
+        // SAFETY: свой элемент; prev принадлежит нашему пулу/аллокатору.
+        unsafe {
+            let prev = *c.inflight.get();
+            if !prev.is_null() {
+                recycle_ctx(cpu, Box::from_raw(prev));
+            }
+            *c.inflight.get() = Box::into_raw(b);
+            Some(Box::from_raw(*c.inflight.get()))
+        }
     }
 
-    /// Забыть контекст мёртвого потока (гейт после reap).
+    /// Забыть контекст мёртвого потока (гейт после reap; слот — свой,
+    /// карта — кросс-CPU: kill-пути ядра гасят потоки с любого CPU).
     pub fn drop_context(&self, thread: ThreadId) {
-        INNER.lock().contexts.remove(&thread.as_u128());
+        let cpu = arch::percpu::cpu_id() as usize;
+        let c = ctx_cpu(cpu);
+        // SAFETY: свой элемент.
+        unsafe {
+            if *c.slot_key.get() == thread.as_u128() {
+                *c.slot_key.get() = 0;
+                if let Some(b) = (*c.slot.get()).take() {
+                    recycle_ctx(cpu, b);
+                }
+                return;
+            }
+        }
+        if let Some(b) = INNER.lock().contexts.remove(&thread.as_u128()) {
+            recycle_ctx(cpu, b);
+        }
+    }
+
+    /// Подмет записи карты, чей TCB разрушен (ядровые kill-пути без
+    /// гейт-reap: user_fault-каскад, kill-сисколы — v0.12 оставлял их
+    /// навсегда). Граница периода: карта мала, поток не горячий.
+    ///
+    /// Локи: ключи копируются под INNER, БЕЗ glue-вызовов (вкладка
+    /// INNER->менеджер запрещена — экспорт-хуки вкладывают наоборот);
+    /// state-запросы — без локов; удаление — повторный короткий INNER.
+    pub fn sweep_dead_contexts(&self) -> usize {
+        let keys: alloc::vec::Vec<u128> = {
+            let inner = INNER.lock();
+            inner.contexts.keys().copied().collect()
+        };
+        let mut dead = 0usize;
+        for k in keys {
+            let gone = gate::kernel_glue()
+                .thread_state(ThreadId::from_u128(k))
+                .is_none();
+            if gone {
+                if let Some(b) = INNER.lock().contexts.remove(&k) {
+                    drop(b); // редкий путь — аллокатор, не пул (чужой поток)
+                }
+                dead += 1;
+            }
+        }
+        dead
     }
 
     /// Есть ли готовые? (lock-free peek: длина — атомик; лишние
     /// пробуждения idle отсеет schedule_next).
     pub fn has_ready(&self) -> bool {
         !READY.is_empty()
+    }
+
+    // ==== TSC-deadline v0.13 (точное вытеснение по квант/бюджет/период) ====
+
+    /// Взвести one-shot вытеснения для входящего потока (finalize; только
+    /// в TSC-deadline-режиме): deadline = now + min(RR-квант, остаток
+    /// бюджета домена, остаток CPU-периода). Домен без квоты — квант RR;
+    /// троттленный ре-разбуженный поток (бюджет ~0) погаснет немедленно —
+    /// квота больше не «до ближайшего тика».
+    pub fn arm_preempt_deadline(&self, thread: ThreadId) {
+        if !crate::lapic::using_tsc_deadline() {
+            return;
+        }
+        let now = crate::lapic::read_tsc();
+        let mut span = quantum_cycles();
+        if let Some(glue) = startup::glue() {
+            if let Some(left) = glue.cpu_budget_cycles_left(thread) {
+                span = span.min(left);
+            }
+        }
+        let end = PERIOD_END.load(Ordering::Acquire);
+        if end > now {
+            span = span.min(end - now);
+        }
+        let deadline = now.saturating_add(span.max(1));
+        let cpu = arch::percpu::cpu_id() as usize;
+        ARMED_DEADLINE[cpu].store(deadline, Ordering::Relaxed);
+        crate::lapic::arm_tsc_deadline(deadline);
     }
 }
 
@@ -442,9 +701,10 @@ impl SchedulerInterface for X86Sched {
     }
 
     fn enqueue(&self, task: TaskId) -> Result<(), SchedulerError> {
-        // Lock-free push из хука TCB (write-гард менеджера держится —
-        // MPMC локов не берёт, инверсии рангов нет).
-        DBG_ENQ.fetch_add(1, Ordering::Relaxed);
+        // Поток публикуется в Ready: контекст — из слота в карту ДО
+        // push (write-гард менеджера держится — pick'ер заблокирован на
+        // чтении состояния до коммита; MPMC и карта локов не вкладывают).
+        self.export_slot_if(task);
         READY
             .push(task)
             .map_err(|_| SchedulerError::Backend("ready ring full"))?;
@@ -458,10 +718,13 @@ impl SchedulerInterface for X86Sched {
     }
 
     fn deschedule(&self, task: TaskId) -> Result<(), SchedulerError> {
-        // Готовность — ЛЕНИВО: запись (если есть) отсеет pick по
-        // состоянию TCB; удаление из кольца невозможно без обхода.
-        // Троттл-лист — точное удаление (поток мог быть припаркован
-        // квотой, когда его погасили (Dead-каскад) или приостановили).
+        // Поток покидает Running (Blocked/Suspended/Dead). Контекст —
+        // из слота в карту (свой CPU: блокируется/приостанавливается
+        // только исполняющийся; кросс-CPU kill слот не трогает — там
+        // ключ не совпадёт, чистка на стороне владельца). Записи кольца —
+        // ленивый отсев на pick; троттл-лист — точное удаление (поток
+        // мог быть припаркован квотой, когда его погасили).
+        self.export_slot_if(task);
         let mut inner = INNER.lock();
         if let Some(pos) = inner.throttled.iter().position(|&t| t == task) {
             inner.throttled.remove(pos);
@@ -563,13 +826,12 @@ impl SchedulerInterface for X86Sched {
         Ok(())
     }
 
-    /// Тик планировщика: уменьшить квант СВОЕГО CPU (per-CPU, без локов —
-    //  вызывается timer_c на быстром пути); при нуле — флаг resched.
-    /// v0.10: копит и `slice_used` — потреблённые тики текущего потока
-    /// (заряд домену — при вытеснении в preempt-шаге).
+    /// Тик планировщика — ТОЛЬКО периодический фолбэк (v0.13: в
+    /// TSC-deadline-режиме квант — граница one-shot, тиков нет):
+    /// уменьшить квант СВОЕГО CPU (per-CPU, без локов); при нуле —
+    /// флаг resched.
     fn perform_tick(&self, delta: u64) {
         let _ = delta; // квант считаем тиками (см. gs:QUANTUM)
-        arch::percpu::set_slice_used(arch::percpu::slice_used() + 1);
         let q = arch::percpu::quantum();
         if q > 0 {
             let q = q - 1;
@@ -581,22 +843,104 @@ impl SchedulerInterface for X86Sched {
     }
 }
 
-// ───────────────────── Диспетчеризация (гейт вызывает) ─────────────────────
+// ───────────────────── Часы периода (v0.13: TSC-граница) ─────────────────────
 
-/// Граница CPU-периода (v0.10): сбросить учёт квот в ядре + вернуть
-/// троттл-лист в готовность. Кто снял флаг — тот и выполнил (один раз
-/// на границу). Возврат — был ли refill.
+/// Пора закрывать период? (lock-free peek: rdtsc против PERIOD_END;
+/// таймер/gate ставит need_resched, закрытие — `cpu_period_refill_if_due`).
+pub fn period_due() -> bool {
+    let end = PERIOD_END.load(Ordering::Acquire);
+    end != 0 && crate::lapic::read_tsc() >= end
+}
+
+/// Текущая TSC-граница периода (idle-будка: взводит one-shot; 0 —
+/// часы ещё не инициализированы, будка берёт now+период).
+pub fn period_end_tsc() -> u64 {
+    let end = PERIOD_END.load(Ordering::Acquire);
+    if end != 0 {
+        end
+    } else {
+        crate::lapic::read_tsc().saturating_add(period_cycles())
+    }
+}
+
+/// Взвод будки idle (TSC-deadline): граница периода + запоминание в
+/// ARMED (перевзвод из ядра — rearm_deadline_from_kernel — продлит её,
+/// а не уйдёт в эпсилон-цикл).
+pub fn arm_idle_deadline() {
+    let deadline = period_end_tsc();
+    let cpu = arch::percpu::cpu_id() as usize;
+    ARMED_DEADLINE[cpu].store(deadline, Ordering::Relaxed);
+    crate::lapic::arm_tsc_deadline(deadline);
+}
+
+/// Перевзвод one-shot из ядра (timer_c !from_user: дедлайн сработал,
+/// а preempt нельзя — держатель лока/спин). Границы ядра короткие:
+/// перевзвод на прежнюю (если ещё впереди) либо эпсилон — вытеснение
+/// с первым же возвратом в пользователя.
+pub fn rearm_deadline_from_kernel() {
+    let cpu = arch::percpu::cpu_id() as usize;
+    let now = crate::lapic::read_tsc();
+    let armed = ARMED_DEADLINE[cpu].load(Ordering::Relaxed);
+    let next = if armed > now {
+        armed
+    } else {
+        now.saturating_add(EPSILON_CYCLES)
+    };
+    ARMED_DEADLINE[cpu].store(next, Ordering::Relaxed);
+    crate::lapic::arm_tsc_deadline(next);
+}
+
+/// Граница CPU-периода (v0.13): TSC-часы, закрытие — CAS (один
+/// победитель). Победивший: сброс учёта квот в ядре (glue) + возврат
+/// троттл-листа в готовность + подмет мёртвых контекстов + resched-IPI.
 ///
-/// Вызывается: preempt-шагом (timer_c/выход из сискола), idle-будкой —
-/// до разбора очередей готовности. Локи: атомик-флаг → glue (TCB
-/// write) → троттл-дренаж (SchedKSpin) — последовательно, без гнёзд.
+/// Вызывается: preempt-шагом (первым делом — до заряда: свежий период
+/// начинает счёт с нуля), idle-будкой после hlt, timer_c — только
+/// флагом (need_resched) — закрытие НЕ из прерывания ядра (держатели
+/// локов: вложенный захват менеджера из таймера — дедлок на спинах).
+///
+/// Возврат — был ли выполнен refill (idle по нему проверяет готовность).
 pub fn cpu_period_refill_if_due() -> bool {
-    if !SCHED.take_period_wrap() {
+    let now = crate::lapic::read_tsc();
+    // Ленивая инициализация часов (первый вызов): граница — now+период.
+    if PERIOD_END.load(Ordering::Acquire) == 0 {
+        let _ = PERIOD_END.compare_exchange(
+            0,
+            now.saturating_add(period_cycles()),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        return false;
+    }
+    // Продвижение границы до будущего: каждый успешный CAS — один
+    // шаг периода; победитель шага делает refill (долгий простой
+    // закрывает несколько шагов — пропущенные границы безвредны:
+    // счётчики доменов уже пусты).
+    let mut refilled = false;
+    loop {
+        let end = PERIOD_END.load(Ordering::Acquire);
+        if now < end {
+            break;
+        }
+        match PERIOD_END.compare_exchange(
+            end,
+            end.saturating_add(period_cycles()),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                refilled = true;
+            }
+            Err(_) => continue, // другой CPU продвинул — переоценка
+        }
+    }
+    if !refilled {
         return false;
     }
     if let Some(glue) = startup::glue() {
         glue.on_cpu_period();
         let n = SCHED.unthrottle_all();
+        let _ = SCHED.sweep_dead_contexts();
         if n > 0 {
             // Разбудить прочие CPU: в готовности появились потоки
             // (как enqueue — шторм IPI на всплесках принят ценой простоты).
@@ -608,53 +952,67 @@ pub fn cpu_period_refill_if_due() -> bool {
     true
 }
 
-/// Вытеснение текущего потока с учётом CPU-квот (v0.10/v0.12).
+// ───────────────────── Диспетчеризация (гейт вызывает) ─────────────────────
+
+/// Вытеснение текущего потока с учётом CPU-квот (v0.10/v0.12/v0.13).
 ///
 /// Единый preempt-шаг гейта (вызывается и из timer_c, и из выхода из
 /// сискола — то есть при квант-истечении, IPI-resched и THREAD_YIELD):
 ///   1. закрыть границу CPU-периода (refill квот — до заряда: свежий
 ///      период начинает счёт с нуля, заряд в старый невозможен);
-///   2. зарядить домену владельца max(1, slice_used) тиков через glue
-///      (ядро решает: троттлить домен или ещё можно исполняться);
-///   3. СОХРАНИТЬ КОНТЕКСТ (SMP v0.12: публикация готовности — только
-///      после сохранения: иначе другой CPU войдёт в поток со старым
-///      контекстом в окне между enqueue и save);
-///   4. публикация: requeue (Running -> Ready + enqueue-хук) или
-///      троттл-парк (Ready без очереди + троттл-лист);
+///   2. зарядить домену владельца циклы отрезка (rdtsc-разность с
+///      метки диспетчеризации; субтик-точно, включая ядровые участки;
+///      анти-спин-пол — min_charge_cycles: 1 тик за проход, как v0.10)
+///      через glue (ядро решает: троттлить домен или исполняться дальше);
+///   3. СОХРАНИТЬ КОНТЕКСТ в per-CPU слот (без локов; публикация —
+///      только после сохранения: другой CPU войдёт в поток со старым
+///      контекстом в окне между enqueue и save — невозможно);
+///   4. публикация: requeue (Running -> Ready + enqueue-хук: экспорт
+///      слота в карту + кольцо) или троттл-парк (Ready без очереди +
+///      троттл-лист; экспорт — внутри throttle_current);
+///      отказ публикации (поток убит в окне) — слот гасим в пул;
 ///   5. schedule_next (не возвращается).
 ///
 /// Замечание о гранулярности: домен, чей квот перебран, может иметь
 /// второй поток в готовности — он отработает до одного вытеснения
-/// (ограниченный перерасход ≤ живые_потоки × квант на границу).
+/// (ограниченный перерасход ≤ живые_потоки × квант на границу; в
+/// TSC-deadline-режиме перерасход дополнительно срезается точным
+/// дедлайном бюджета каждого входящего потока).
 pub fn preempt_step(ctx: Box<UserCtx>) -> ! {
     cpu_period_refill_if_due();
     let mut throttled = false;
     if let Some(glue) = startup::glue() {
         if let Some(cur) = SCHED.current_thread() {
-            // Минимум 1 тик за проход диспетчеризации: yield-цикл не
-            // дешевле честного кванта (анти-спин-лазейка для квот).
-            let used = SCHED.take_slice_used().max(1) as usize;
-            throttled = glue.on_timeslice_consumed(cur, used);
+            let cycles = SCHED
+                .cycles_since_dispatch()
+                .max(min_charge_cycles());
+            throttled = glue.on_cpu_cycles_consumed(cur, cycles);
         }
     }
     if let Some(cur) = SCHED.current_thread() {
-        // Шаг 3: контекст — ДО любой публикации готовности.
+        // Шаг 3: контекст — в слот, ДО любой публикации готовности.
         SCHED.save_context(cur, ctx);
         // Шаг 4: публикация через автомат состояний ядра.
         if let Some(glue) = startup::glue() {
             if throttled && glue.throttle_thread(cur) {
-                // Running -> Ready без очереди: в троттл-лист до
-                // границы периода (контекст уже сохранён — возобновление
-                // возьмёт его как есть).
+                // Running -> Ready без очереди: троттл-лист до границы
+                // периода (контекст экспортирован внутри — возобновление
+                // после unthrottle возьмёт его из карты).
                 SCHED.throttle_current();
             } else {
-                // Rotate (RR): Ready + кольцо (+ resched-IPI из хука).
-                // Отказ (поток убит/приостановлен в окне вытеснения) —
-                // без ре-очереди: дальше — «поток уже не наш».
-                let _ = glue.requeue_thread(cur);
+                // Rotate (RR): Ready + кольцо (enqueue-хук экспортирует
+                // слот ДО push). Отказ (поток убит в окне вытеснения) —
+                // без ре-очереди: слот в пул, дальше — «поток уже не наш».
+                let requeued = glue.requeue_thread(cur);
+                if !requeued {
+                    SCHED.release_slot_if(cur);
+                }
             }
         } else {
-            // До kinit (idle-холостой путь) — квот и glue нет: rotate.
+            // До kinit (idle-холостой путь) — квот и glue нет: экспорт
+            // слота в карту и прямой rotate (SMP ещё спит — конкуренции
+            // нет; слот обязан покинуть CPU: дальше schedule_next).
+            SCHED.export_slot_if(cur);
             let _ = READY.push(cur);
         }
     }
@@ -663,10 +1021,12 @@ pub fn preempt_step(ctx: Box<UserCtx>) -> ! {
 
 /// Выбрать следующий поток и уйти в него (не возвращается).
 ///
-/// Порядок: валидация состояния (ленивый deschedule: записи мёртвых/
-/// заблокированных отсеиваются) → activate CR3 владельца →
-/// mark_running (финальная защита Ready→Running) → switch_to(ctx).
-/// Нет готовых — idle-цикл (см. gate::idle_loop): сюда не возвращаемся.
+/// Порядок: валидация состояния (ленивый deschedule: записи
+/// заблокированных/приостановленных/убитых отсеиваются; легаси
+/// task-level записей с v0.13 не существует — ядро пушит только
+/// потоки) → activate CR3 владельца → mark_running (финальная защита
+/// Ready→Running) → switch_to(ctx). Нет готовых — idle-цикл
+/// (см. gate::idle_loop): сюда не возвращаемся.
 pub fn schedule_next() -> ! {
     loop {
         let next = match SCHED.pick_next() {
@@ -676,13 +1036,11 @@ pub fn schedule_next() -> ! {
             }
         };
         // Ленивый deschedule: запись могла протухнуть (поток перевели в
-        // Blocked/Suspended/Dead после enqueue; либо это UUID задачи из
-        // легаси task-level set_state — потоков с таким ID нет). Мёртвых
-        // НЕ reap-им (владелец состояния — их собственные пути), просто мимо.
+        // Blocked/Suspended/Dead после enqueue). Мёртвых НЕ reap-им
+        // (владелец состояния — их собственные пути), просто мимо.
         match gate::kernel_glue().thread_state(next) {
             Some(pkg_generic_interface::task::TaskState::Ready) => {}
             _ => {
-                DBG_STALE.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
         }
@@ -704,15 +1062,16 @@ pub fn schedule_next() -> ! {
         // Финальная защита от воскрешения: Ready→Running под write-гардом
         // TCB; провал (Kill в окне между валидацией и запуском) = мимо.
         if !gate::mark_running(next) {
-            DBG_MARKFAIL.fetch_add(1, Ordering::Relaxed);
+            // Контекст уже изъят (наш inflight): рециклинг произойдёт на
+            // следующем context_of этого CPU — ок; поток мёртв — мимо.
             continue;
         }
-        DBG_ENTER.fetch_add(1, Ordering::Relaxed);
         gate::finalize_and_enter(next, ctx);
     }
 }
 
-/// Число живых контекстов (для отчёта).
+/// Число паркованных контекстов (для отчёта; v0.13: карта — только
+/// не-Running, Running-контексты живут в per-CPU слотах).
 pub fn context_count() -> usize {
     INNER.lock().contexts.len()
 }

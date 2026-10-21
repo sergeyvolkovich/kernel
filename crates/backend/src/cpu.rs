@@ -340,7 +340,7 @@ pub fn has_rdcl_no() -> bool {
 /// Сырой CPUID (leaf, subleaf) -> (eax, ebx, ecx, edx).
 ///
 /// EBX занят LLVM — обходим сохранением rbx на стек.
-fn cpuid_raw(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
+pub(crate) fn cpuid_raw(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
     let a: u32;
     let b: u32;
     let c: u32;

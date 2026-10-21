@@ -206,7 +206,12 @@ impl startup::Platform for X86Platform {
             // IRTE-ремаппинг линий видит включённый IR.
             crate::ioapic::init();
         }
-        if startup::glue().is_some() {
+        if let Some(glue) = startup::glue() {
+            // v0.13: единица CPU-времени — циклов TSC на тик (квоты
+            // субтик-точны; TSC откалиброван в start_timer до kinit).
+            // ДО release_aps: дальше значение неизменно, читается без
+            // локов на горячем пути заряда.
+            glue.set_cpu_time_unit(crate::lapic::tsc_per_tick());
             // APы из парковки в планировщик (resched-IPI будит hlt).
             crate::smp::release_aps();
         }

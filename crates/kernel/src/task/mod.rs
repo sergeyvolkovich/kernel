@@ -38,6 +38,8 @@ pub(crate) use thread::{RecvAnyPark, SendThreadOffer};
 
 use alloc::boxed::Box;
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use crate::sync::KRwLock;
 
 use intrusive_collections::{Bound, KeyAdapter, RBTree, RBTreeLink, UnsafeRef, intrusive_adapter};
@@ -139,6 +141,11 @@ pub(crate) struct TcbInner {
 /// `sync`, вложенность допустима только вниз по таблице рангов).
 pub struct TcbManager {
     inner: KRwLock<TcbInner>,
+    /// Единица CPU-времени v0.13: циклов на один «тик» квоты. Квота
+    /// `cpu_quota` тиков = `quota × unit` циклов потребления. Дефолт 1
+    /// (тики == циклы — юнит-тесты/платформы без TSC); x86-бекенд
+    /// задаёт калибровкой TSC (`lapic::tsc_per_tick`) до старта SMP.
+    cpu_unit: AtomicU64,
 }
 
 impl TcbManager {
@@ -151,7 +158,23 @@ impl TcbManager {
                 threads: ThreadInner::new()?,
                 scheduler: None,
             }),
+            cpu_unit: AtomicU64::new(1),
         })
+    }
+
+    /// Задать единицу CPU-времени (циклов на тик; v0.13 — точность
+    /// квот). Вызывает платформа ОДИН раз до старта SMP/диспетчеризации:
+    /// читается без локов на горячем пути заряда. Значение 0 вырождено
+    /// и клампится в 1 (учёт остаётся в прежней единице).
+    pub fn set_cpu_time_unit(&self, cycles_per_tick: u64) -> Result<(), TaskError> {
+        // 0 вырожден: клампим в 1 (учёт остаётся в прежней единице).
+        self.cpu_unit.store(cycles_per_tick.max(1), Ordering::Release);
+        Ok(())
+    }
+
+    /// Единица CPU-времени (циклов на тик; дефолт 1).
+    pub fn cpu_time_unit(&self) -> u64 {
+        self.cpu_unit.load(Ordering::Acquire)
     }
 
     // ==== Планировщик ====
@@ -160,10 +183,14 @@ impl TcbManager {
     /// сервис ядра со временем жизни программы).
     ///
     /// После регистрации менеджер уведомляет бекенд о переходах автомата
-    /// состояний ЗАДАЧ (легаси-модель, для платформ без потоков) и ПОТОКОВ
-    /// (L4-модель; см. `thread::TcbManager::create_thread`):
+    /// состояний ПОТОКОВ (L4-модель: поток — единственная единица
+    /// планирования; см. `thread::TcbManager::create_thread`).
+    /// ЗАДАЧИ-домены планировщику не адресуются: v0.13 убрал легаси-
+    /// уведомления уровня задач (модель «платформ без потоков») — на
+    /// L4-платформах их enqueue порождал записи-призраки в очереди
+    /// готовности (шум stale) и пустые resched-IPI на каждый спавн домена.
     ///
-    /// | переход в        | хук                            |
+    /// | переход потока в | хук                            |
     /// |------------------|--------------------------------|
     /// | `Ready` (create, из Blocked/Suspended) | `enqueue`      |
     /// | `Blocked`/`Suspended`/`Dead`           | `deschedule`   |
@@ -171,7 +198,7 @@ impl TcbManager {
     ///
     /// Хуки вызываются ДО фиксации перехода: отказ бекенда
     /// ([`TaskError::Scheduler`]) оставляет автомат состояний нетронутым,
-    /// а при создании задачи/потока — полностью откатывает регистрацию.
+    /// а при создании потока — полностью откатывает регистрацию.
     ///
     /// Контракт реентерабельности: хуки вызываются под `write`
     /// менеджера — синхронный реентери в методы `TcbManager` из бекенда
@@ -191,13 +218,17 @@ impl TcbManager {
 
     // ==== Жизненный цикл задачи ====
 
-    /// Создаёт задачу с уникальным `task_id` в состоянии `Ready`.
+    /// Создаёт задачу-домен с уникальным `task_id` в состоянии `Ready`.
     ///
     /// Идентификатор назначает вызывающая сторона; повторная регистрация —
     /// [`TaskError::TaskExists`] (коллизия с ThreadId — тоже, общее
-    /// пространство имён L4). При зарегистрированном планировщике задача
-    /// ставится в очередь бекенда (`enqueue`; легаси-модель платформ без
-    /// потоков); отказ бекенда откатывает создание целиком.
+    /// пространство имён L4). Планировщик НЕ уведомляется: домен — контейнер
+    /// защиты (cspace + адресное пространство + атрибуты), а не единица
+    /// планирования; исполняемость домена определяется его ПОТОКАМИ
+    /// (первый `THREAD_CREATE` сделает `enqueue` бекенду). Легаси-вызов
+    /// `enqueue(task_id)` (v0.12 и раньше) пушел UUID домена в кольцо
+    /// готовности — на x86-бекенде такие записи отсеивались на pick как
+    /// stale (шум) и попутно рассылали resched-IPI всем CPU.
     pub fn create(&self, task_id: TaskId, priority: TaskPriority) -> Result<(), TaskError> {
         let mut inner = self.inner.write();
 
@@ -241,17 +272,9 @@ impl TcbManager {
         let node_ref = unsafe { UnsafeRef::from_raw(node_ptr) };
         inner.by_uuid.insert(node_ref);
 
-        // Хук планировщика после успешной регистрации TCB: бекенд получает
-        // id уже существующей Ready-задачи. Отказ — полный откат создания
-        // (снятие с реестра, освобождение слота с уничтожением TCB).
-        if let Some(s) = inner.scheduler {
-            if let Err(e) = s.enqueue(task_id) {
-                inner.by_uuid.find_mut(&task_id).remove();
-                let freed = inner.tasks.free(slot.idx);
-                debug_assert!(freed, "слот только что выделен");
-                return Err(TaskError::Scheduler(e));
-            }
-        }
+        // Хука планировщика НЕТ (v0.13): единица планирования — поток;
+        // домен становится исполнимым, когда в нём создан первый поток
+        // (`create_thread` -> `enqueue`). Регистрация безоткатна.
         Ok(())
     }
 
@@ -388,21 +411,36 @@ impl TcbManager {
         }
     }
 
-    // ==== CPU-квоты v0.10 (учёт троттлинга песочницы) ====
+    // ==== CPU-квоты v0.10/v0.13 (учёт троттлинга песочницы; точность — циклы TSC) ====
 
-    /// Зарядить домену `ticks` тиков CPU (вытеснение потока гейтом
-    /// планировщика; минимум 1 за проход — анти-спин для yield-циклов).
-    ///
-    /// Потреблённое не отказываем — счётчик клампится в квоту. Возврат
-    /// `Ok(true)` — домен за пределом `cpu_quota`: планировщик обязан
-    /// запарковать вытеснённый поток до границы периода (троттлинг).
-    /// Первый вход за предел (и каждый после сброса периода) — аудит
-    /// песочницы + `cpu_throttle_events += 1`. Квота `usize::MAX`
-    /// (доверенный домен) — быстрый путь без бухгалтерии.
+    /// Зарядить домену `ticks` тиков CPU (v0.10-совместимый фасад:
+    /// платформы/тесты оперируют тиками; фактический учёт — в циклах
+    /// через [`Self::charge_cpu_cycles`]).
     pub fn charge_cpu(&self, task_id: &TaskId, ticks: usize) -> Result<bool, TaskError> {
-        if ticks == 0 {
+        let unit = self.cpu_unit.load(Ordering::Acquire);
+        let cycles = (ticks as u64).saturating_mul(unit);
+        self.charge_cpu_cycles(task_id, cycles)
+    }
+
+    /// Зарядить домену `cycles` циклов фактического потребления (v0.13:
+    /// гейт измеряет отрезок исполнения rdtsc-разностью — субтик-точное
+    /// время, включая ядровые участки потока; «минимум 1 тик» больше не
+    /// нужен: yield-цикл не дешевле честного кванта, он честно измерен).
+    ///
+    /// Бюджет периода — `quota × unit` циклов (`unit` из
+    /// [`Self::set_cpu_time_unit`]; u128 — квота usize::MAX не
+    /// переполняется до быстрого пути ниже). Потреблённое не
+    /// отказываем — счётчик клампится в бюджет. Возврат `Ok(true)` —
+    /// домен за пределом `cpu_quota`: планировщик обязан запарковать
+    /// вытеснённый поток до границы периода (троттлинг). Первый вход
+    /// за предел — аудит песочницы + `cpu_throttle_events += 1`.
+    /// Квота `usize::MAX` (доверенный домен) — быстрый путь без
+    /// бухгалтерии; `cpu_used` (тики, аудит) — floor-производное.
+    pub fn charge_cpu_cycles(&self, task_id: &TaskId, cycles: u64) -> Result<bool, TaskError> {
+        if cycles == 0 {
             return Ok(false);
         }
+        let unit = self.cpu_unit.load(Ordering::Acquire);
         let mut inner = self.inner.write();
         let node = find_task(&inner, task_id).ok_or(TaskError::TaskNotFound(*task_id))?;
         // SAFETY: эксклюзивный доступ под borrow_mut.
@@ -411,24 +449,46 @@ impl TcbManager {
         if quota == usize::MAX {
             return Ok(false);
         }
-        let total = tcb.usage.cpu_used.saturating_add(ticks);
-        if total < quota {
-            tcb.usage.cpu_used = total;
+        let budget = quota as u128 * unit as u128;
+        let used = tcb.usage.cpu_used_cycles.saturating_add(cycles);
+        if (used as u128) < budget {
+            tcb.usage.cpu_used_cycles = used;
+            tcb.usage.cpu_used = (used / unit) as usize;
             return Ok(false);
         }
-        // За пределом: счётчик клампится, флаг один раз логируется.
+        // За пределом: счётчик клампится в бюджет, флаг один раз логируется.
+        tcb.usage.cpu_used_cycles = budget.min(u64::MAX as u128) as u64;
         tcb.usage.cpu_used = quota;
         if !tcb.usage.cpu_throttled {
             tcb.usage.cpu_throttled = true;
             tcb.usage.cpu_throttle_events = tcb.usage.cpu_throttle_events.saturating_add(1);
             sandbox_audit(&alloc::format!(
-                "cpu quota: domain {} throttled (charged {} ticks, limit {} per period)",
+                "cpu quota: domain {} throttled (charged {} cycles, limit {} ticks per period)",
                 tcb.task_id,
-                total,
+                used,
                 quota
             ));
         }
         Ok(true)
+    }
+
+    /// Остаток бюджета домена в циклах до конца периода (v0.13: база
+    /// TSC-deadline — вытесление в ТОЧНЫЙ момент исчерпания, а не на
+    /// ближайшем тике). `None` — без квоты/домен неизвестен ( deadline
+    /// не назначается: только RR-квант).
+    pub fn cpu_budget_cycles_left(&self, task_id: &TaskId) -> Option<u64> {
+        let unit = self.cpu_unit.load(Ordering::Acquire);
+        let inner = self.inner.read();
+        let node = find_task(&inner, task_id)?;
+        // SAFETY: только чтение.
+        let tcb: &TaskObj = unsafe { &*UnsafeRef::into_raw(node) };
+        let quota = tcb.limits.cpu_quota;
+        if quota == usize::MAX {
+            return None;
+        }
+        let budget = quota as u128 * unit as u128;
+        let left = budget.saturating_sub(tcb.usage.cpu_used_cycles as u128);
+        Some(left.min(u64::MAX as u128) as u64)
     }
 
     /// Граница CPU-периода: сбросить учёт всех доменов (вызывает бекенд
@@ -454,6 +514,7 @@ impl TcbManager {
                 t.usage.cpu_throttled = false;
             }
             t.usage.cpu_used = 0;
+            t.usage.cpu_used_cycles = 0;
         }
         unthrottled
     }
@@ -583,12 +644,12 @@ impl TcbManager {
     /// планировщика; сбор потока идёт без удержания borrow, чтобы
     /// `thread_set_state` не реентерил лок менеджера).
     ///
-    /// При зарегистрированном планировщике переход сначала уведомляет бекенд
-    /// (`enqueue` в `Ready`, `deschedule` в `Blocked`/`Suspended`/`Dead`; в
-    /// `Running` хука нет — диспетчеризация и есть событие планировщика,
-    /// состояние выставляет платформенный glue после `switch_context`).
-    /// Отказ бекенда ([`TaskError::Scheduler`]) НЕ фиксирует переход:
-    /// состояние и поколение остаются прежними.
+    /// Уведомления планировщика на уровне ЗАДАЧИ нет (v0.13): хуки —
+    /// контракт ПОТОКОВ (`thread_set_state`: `enqueue` в `Ready`,
+    /// `deschedule` в `Blocked`/`Suspended`/`Dead`). Задача-домен
+    /// планировщику не адресуется (легаси-записи UUID задач в очереди
+    /// готовности были шумом stale); `Dead`-каскад ниже гасит потоки
+    /// поодиночке — каждый со своими хуками.
     pub fn set_state(&self, task_id: &TaskId, to: TaskState) -> Result<TaskState, TaskError> {
         // Фаза 1: перевод задачи под borrow + сбор живых потоков для каскада.
         let (from, live_threads) = {
@@ -607,20 +668,11 @@ impl TcbManager {
                 });
             }
 
-            // Хук планировщика ДО фиксации: отказ бекенда оставляет автомат
-            // состояний и поколение объекта нетронутыми.
-            if let Some(s) = inner.scheduler {
-                let notified = match to {
-                    TaskState::Ready => s.enqueue(*task_id),
-                    TaskState::Blocked | TaskState::Suspended | TaskState::Dead => {
-                        s.deschedule(*task_id)
-                    }
-                    // Диспетчеризация — событие самого планировщика: в Running
-                    // задачу переводит платформенный код после switch_context.
-                    TaskState::Running => Ok(()),
-                };
-                notified.map_err(TaskError::Scheduler)?;
-            }
+            // Планировщик НЕ уведомляется (v0.13): домен — не единица
+            // планирования; хуки бекенда — контракт ПОТОКОВ, их получит
+            // Dead-каскад ниже (thread_set_state на каждом живом потоке).
+            // Легаси-записи уровня задач в очереди готовности были шумом
+            // stale (и источником пустых resched-IPI).
 
             if to == TaskState::Dead {
                 tcb.hdr.kill();
@@ -847,6 +899,67 @@ mod tests {
         // Несуществующий домен — ошибка, а не false.
         let ghost = uuid_next();
         assert!(tasks.charge_cpu(&ghost, 1).is_err());
+    }
+
+    /// v0.13: субтик-точность — заряд циклами при единице «циклов на
+    /// тик» > 1. Квота 3 тика = 30 циклов: отрезки по 3 цикла (каждый
+    /// меньше тика — раньше недоучитывались/пересчитывались в тиках)
+    /// наполняют бюджет точно, исчерпание — ровно на границе.
+    #[test]
+    fn cpu_quota_subtick_cycles_precision() {
+        let tasks = TcbManager::new().unwrap();
+        let dom = uuid_next();
+        tasks.create(dom, TaskPriority::DEFAULT).unwrap();
+        tasks
+            .set_limits(
+                &dom,
+                TaskLimits {
+                    cpu_quota: 3,
+                    ..TaskLimits::UNLIMITED
+                },
+            )
+            .unwrap();
+        tasks.set_cpu_time_unit(10).unwrap(); // 1 тик = 10 циклов
+
+        // Остаток бюджета для TSC-deadline: полный в начале периода.
+        assert_eq!(tasks.cpu_budget_cycles_left(&dom), Some(30));
+
+        // Субтик-заряды: 8 × 3 = 24 цикла (2.4 тика) — без троттла.
+        for _ in 0..8 {
+            assert!(!tasks.charge_cpu_cycles(&dom, 3).unwrap());
+            assert!(!tasks.charge_cpu_cycles(&dom, 0).unwrap()); // no-op
+        }
+        assert_eq!(tasks.cpu_budget_cycles_left(&dom), Some(6));
+        let sec = tasks.sec_view(&dom).unwrap();
+        assert_eq!(sec.usage.cpu_used, 2, "floor-производное в тиках");
+        assert_eq!(sec.usage.cpu_used_cycles, 24);
+        assert!(!sec.usage.cpu_throttled);
+
+        // Точная граница: ещё 6 циклов — ровно бюджет (>= — троттл).
+        assert!(tasks.charge_cpu_cycles(&dom, 6).unwrap());
+        let sec = tasks.sec_view(&dom).unwrap();
+        assert!(sec.usage.cpu_throttled);
+        assert_eq!(sec.usage.cpu_used, 3, "кламп в квоту");
+        assert_eq!(sec.usage.cpu_used_cycles, 30);
+
+        // Период: циклы сброшены, бюджет восстановлен.
+        assert_eq!(tasks.on_cpu_period(), 1);
+        assert_eq!(tasks.cpu_budget_cycles_left(&dom), Some(30));
+
+        // Фасад тиков поверх той же единицы: 2 тика = 20 циклов.
+        assert!(!tasks.charge_cpu(&dom, 2).unwrap());
+        assert_eq!(tasks.cpu_budget_cycles_left(&dom), Some(10));
+        assert_eq!(tasks.sec_view(&dom).unwrap().usage.cpu_used_cycles, 20);
+
+        // Без квоты (UNLIMITED после трещотки — нельзя, но напрямую
+        // через бюджет: чужой домен без лимита) — None.
+        let free = uuid_next();
+        tasks.create(free, TaskPriority::DEFAULT).unwrap();
+        assert_eq!(tasks.cpu_budget_cycles_left(&free), None);
+
+        // Единица 0 вырождена — кламп в 1.
+        tasks.set_cpu_time_unit(0).unwrap();
+        assert_eq!(tasks.cpu_time_unit(), 1);
     }
 
     #[test]

@@ -223,6 +223,33 @@ pub trait KernelGlue: Send + Sync {
         false
     }
 
+    /// v0.13, точность квот: поток `thread` уступил CPU, потребив
+    /// `cycles` циклов платформенного счётчика времени (x86: TSC-разность
+    /// «диспетчеризация -> вытеснение/блокировка», субтик-точность,
+    /// включая ядровые участки). Ядро заряжает их домену-владельцу в
+    /// циклах (единица — `set_cpu_time_unit`); возврат `true` — домен
+    /// за пределом `cpu_quota`: парк (троттлинг) до границы периода.
+    ///
+    /// Бекенде с квотами ОБЯЗАН переопределить (вместе с
+    /// [`Self::set_cpu_time_unit`]); дефолт — `false`.
+    fn on_cpu_cycles_consumed(&self, _thread: ThreadId, _cycles: u64) -> bool {
+        false
+    }
+
+    /// v0.13, точность квот: остаток бюджета домена-владельца `thread`
+    /// в циклах до конца периода (`None` — домен без квоты/неизвестен).
+    /// Диспетчеризация использует значение для TSC-deadline точного
+    /// вытеснения в момент исчерпания (и для укороченного кванта).
+    fn cpu_budget_cycles_left(&self, _thread: ThreadId) -> Option<u64> {
+        None
+    }
+
+    /// v0.13, точность квот: задать единицу CPU-времени — циклов
+    /// платформенного счётчика на один «тик» квоты. Платформа зовёт
+    /// ОДИН раз после калибровки счётчика (TSC) и ДО старта SMP:
+    /// дальше значение неизменно, читается без локов на горячем пути.
+    fn set_cpu_time_unit(&self, _cycles_per_tick: u64) {}
+
     /// v0.12, демонтаж BKL: возврат вытесненного потока в готовность
     /// (rotate preempt-шага) — переход Running -> Ready ПОД хуком
     /// `enqueue` планировщика (публикация в кольцо готовности).
@@ -530,6 +557,24 @@ impl<MMAP: MMAPInterface + KMAPInterface + ASIDInterface + 'static> KernelGlue f
         // Аудит «cpu quota: ... throttled» печатает сам менеджер при
         // первом входе домена за предел квоты.
         tasks.charge_cpu(&owner, ticks).unwrap_or(false)
+    }
+
+    fn on_cpu_cycles_consumed(&self, thread: ThreadId, cycles: u64) -> bool {
+        let tasks = self.gctl.task_manager();
+        let Some(owner) = tasks.thread_task(&thread) else {
+            return false;
+        };
+        tasks.charge_cpu_cycles(&owner, cycles).unwrap_or(false)
+    }
+
+    fn cpu_budget_cycles_left(&self, thread: ThreadId) -> Option<u64> {
+        let tasks = self.gctl.task_manager();
+        let owner = tasks.thread_task(&thread)?;
+        tasks.cpu_budget_cycles_left(&owner)
+    }
+
+    fn set_cpu_time_unit(&self, cycles_per_tick: u64) {
+        let _ = self.gctl.task_manager().set_cpu_time_unit(cycles_per_tick);
     }
 
     fn on_cpu_period(&self) {
