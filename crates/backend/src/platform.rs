@@ -182,6 +182,16 @@ impl startup::Platform for X86Platform {
     }
 
     fn run(&self) -> ! {
+        // SMP v0.12: IF-хуки спин-локов ядра (sync.rs) — ДО любого
+        // параллельного исполнения (release_aps/диспетчеризация).
+        // GS:DEPTH — бывший BKL-счётчик, теперь глубина локов.
+        pkg_generic_interface::sync::install_hooks(pkg_generic_interface::sync::SpinHooks {
+            wait: spin_hooks_wait,
+            wake: spin_hooks_wake,
+            depth_inc: spin_hooks_depth_inc,
+            depth_dec: spin_hooks_depth_dec,
+            depth: spin_hooks_depth,
+        });
         // kinit завершён (пулы/куча/GCTL/glue) — но fatal-пути тоже
         // попадают сюда ДО готовности: VT-d ставится только при живом
         // пуле кадров, APы отпускаются только при живом glue.
@@ -200,9 +210,44 @@ impl startup::Platform for X86Platform {
             // APы из парковки в планировщик (resched-IPI будит hlt).
             crate::smp::release_aps();
         }
-        // Первый вход BSP в диспетчеризацию — под BKL (инвариант
-        // schedule_next; см. ap_entry64).
-        crate::klock::acquire();
+        // Первый вход BSP в диспетчеризацию — без BKL (v0.12):
+        // schedule_next синхронизирован своими структурами (MPMC +
+        // KSpin + валидация состояний), APы стартуют симметрично
+        // (см. smp::ap_entry64).
         sched::schedule_next()
     }
+}
+
+// ───────────────────── IF-хуки спин-локов (SMP v0.12) ─────────────────────
+
+/// Спин на «глубине 0» — с прерываниями: доставляются IPI (в частности
+/// shootdown-ACK держателю KMEM — единственного лока с cross-CPU
+/// ожиданием; см. sync.rs). Глубина читается ДО захвата (инкремент —
+/// после), так что здесь она ещё «прежняя».
+fn spin_hooks_wait() {
+    if arch::percpu::depth() == 0 {
+        unsafe { x86_64::instructions::interrupts::enable() };
+    }
+}
+
+/// Захватили после спина: вернуть IF=0, если ждали на глубине 0
+/// (дисциплина «держатель лока всегда IF=0»).
+fn spin_hooks_wake() {
+    if arch::percpu::depth() == 0 {
+        x86_64::instructions::interrupts::disable();
+    }
+}
+
+fn spin_hooks_depth_inc() {
+    arch::percpu::set_depth(arch::percpu::depth() + 1);
+}
+
+fn spin_hooks_depth_dec() {
+    let d = arch::percpu::depth();
+    debug_assert!(d > 0, "sync: depth_dec без захвата (протокол)");
+    arch::percpu::set_depth(d - 1);
+}
+
+fn spin_hooks_depth() -> u32 {
+    arch::percpu::depth() as u32
 }

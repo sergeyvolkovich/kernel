@@ -625,11 +625,10 @@ extern "C" fn ap_entry64() -> ! {
     mark(b'T');
     crate::lapic::start_timer_shared();
     mark(b'S');
-    // Первый вход в диспетчеризацию — ПОД BKL (иначе гонка с BSP в
-    // schedule_next/run на RefCell-структурах GCTL: KERNEL FAULT).
-    // Дисциплина: schedule_next всегда вызывается держателем BKL;
-    // idle_loop отпустит замок перед сном.
-    crate::klock::acquire();
+    // Первый вход в диспетчеризацию — без BKL (v0.12): готовность —
+    // lock-free MPMC (эксклюзивный pop), контексты/очереди — KSpin,
+    // валидация состояний — под локом TcbManager. Гонки с BSP нет:
+    // каждый поток достаётся ровно одному CPU.
     crate::sched::schedule_next()
 }
 

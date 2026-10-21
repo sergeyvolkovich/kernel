@@ -37,6 +37,7 @@ pub mod capability;
 pub mod hal;
 pub mod ipc;
 pub mod mem;
+pub mod sync;
 pub mod syscall;
 pub mod task;
 

@@ -35,7 +35,7 @@
 // что часть элементов пропущена.
 
 use alloc::{boxed::Box, collections::VecDeque};
-use core::cell::Cell;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use uuid::Uuid;
 
@@ -47,7 +47,9 @@ use crate::capability::{
 };
 use crate::mem::MemRouter;
 use crate::task::scheduler::BlockQueueId;
-use crate::task::{TaskError, TaskId, TaskState, TcbManager, ThreadId, ThreadWait};
+use crate::task::{
+    RecvAnyPark, SendThreadOffer, TaskError, TaskId, TaskState, TcbManager, ThreadId, ThreadWait,
+};
 
 pub mod shm;
 
@@ -589,27 +591,28 @@ impl ExitPayload {
 /// только счётчиками аудита. Методы принимают менеджеры параметрами —
 /// тот же паттерн, что `DeviceManager::export_capabilities(&tasks, &caps)`.
 pub struct IpcManager {
-    delivered: Cell<usize>,
-    fast_path: Cell<usize>,
-    blocked_ops: Cell<usize>,
+    /// Счётчики аудита (SMP v0.12: атомики — инкремент без лока).
+    delivered: AtomicUsize,
+    fast_path: AtomicUsize,
+    blocked_ops: AtomicUsize,
 }
 
 impl IpcManager {
     /// Пустой менеджер.
     pub fn new() -> Self {
         Self {
-            delivered: Cell::new(0),
-            fast_path: Cell::new(0),
-            blocked_ops: Cell::new(0),
+            delivered: AtomicUsize::new(0),
+            fast_path: AtomicUsize::new(0),
+            blocked_ops: AtomicUsize::new(0),
         }
     }
 
     /// Счётчики аудита: (доставлено, из них fast-path, заблокировано).
     pub fn stats(&self) -> (usize, usize, usize) {
         (
-            self.delivered.get(),
-            self.fast_path.get(),
-            self.blocked_ops.get(),
+            self.delivered.load(Ordering::Relaxed),
+            self.fast_path.load(Ordering::Relaxed),
+            self.blocked_ops.load(Ordering::Relaxed),
         )
     }
 
@@ -690,17 +693,29 @@ impl IpcManager {
         mode: BlockMode,
         then_recv: Option<ObjId>,
     ) -> Result<SendOutcome, IpcError> {
-        // 1. Ждущий получатель (recv-очередь endpoint'а) — прямая доставка.
+        // SMP v0.12: [pop ждущего получателя → буфер → парк отправителя] —
+        // ОДНА критсекция пер-gate лока (ранг GATE, см. `sync`): получатель
+        // не может запарковаться «между» нашей проверкой recv_q и push в
+        // буфер (его [буфер-проверка → парк] идёт в той же секции лока).
         let mut slot = Some(msg);
-        if let Some(outcome) =
-            self.try_deliver_to_waiter(tasks, caps, router, from_thread, gate, &mut slot)?
         {
-            return Ok(outcome);
-        }
+            let _g = caps.gate_lock(gate).acquire_guard();
 
-        // 2. Буфер endpoint'а.
-        let queued = caps
-            .with_endpoint(gate, |ep| {
+            // 1. Ждущий получатель: claim (вывод из recv_q, снятие wait,
+            //    материализация ret) — доставка пойдёт ВНЕ лока (map-элементы
+            //    — KMEM; ранг GATE→KMEM запрещён).
+            if let Some(waiter) = self.claim_recv_waiter(tasks, caps, gate, from_thread)? {
+                let msg = slot
+                    .take()
+                    .expect("claim оставляет сообщение владельцу вызова");
+                drop(_g);
+                self.deliver(tasks, router, from_thread, waiter, msg)?;
+                self.delivered.fetch_add(1, Ordering::Relaxed);
+                return Ok(SendOutcome::Delivered);
+            }
+
+            // 2. Буфер endpoint'а (та же критсекция).
+            let queued = match caps.with_endpoint(gate, |ep| {
                 if ep.has_room() {
                     if let Some(m) = slot.take() {
                         ep.queue.push_back(m);
@@ -709,21 +724,25 @@ impl IpcManager {
                 } else {
                     false
                 }
-            })
-            .ok_or(IpcError::OwnerDead)?;
-        if queued {
-            return Ok(SendOutcome::Queued);
-        }
+            }) {
+                Some(q) => q,
+                None => return Err(IpcError::OwnerDead), // _g отпустит дроп
+            };
+            if queued {
+                return Ok(SendOutcome::Queued);
+            }
 
-        // 3. Буфера нет/полон: try-режим отказывает, блокирующий — паркует
-        //    отправителя (сообщение переносится в ThreadObj::blocked_msg).
-        if mode == BlockMode::Try {
-            return Err(IpcError::TryAgain);
+            // 3. Буфера нет/полон: try-режим отказывает, блокирующий —
+            //    паркует отправителя (сообщение — в blocked_msg) ПОД ТЕМ ЖЕ
+            //    локом: refill получателя (после забора из буфера) не может
+            //    «промахнуться» мимо нашей публикации в send_q.
+            if mode == BlockMode::Try {
+                return Err(IpcError::TryAgain);
+            }
+            let msg = slot.take().expect("message stays in slot when not queued");
+            self.block_sender(tasks, caps, from_thread, gate, msg, then_recv)?;
         }
-        // Сообщение всё ещё в слоте (буфер его не взял).
-        let msg = slot.take().expect("message stays in slot when not queued");
-        self.block_sender(tasks, caps, from_thread, gate, msg, then_recv)?;
-        self.blocked_ops.set(self.blocked_ops.get() + 1);
+        self.blocked_ops.fetch_add(1, Ordering::Relaxed);
         Ok(SendOutcome::Blocked)
     }
 
@@ -742,15 +761,44 @@ impl IpcManager {
         let mut msg = msg;
         msg.set_from(IPC_KERNEL_FROM);
         let mut slot = Some(msg);
-        if let Some(outcome) =
-            self.try_deliver_to_waiter(tasks, caps, None, IPC_KERNEL_FROM, gate, &mut slot)?
-        {
-            return Ok(outcome);
+        // SMP v0.12: [claim ждущего → буфер] — одна критсекция GATE
+        // (зеркально send_to_gate; блокировки отправителя-ядра нет).
+        let waiter = {
+            let _g = caps.gate_lock(gate).acquire_guard();
+            match self.claim_recv_waiter(tasks, caps, gate, IPC_KERNEL_FROM)? {
+                Some(w) => Some(w),
+                None => {
+                    let queued = caps.with_endpoint(gate, |ep| {
+                        if ep.has_room() {
+                            if let Some(m) = slot.take() {
+                                ep.queue.push_back(m);
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    match queued {
+                        Some(true) => return Ok(SendOutcome::Queued),
+                        Some(false) => {}
+                        None => return Err(IpcError::OwnerDead),
+                    }
+                    None
+                }
+            }
+        };
+        match waiter {
+            Some(w) => {
+                let msg = slot
+                    .take()
+                    .expect("claim оставляет сообщение владельцу вызова");
+                self.deliver(tasks, None, IPC_KERNEL_FROM, w, msg)?;
+                self.delivered.fetch_add(1, Ordering::Relaxed);
+                Ok(SendOutcome::Delivered)
+            }
+            // Ядро не блокируется: буфер полон — честный отказ.
+            None => Err(IpcError::QueueFull),
         }
-        let msg = slot
-            .take()
-            .expect("сообщение у вызывающего, если доставки не было");
-        enqueue_or_full(caps, gate, msg)
     }
 
     /// Однословный signal (doorbell SHM-колец, события устройств).
@@ -769,17 +817,19 @@ impl IpcManager {
         )
     }
 
-    /// Доставка ждущему получателю, если он есть. `Ok(None)` — получателя
-    /// нет (сообщение остаётся во владении вызывающего — слот не тронут).
-    fn try_deliver_to_waiter(
+    /// Claim ждущего получателя (ВЫЗЫВАЮЩИЙ ДЕРЖИТ gate-лок): поток
+    /// выводится из recv-очереди планировщика, причина ожидания
+    /// снимается, возврат сискола материализуется (0). Доставку
+    /// (map-элементы/mailbox/wake) вызывающий делает ВНЕ gate-лока —
+    /// claim публикует «поток занят доставкой» самим фактом выхода из
+    /// очереди. `Ok(None)` — получателя нет (сообщение не тронуто).
+    fn claim_recv_waiter(
         &self,
         tasks: &TcbManager,
         caps: &CapabilityManager,
-        router: Option<&dyn MemRouter>,
-        from_thread: ThreadId,
         gate: ObjId,
-        msg: &mut Option<Box<IpcMessage>>,
-    ) -> Result<Option<SendOutcome>, IpcError> {
+        _from_thread: ThreadId,
+    ) -> Result<Option<ThreadId>, IpcError> {
         // Первый поток из recv-очереди endpoint'а (FIFO планировщика).
         let Some(waiter) = self.pop_waiter(tasks, caps, gate, WaitSide::Recv)? else {
             return Ok(None);
@@ -794,13 +844,19 @@ impl IpcManager {
         if !expects_gate {
             return Err(IpcError::Internal);
         }
-        let msg = msg.take().expect("вызывающий держит сообщение");
-        self.deliver(tasks, router, from_thread, waiter, msg)?;
-        self.delivered.set(self.delivered.get() + 1);
-        Ok(Some(SendOutcome::Delivered))
+        // Claim: wait = None + syscall_ret = Some(0) — одна write-секция
+        // TCB (встречный send_thread увидит «не open-receive» и паркуется).
+        tasks.with_thread(&waiter, |t| {
+            t.wait = None;
+            t.syscall_ret = Some(0);
+        });
+        Ok(Some(waiter))
     }
 
     /// Блокировка отправителя: сообщение — в blocked_msg, поток — в send_q.
+    ///
+    /// SMP v0.12: вызывается ТОЛЬКО под gate-локом вызывающего (атомарность
+    /// публикации в send_q против refill/claim приёмной стороны).
     fn block_sender(
         &self,
         tasks: &TcbManager,
@@ -857,6 +913,13 @@ impl IpcManager {
 
     /// Приём с гейта (ядро/фасад). `already_blocked` — поток уже Blocked
     /// (фаза call: переход Blocked->Blocked недопустим автоматом состояний).
+    ///
+    /// SMP v0.12: [буфер → заблокированный отправитель → парк себя] —
+    /// ОДНА критсекция пер-gate лока: отправитель не может «не увидеть»
+    /// нас между нашей проверкой буфера/send_q и публикацией в recv_q.
+    /// Claim отправителя (вывод из send_q + изъятие сообщения) — под
+    /// локом; завершение его фазы (`complete_sender`, возможный переход
+    /// на reply-гейт) — ВНЕ лока: GATE→GATE запрещён (ABBA call-фаз).
     pub fn recv_from_gate(
         &self,
         tasks: &TcbManager,
@@ -866,55 +929,88 @@ impl IpcManager {
         mode: BlockMode,
         already_blocked: bool,
     ) -> Result<RecvOutcome, IpcError> {
-        // 1. Буфер endpoint'а.
-        let from_queue: Option<Box<IpcMessage>> = caps
-            .with_endpoint(gate, |ep| ep.queue.pop_front())
-            .flatten();
-        if let Some(mut msg) = from_queue {
-            // Освободился слот: FIFO-отправитель занимает его из send_q.
-            self.refill_from_senders(tasks, caps, gate)?;
-            msg.set_status(msg.status() | IpcStatus::FAST_PATH);
-            self.delivered.set(self.delivered.get() + 1);
-            return Ok(RecvOutcome::Message(msg));
-        }
+        // 2. Rendezvous-claim отправителя (под локом; None — нет).
+        let claimed = {
+            let _g = caps.gate_lock(gate).acquire_guard();
 
-        // 2. Rendezvous: заблокированный отправитель с сообщением.
-        if let Some(sender) = self.pop_waiter(tasks, caps, gate, WaitSide::Send)? {
-            let expects_gate = tasks
-                .with_thread(&sender, |t| {
-                    matches!(&t.wait, Some(ThreadWait::SendEndpoint { gate: g, .. }) if *g == gate)
-                })
-                .unwrap_or(false);
-            if !expects_gate {
-                return Err(IpcError::Internal);
-            }
-            let taken = tasks
-                .with_thread(&sender, |t| {
-                    let msg = t.blocked_msg.take();
-                    let wait = t.wait.take();
-                    msg.map(|m| (m, wait))
-                })
+            // 1. Буфер endpoint'а.
+            let from_queue: Option<Box<IpcMessage>> = caps
+                .with_endpoint(gate, |ep| ep.queue.pop_front())
                 .flatten();
-            let Some((msg, wait)) = taken else {
-                return Err(IpcError::Internal);
-            };
+            if let Some(mut msg) = from_queue {
+                // Освободился слот: FIFO-отправитель занимает его из send_q
+                // (refill — под тем же локом: pop+push атомарны).
+                self.refill_from_senders(tasks, caps, gate)?;
+                msg.set_status(msg.status() | IpcStatus::FAST_PATH);
+                self.delivered.fetch_add(1, Ordering::Relaxed);
+                return Ok(RecvOutcome::Message(msg));
+            }
+
+            self.claim_send_waiter(tasks, caps, gate)?
+        };
+
+        if let Some((sender, msg, wait)) = claimed {
             // Отправитель доставлен: вернуть его в пользователя или перевести
-            // в фазу call-приёма (then_recv).
+            // в фазу call-приёма (then_recv) — уже ВНЕ gate-лока.
             self.complete_sender(tasks, caps, sender, wait)?;
-            self.delivered.set(self.delivered.get() + 1);
+            self.delivered.fetch_add(1, Ordering::Relaxed);
             return Ok(RecvOutcome::Message(msg));
         }
 
-        // 3. Принимать нечего: try-отказ или блокировка получателя.
+        // 3. Принимать нечего: try-отказ или блокировка получателя —
+        //    парк себя в критсекции лока (окно «отправитель проверил
+        //    recv_q до нашей публикации и ушёл в буфер» закрыто).
         if mode == BlockMode::Try {
             return Err(IpcError::TryAgain);
         }
-        self.block_receiver(tasks, caps, thread, gate, already_blocked)?;
-        self.blocked_ops.set(self.blocked_ops.get() + 1);
+        {
+            let _g = caps.gate_lock(gate).acquire_guard();
+            self.block_receiver(tasks, caps, thread, gate, already_blocked)?;
+        }
+        self.blocked_ops.fetch_add(1, Ordering::Relaxed);
         Ok(RecvOutcome::Blocked)
     }
 
+    /// Claim заблокированного отправителя (ВЫЗЫВАЮЩИЙ ДЕРЖИТ gate-лок):
+    /// вывод из send-очереди, изъятие blocked_msg и причины ожидания,
+    /// материализация возврата (0). Завершение фазы — вне лока.
+    fn claim_send_waiter(
+        &self,
+        tasks: &TcbManager,
+        caps: &CapabilityManager,
+        gate: ObjId,
+    ) -> Result<Option<(ThreadId, Box<IpcMessage>, Option<ThreadWait>)>, IpcError> {
+        let Some(sender) = self.pop_waiter(tasks, caps, gate, WaitSide::Send)? else {
+            return Ok(None);
+        };
+        let expects_gate = tasks
+            .with_thread(
+                &sender,
+                |t| matches!(&t.wait, Some(ThreadWait::SendEndpoint { gate: g, .. }) if *g == gate),
+            )
+            .unwrap_or(false);
+        if !expects_gate {
+            return Err(IpcError::Internal);
+        }
+        let taken = tasks
+            .with_thread(&sender, |t| {
+                let msg = t.blocked_msg.take();
+                let wait = t.wait.take();
+                t.syscall_ret = Some(0);
+                msg.map(|m| (m, wait))
+            })
+            .flatten();
+        match taken {
+            Some((msg, wait)) => Ok(Some((sender, msg, wait))),
+            None => Err(IpcError::Internal),
+        }
+    }
+
     /// Освободившийся слот буфера занимает FIFO-отправитель из send_q.
+    ///
+    /// SMP v0.12: вызывается ТОЛЬКО под gate-локом вызывающего (приём из
+    /// буфера): pop отправителя и push его сообщения — атомарны против
+    /// встречного block_sender (который паркуется под тем же локом).
     fn refill_from_senders(
         &self,
         tasks: &TcbManager,
@@ -944,8 +1040,13 @@ impl IpcManager {
         Ok(())
     }
 
-    /// Завершение фазы отправки заблокированного отправителя: возврат в
+    /// Завершение фазы отправки ЗАХВАЧЕННОГО отправителя (claim уже вывел
+    /// его из send-очереди, снял wait и материализовал ret = 0): возврат в
     /// пользователя или переход к фазе приёма (ipc_call, L4).
+    ///
+    /// Вызывается ВНЕ gate-лока: фаза call берёт лок reply-гейта как
+    /// topLevel-захват (GATE→GATE запрещён — устраняет ABBA пары
+    /// встречных ipc_call).
     fn complete_sender(
         &self,
         tasks: &TcbManager,
@@ -971,21 +1072,19 @@ impl IpcManager {
                     tasks.thread_set_state(&sender, TaskState::Ready)?;
                     Ok(())
                 }
-                // Поток переблокирован на recv-очереди reply-гейта.
+                // Поток переблокирован на recv-очереди reply-гейта
+                // (already_blocked: перехода состояния не было).
                 Ok(RecvOutcome::Blocked) => Ok(()),
                 Err(e) => Err(e),
             };
         }
-        // Обычная отправка: возврат в пользователя с кодом 0.
-        tasks.with_thread(&sender, |t| {
-            t.wait = None;
-            t.syscall_ret = Some(0);
-        });
+        // Обычная отправка: claim уже подготовил wait = None / ret = 0 —
+        // только перевод в Ready (хук enqueue планировщика).
         tasks.thread_set_state(&sender, TaskState::Ready)?;
         Ok(())
     }
 
-    /// Блокировка получателя на гейте.
+    /// Блокировка получателя на гейте (под gate-локом вызывающего).
     fn block_receiver(
         &self,
         tasks: &TcbManager,
@@ -1030,37 +1129,25 @@ impl IpcManager {
         router: Option<&dyn MemRouter>,
         from_thread: ThreadId,
         to_thread: ThreadId,
-        mut msg: Box<IpcMessage>,
+        msg: Box<IpcMessage>,
     ) -> Result<SendOutcome, IpcError> {
-        let receiver_open = tasks
-            .with_thread(&to_thread, |t| {
-                t.state == TaskState::Blocked && matches!(t.wait, Some(ThreadWait::RecvAny))
-            })
-            .unwrap_or(false);
-
-        if receiver_open {
-            msg.set_status(msg.status() | IpcStatus::FAST_PATH);
-            self.deliver(tasks, router, from_thread, to_thread, msg)?;
-            self.fast_path.set(self.fast_path.get() + 1);
-            self.delivered.set(self.delivered.get() + 1);
-            return Ok(SendOutcome::Delivered);
-        }
-
-        // Парковка в очереди потока-получателя.
-        let parked = tasks
-            .with_thread(&to_thread, |t| {
-                if t.parked.len() >= IPC_THREAD_PARK_MAX {
-                    false
-                } else {
-                    t.parked.push_back(msg);
-                    true
-                }
-            })
-            .ok_or(TaskError::ThreadNotFound(to_thread))?;
-        if parked {
-            Ok(SendOutcome::Parked)
-        } else {
-            Err(IpcError::TryAgain)
+        // SMP v0.12: [open-receive? → claim] / [парковка в очередь потока] —
+        // ОДНА write-секция TcbManager (зеркально recv_any_park): гонка
+        // «recv_any проверил очередь до нашей парковки» исключена.
+        let offer = tasks
+            .send_thread_offer(&to_thread, msg)
+            .map_err(IpcError::Task)?;
+        match offer {
+            SendThreadOffer::Claimed { msg } => {
+                let mut msg = msg;
+                msg.set_status(msg.status() | IpcStatus::FAST_PATH);
+                self.deliver(tasks, router, from_thread, to_thread, msg)?;
+                self.fast_path.fetch_add(1, Ordering::Relaxed);
+                self.delivered.fetch_add(1, Ordering::Relaxed);
+                Ok(SendOutcome::Delivered)
+            }
+            SendThreadOffer::Parked => Ok(SendOutcome::Parked),
+            SendThreadOffer::Full => Err(IpcError::TryAgain),
         }
     }
 
@@ -1074,23 +1161,24 @@ impl IpcManager {
         thread: ThreadId,
         mode: BlockMode,
     ) -> Result<RecvOutcome, IpcError> {
-        let parked: Option<Box<IpcMessage>> = tasks
-            .with_thread(&thread, |t| t.parked.pop_front())
-            .flatten();
-        if let Some(mut msg) = parked {
-            msg.set_status(msg.status() | IpcStatus::FAST_PATH);
-            self.delivered.set(self.delivered.get() + 1);
-            return Ok(RecvOutcome::Message(msg));
+        // SMP v0.12: одна write-секция TcbManager ([pop parked] или
+        // [Blocked + RecvAny]) — send_thread не может потерять нас
+        // между проверкой и парком (зеркальная транзакция).
+        match tasks
+            .recv_any_park(&thread, mode == BlockMode::Try)
+            .map_err(IpcError::Task)?
+        {
+            RecvAnyPark::Msg(mut msg) => {
+                msg.set_status(msg.status() | IpcStatus::FAST_PATH);
+                self.delivered.fetch_add(1, Ordering::Relaxed);
+                Ok(RecvOutcome::Message(msg))
+            }
+            RecvAnyPark::TryEmpty => Err(IpcError::TryAgain),
+            RecvAnyPark::Parked => {
+                self.blocked_ops.fetch_add(1, Ordering::Relaxed);
+                Ok(RecvOutcome::Blocked)
+            }
         }
-        if mode == BlockMode::Try {
-            return Err(IpcError::TryAgain);
-        }
-        tasks.thread_set_state(&thread, TaskState::Blocked)?;
-        tasks.with_thread(&thread, |t| {
-            t.wait = Some(ThreadWait::RecvAny);
-        });
-        self.blocked_ops.set(self.blocked_ops.get() + 1);
-        Ok(RecvOutcome::Blocked)
     }
 
     // ==== Доставка в почтовый ящик ====
@@ -1483,5 +1571,345 @@ mod tests {
         assert_eq!(ep.capacity(), 4);
         assert_eq!(ep.send_queue(), BlockQueueId::new(1));
         assert_eq!(ep.recv_queue(), BlockQueueId::new(2));
+    }
+
+    // ==== SMP v0.12: многопоточный стресс rendezvous (host) ====
+
+    /// Sync-мок планировщика с block-очередями (KSpin: разделяем по OS-потокам).
+    struct SyncSched {
+        queues: crate::sync::KSpin<
+            alloc::collections::BTreeMap<u64, alloc::collections::VecDeque<ThreadId>>,
+        >,
+        next: core::sync::atomic::AtomicU64,
+    }
+
+    impl SyncSched {
+        fn new() -> Self {
+            Self {
+                queues: crate::sync::KSpin::new(alloc::collections::BTreeMap::new()),
+                next: core::sync::atomic::AtomicU64::new(1),
+            }
+        }
+    }
+
+    impl crate::task::SchedulerInterface for SyncSched {
+        fn current(&self, _: crate::task::CpuId) -> Option<ThreadId> {
+            None
+        }
+        fn enqueue(&self, _: ThreadId) -> Result<(), crate::task::SchedulerError> {
+            Ok(())
+        }
+        fn deschedule(&self, _: ThreadId) -> Result<(), crate::task::SchedulerError> {
+            Ok(())
+        }
+        fn on_priority_change(
+            &self,
+            _: ThreadId,
+            _: crate::task::TaskPriority,
+        ) -> Result<(), crate::task::SchedulerError> {
+            Ok(())
+        }
+        fn switch_context(
+            &self,
+            _: crate::task::CpuId,
+            _: Option<ThreadId>,
+            _: ThreadId,
+        ) -> Result<(), crate::task::SchedulerError> {
+            Ok(())
+        }
+        fn isolation_policy(
+            &self,
+            _: crate::task::CpuId,
+        ) -> crate::hal::traits::kmap::IsolationPolicy {
+            crate::hal::traits::kmap::IsolationPolicy::conservative()
+        }
+        fn block_queue_create(
+            &self,
+        ) -> Result<crate::task::scheduler::BlockQueueId, crate::task::SchedulerError> {
+            let id = self
+                .next
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            self.queues
+                .lock()
+                .insert(id, alloc::collections::VecDeque::new());
+            Ok(crate::task::scheduler::BlockQueueId::new(id))
+        }
+        fn block_queue_destroy(
+            &self,
+            _q: crate::task::scheduler::BlockQueueId,
+        ) -> Result<(), crate::task::SchedulerError> {
+            Ok(())
+        }
+        fn block_push(
+            &self,
+            q: crate::task::scheduler::BlockQueueId,
+            t: ThreadId,
+        ) -> Result<(), crate::task::SchedulerError> {
+            if let Some(vq) = self.queues.lock().get_mut(&q.as_u64()) {
+                vq.push_back(t);
+                Ok(())
+            } else {
+                Err(crate::task::SchedulerError::Backend("unknown block queue"))
+            }
+        }
+        fn block_remove(
+            &self,
+            q: crate::task::scheduler::BlockQueueId,
+            t: ThreadId,
+        ) -> Result<bool, crate::task::SchedulerError> {
+            if let Some(vq) = self.queues.lock().get_mut(&q.as_u64()) {
+                if let Some(pos) = vq.iter().position(|&x| x == t) {
+                    vq.remove(pos);
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        fn block_pop_front(
+            &self,
+            q: crate::task::scheduler::BlockQueueId,
+        ) -> Result<Option<ThreadId>, crate::task::SchedulerError> {
+            Ok(self
+                .queues
+                .lock()
+                .get_mut(&q.as_u64())
+                .and_then(|vq| vq.pop_front()))
+        }
+        fn block_len(
+            &self,
+            q: crate::task::scheduler::BlockQueueId,
+        ) -> Result<usize, crate::task::SchedulerError> {
+            Ok(self
+                .queues
+                .lock()
+                .get(&q.as_u64())
+                .map(|vq| vq.len())
+                .unwrap_or(0))
+        }
+        fn yield_now(&self, _: ThreadId) -> Result<(), crate::task::SchedulerError> {
+            Ok(())
+        }
+        fn perform_tick(&self, _: u64) {}
+    }
+
+    /// Обёртка флюкса для OS-потоков: менеджеры внутренне залочены
+    /// (KRwLock/KSpin/атомики), SyncSched — на KSpin; формальные
+    /// superтрейты SchedulerInterface не объявлены — потому unsafe.
+    struct Rig<'a> {
+        tasks: &'a crate::task::TcbManager,
+        caps: &'a crate::capability::CapabilityManager,
+        ipc: &'a IpcManager,
+    }
+    unsafe impl Send for Rig<'_> {}
+    unsafe impl Sync for Rig<'_> {}
+
+    /// Стресс rendezvous (SMP v0.12): OS-потоки параллельно паркуют
+    /// приёмников и доставляют сообщения; claim-протокол per-gate лока
+    /// обязан исключить lost-wakeup — итог строго сходится.
+    #[test]
+    fn ipc_rendezvous_stress_multithreaded_no_lost_wakeups() {
+        use crate::capability::{ActionPermissions, CapabilityBadge};
+        use crate::task::{TaskPriority, TaskState, TcbManager};
+        use std::sync::Arc;
+        use std::thread;
+
+        fn uuid_next() -> Uuid {
+            use core::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0x7000);
+            Uuid::from_u128(NEXT.fetch_add(1, Ordering::Relaxed) as u128)
+        }
+
+        // 'static, как в реальном ядре: leaked-менеджеры (GCTL-паттерн).
+        let tasks: &'static TcbManager = Box::leak(Box::new(TcbManager::new().unwrap()));
+        let caps: &'static crate::capability::CapabilityManager = Box::leak(Box::new(
+            crate::capability::CapabilityManager::new().unwrap(),
+        ));
+        let ipc: &'static IpcManager = Box::leak(Box::new(IpcManager::new()));
+        tasks.install_scheduler(Box::leak(Box::new(SyncSched::new())));
+
+        let owner = uuid_next();
+        tasks.create(owner, TaskPriority::DEFAULT).unwrap();
+        let handle = ipc
+            .create_endpoint(
+                &tasks,
+                &caps,
+                owner,
+                0, // строгий rendezvous: доставки только ждущим
+                ActionPermissions::all(),
+                CapabilityBadge::FULL,
+            )
+            .unwrap();
+        let view = caps.get(&tasks, owner, handle).unwrap();
+        let gate = match &view.cap_ref {
+            crate::capability::ContainerACCCapability::Gate { gate_id } => *gate_id,
+            _ => panic!("не гейт"),
+        };
+
+        const N: usize = 48;
+        const ROUNDS: usize = 8;
+        let mut recv_threads = alloc::vec::Vec::new();
+        for _ in 0..N {
+            let t = uuid_next();
+            tasks
+                .create_thread(t, owner, TaskPriority(10), 0x1000, 0x9000)
+                .unwrap();
+            tasks.thread_set_state(&t, TaskState::Running).unwrap();
+            recv_threads.push(t);
+        }
+
+        let rig = Arc::new(Rig {
+            tasks: &tasks,
+            caps: &caps,
+            ipc: &ipc,
+        });
+
+        for round in 0..ROUNDS {
+            // Ядро парка: каждый приёмник делает Blocking-recv в своём
+            // OS-потоке (половина), вторая половина OS-потоков УЖЕ шлёт —
+            // фазы перекрываются, гонка claim/park работает на максимум.
+            let mut handles = alloc::vec::Vec::new();
+            for chunk in recv_threads.chunks(N / 4) {
+                let rig = Arc::clone(&rig);
+                let chunk = chunk.to_vec();
+                handles.push(thread::spawn(move || {
+                    for r in chunk {
+                        let _ = rig.ipc.recv_from_gate(
+                            rig.tasks,
+                            rig.caps,
+                            r,
+                            gate,
+                            BlockMode::Blocking,
+                            false,
+                        );
+                    }
+                }));
+            }
+            // Сендеры: kernel_send (claim ждущего) с ретраями до успеха.
+            for _ in 0..N / 4 {
+                let rig = Arc::clone(&rig);
+                handles.push(thread::spawn(move || {
+                    let mut word: u64 = 0xDEAD_0000;
+                    let mut sent = 0usize;
+                    while sent < N / 4 * 4 / (N / 4) {
+                        // по одному сообщению на поток-отправитель…
+                        let msg = Box::new(IpcMessage::signal(IPC_KERNEL_FROM, word));
+                        match rig.ipc.kernel_send(rig.tasks, rig.caps, gate, msg) {
+                            Ok(SendOutcome::Delivered) => {
+                                sent += 1;
+                                word += 1;
+                            }
+                            Ok(_) => unreachable!("rendezvous без буфера не даёт Queued"),
+                            Err(IpcError::QueueFull) => thread::yield_now(),
+                            Err(e) => panic!("kernel_send: {e:?}"),
+                        }
+                        if sent >= 4 {
+                            break;
+                        }
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            // Сверка: все N приёмников разбужены (Ready + mailbox + ret),
+            // recv_q пуст, delivered сходится с числом доставок раунда.
+            for r in &recv_threads {
+                let v = tasks.thread_view(r).unwrap();
+                assert_eq!(v.state, TaskState::Ready, "поток спит после раунда {round}");
+                assert!(ipc.mailbox_len(&tasks, *r) > 0, "ящик пуст");
+                assert_eq!(tasks.take_thread_syscall_ret(r), Some(0));
+                ipc.mailbox_clear(&tasks, *r);
+                // подготовка к следующему раунду
+                tasks.thread_set_state(r, TaskState::Running).unwrap();
+            }
+            let (delivered, _, _) = ipc.stats();
+            assert_eq!(delivered, (round + 1) * N, "доставки терялись");
+        }
+
+        // ==== Зеркальный сценарий: парк ОТПРАВИТЕЛЕЙ, разбор приёмниками ====
+        let mut send_threads = alloc::vec::Vec::new();
+        for i in 0..N {
+            let t = uuid_next();
+            tasks
+                .create_thread(t, owner, TaskPriority(10), 0x1000, 0x9000)
+                .unwrap();
+            tasks.thread_set_state(&t, TaskState::Running).unwrap();
+            let _ = i;
+            send_threads.push(t);
+        }
+        let mut handles = alloc::vec::Vec::new();
+        for chunk in send_threads.chunks(N / 4) {
+            let rig = Arc::clone(&rig);
+            let chunk = chunk.to_vec();
+            handles.push(thread::spawn(move || {
+                for s in chunk {
+                    let msg = Box::new(IpcMessage::signal(s, 0xABCD));
+                    let out = rig
+                        .ipc
+                        .send_to_gate(
+                            rig.tasks,
+                            rig.caps,
+                            None,
+                            s,
+                            gate,
+                            msg,
+                            BlockMode::Blocking,
+                            None,
+                        )
+                        .unwrap();
+                    assert_eq!(out, SendOutcome::Blocked, "сендер не запаркован");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Приёмники разбирают parked-сендеров (Try-ретраи).
+        let got = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let mut handles = alloc::vec::Vec::new();
+        for chunk in recv_threads.chunks(N / 4) {
+            let rig = Arc::clone(&rig);
+            let chunk = chunk.to_vec();
+            let got = Arc::clone(&got);
+            handles.push(thread::spawn(move || {
+                loop {
+                    let r = chunk[0]; // приёмники катают Try-приём по кругу
+                    match rig.ipc.recv_from_gate(
+                        rig.tasks,
+                        rig.caps,
+                        r,
+                        gate,
+                        BlockMode::Try,
+                        false,
+                    ) {
+                        Ok(RecvOutcome::Message(_)) => {
+                            got.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+                        }
+                        Ok(RecvOutcome::Blocked) => unreachable!("Try не паркует"),
+                        Err(IpcError::TryAgain) => {
+                            if got.load(core::sync::atomic::Ordering::Acquire) == N {
+                                return;
+                            }
+                            thread::yield_now();
+                        }
+                        Err(e) => panic!("recv: {e:?}"),
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(got.load(core::sync::atomic::Ordering::Acquire), N);
+        for s in &send_threads {
+            let v = tasks.thread_view(s).unwrap();
+            assert_eq!(v.state, TaskState::Ready, "сендер спит после разбора");
+            assert_eq!(tasks.take_thread_syscall_ret(s), Some(0));
+        }
+        // send_q пуст, delivered вырос ровно на N.
+        let (delivered, _, _) = ipc.stats();
+        assert_eq!(delivered, ROUNDS * N + N);
+        let _ = caps.destroy_gate(&tasks, owner, handle);
     }
 }

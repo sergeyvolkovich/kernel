@@ -26,14 +26,19 @@
 //
 // CSpace задачи — локальная таблица хендлов (уровень 2), см.
 // `crate::capability::HandleTable`. Доступ к ней — только через
-// `with_caps` / `with_caps_mut` (RefCell-контракт однопоточности).
+// `with_caps` / `with_caps_mut` (под read/write-гардом менеджера; SMP
+// v0.12: вложенные read-секции легальны, реентери записи — дедлок
+// спин-лока, тот же класс бага, что раньше ловился паникой RefCell).
 
 pub mod scheduler;
 pub mod thread;
 pub mod types;
 
+pub(crate) use thread::{RecvAnyPark, SendThreadOffer};
+
 use alloc::boxed::Box;
-use core::cell::RefCell;
+
+use crate::sync::KRwLock;
 
 use intrusive_collections::{Bound, KeyAdapter, RBTree, RBTreeLink, UnsafeRef, intrusive_adapter};
 
@@ -113,7 +118,7 @@ impl<'a> KeyAdapter<'a> for TaskAdapter {
 
 /// Полное внутреннее состояние менеджера (задачи + потоки + планировщик).
 /// `pub(crate)`: потоковые операции живут в сиблинг-модуле `task::thread`
-/// и работают с теми же таблицами под одним контрактом RefCell.
+/// и работают с теми же таблицами под одним KRwLock-контрактом менеджера.
 pub(crate) struct TcbInner {
     /// Порядок полей важен для дропа: реестры снимаем раньше таблиц.
     pub(crate) by_uuid: RBTree<TaskAdapter>,
@@ -129,17 +134,18 @@ pub(crate) struct TcbInner {
 /// Менеджер задач: глобальные таблицы объектов (задачи-домены + потоки)
 /// + uuid-индексы (редкий путь) + cspace-якорь каждой задачи.
 ///
-/// Все методы принимают `&self`; сериализация — внутренним `RefCell`
-/// (однопоточный контракт, см. тест `reentrancy_is_caught`).
+/// Все методы принимают `&self`; сериализация — внутренним `KRwLock`
+/// (SMP v0.12: lookup-пути — читатели, мутации — писатель; ранг — см.
+/// `sync`, вложенность допустима только вниз по таблице рангов).
 pub struct TcbManager {
-    inner: RefCell<TcbInner>,
+    inner: KRwLock<TcbInner>,
 }
 
 impl TcbManager {
     /// Пустой реестр. Страницы таблиц выделяются лениво.
     pub fn new() -> Result<Self, TaskError> {
         Ok(Self {
-            inner: RefCell::new(TcbInner {
+            inner: KRwLock::new(TcbInner {
                 by_uuid: RBTree::new(TaskAdapter::new()),
                 tasks: PagedTable::new().map_err(|_| TaskError::OutOfMemory)?,
                 threads: ThreadInner::new()?,
@@ -167,7 +173,7 @@ impl TcbManager {
     /// ([`TaskError::Scheduler`]) оставляет автомат состояний нетронутым,
     /// а при создании задачи/потока — полностью откатывает регистрацию.
     ///
-    /// Контракт реентерабельности: хуки вызываются под `borrow_mut`
+    /// Контракт реентерабельности: хуки вызываются под `write`
     /// менеджера — синхронный реентери в методы `TcbManager` из бекенда
     /// паникует заимствованием (тот же контракт, что у `for_each`).
     /// Замена бекенда «на живую» — ответственность вызывающего: уже
@@ -175,12 +181,12 @@ impl TcbManager {
     /// обязанность — синхронизировать состояние (или регистрировать
     /// бекенд до создания задач/потоков).
     pub fn install_scheduler(&self, scheduler: &'static dyn SchedulerInterface) {
-        self.inner.borrow_mut().scheduler = Some(scheduler);
+        self.inner.write().scheduler = Some(scheduler);
     }
 
     /// Зарегистрированный планировщик-бекенд, если есть.
     pub fn scheduler(&self) -> Option<&'static dyn SchedulerInterface> {
-        self.inner.borrow().scheduler
+        self.inner.read().scheduler
     }
 
     // ==== Жизненный цикл задачи ====
@@ -193,7 +199,7 @@ impl TcbManager {
     /// ставится в очередь бекенда (`enqueue`; легаси-модель платформ без
     /// потоков); отказ бекенда откатывает создание целиком.
     pub fn create(&self, task_id: TaskId, priority: TaskPriority) -> Result<(), TaskError> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.write();
 
         if inner.by_uuid.find(&task_id).get().is_some()
             || inner.threads.by_uuid.find(&task_id).get().is_some()
@@ -259,7 +265,7 @@ impl TcbManager {
     /// Порядок «revoke_all → terminate → destroy» — ответственность
     /// вызывающего кода: менеджеры не вызывают друг друга в цикле.
     pub fn destroy(&self, task_id: TaskId) -> Result<(), TaskError> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.write();
 
         let node = find_task(&inner, &task_id).ok_or(TaskError::TaskNotFound(task_id))?;
         let (self_idx, live) = {
@@ -301,7 +307,7 @@ impl TcbManager {
     /// контролирует хендлер сискола (TaskTCB на цель), менеджер лишь
     /// хранит и применяет атомарно.
     pub fn set_limits(&self, task_id: &TaskId, tighten_to: TaskLimits) -> Result<(), TaskError> {
-        let inner = self.inner.borrow_mut();
+        let inner = self.inner.write();
         let node = find_task(&inner, task_id).ok_or(TaskError::TaskNotFound(*task_id))?;
         // SAFETY: эксклюзивный доступ под borrow_mut.
         let tcb: &mut TaskObj = unsafe { &mut *UnsafeRef::into_raw(node) };
@@ -311,7 +317,7 @@ impl TcbManager {
 
     /// Снимок атрибутов безопасности задачи (пределы + потребление).
     pub fn sec_view(&self, task_id: &TaskId) -> Option<TaskSecView> {
-        let inner = self.inner.borrow();
+        let inner = self.inner.read();
         let node = find_task(&inner, task_id)?;
         // SAFETY: только чтение.
         let tcb: &TaskObj = unsafe { &*UnsafeRef::into_raw(node) };
@@ -326,7 +332,7 @@ impl TcbManager {
     /// меняется). Вызов ДО фактической аллокации/отображения, откат —
     /// `refund_pages` при отказе подсистемы.
     pub fn charge_pages(&self, task_id: &TaskId, pages: usize) -> Result<(), TaskError> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.write();
         let node = find_task(&inner, task_id).ok_or(TaskError::TaskNotFound(*task_id))?;
         // SAFETY: эксклюзивный доступ под borrow_mut.
         let tcb: &mut TaskObj = unsafe { &mut *UnsafeRef::into_raw(node) };
@@ -348,7 +354,7 @@ impl TcbManager {
     /// Вернуть `pages` страниц в учёт домена (MEM_FREE, grant-исход,
     /// откат неудачной зарядки). Счётчик не уходит ниже нуля.
     pub fn refund_pages(&self, task_id: &TaskId, pages: usize) {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.write();
         if let Some(node) = find_task(&inner, task_id) {
             // SAFETY: эксклюзивный доступ под borrow_mut.
             let tcb: &mut TaskObj = unsafe { &mut *UnsafeRef::into_raw(node) };
@@ -358,7 +364,7 @@ impl TcbManager {
 
     /// Зарядить домену один SHM-регион (предел max_shm).
     pub fn charge_shm(&self, task_id: &TaskId) -> Result<(), TaskError> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.write();
         let node = find_task(&inner, task_id).ok_or(TaskError::TaskNotFound(*task_id))?;
         // SAFETY: эксклюзивный доступ под borrow_mut.
         let tcb: &mut TaskObj = unsafe { &mut *UnsafeRef::into_raw(node) };
@@ -374,7 +380,7 @@ impl TcbManager {
 
     /// Снять один SHM-регион с учёта домена (SHM_DESTROY).
     pub fn refund_shm(&self, task_id: &TaskId) {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.write();
         if let Some(node) = find_task(&inner, task_id) {
             // SAFETY: эксклюзивный доступ под borrow_mut.
             let tcb: &mut TaskObj = unsafe { &mut *UnsafeRef::into_raw(node) };
@@ -397,7 +403,7 @@ impl TcbManager {
         if ticks == 0 {
             return Ok(false);
         }
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.write();
         let node = find_task(&inner, task_id).ok_or(TaskError::TaskNotFound(*task_id))?;
         // SAFETY: эксклюзивный доступ под borrow_mut.
         let tcb: &mut TaskObj = unsafe { &mut *UnsafeRef::into_raw(node) };
@@ -430,7 +436,7 @@ impl TcbManager {
     /// готовность сам бекенд). Возврат — число доменов, которые
     /// находились в троттлинге (аудит границы периода).
     pub fn on_cpu_period(&self) -> usize {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.write();
         // Реестр (KeyAdapter-RBTree) даёт только &TaskObj — два прохода:
         // снимок идентификаторов, затем точечные мутации через find_task
         // (свежая UnsafeRef; consuming-into_raw — без переиспользования).
@@ -454,7 +460,7 @@ impl TcbManager {
 
     /// Предел `may_spawn` задачи (право творца; TASK_CREATE-хендлер).
     pub fn may_spawn(&self, task_id: &TaskId) -> Result<bool, TaskError> {
-        let inner = self.inner.borrow();
+        let inner = self.inner.read();
         let node = find_task(&inner, task_id).ok_or(TaskError::TaskNotFound(*task_id))?;
         // SAFETY: только чтение.
         let tcb: &TaskObj = unsafe { &*UnsafeRef::into_raw(node) };
@@ -466,7 +472,7 @@ impl TcbManager {
     /// Зарегистрировать exit-endpoint задачи (см. `crate::ipc` —
     /// три вида данных: код выхода / исключение / кем убита).
     pub(crate) fn set_exit_endpoint(&self, task_id: &TaskId, gate: ObjId) -> Result<(), TaskError> {
-        let inner = self.inner.borrow_mut();
+        let inner = self.inner.write();
         let node = find_task(&inner, task_id).ok_or(TaskError::TaskNotFound(*task_id))?;
         // SAFETY: эксклюзивный доступ под borrow_mut.
         let tcb: &mut TaskObj = unsafe { &mut *UnsafeRef::into_raw(node) };
@@ -477,7 +483,7 @@ impl TcbManager {
     /// Зарегистрированный exit-endpoint задачи (`None` — не регистрировался
     /// или задачи нет).
     pub(crate) fn exit_endpoint(&self, task_id: &TaskId) -> Option<ObjId> {
-        let inner = self.inner.borrow();
+        let inner = self.inner.read();
         let node = find_task(&inner, task_id)?;
         // SAFETY: только чтение.
         let tcb: &TaskObj = unsafe { &*UnsafeRef::into_raw(node) };
@@ -488,13 +494,13 @@ impl TcbManager {
 
     /// Зарегистрирована ли задача.
     pub fn contains(&self, task_id: &TaskId) -> bool {
-        let inner = self.inner.borrow();
+        let inner = self.inner.read();
         inner.by_uuid.find(task_id).get().is_some()
     }
 
     /// Снимок состояния задачи.
     pub fn get(&self, task_id: &TaskId) -> Option<TaskView> {
-        let inner = self.inner.borrow();
+        let inner = self.inner.read();
         let tcb = find_task(&inner, task_id)?;
         // SAFETY: под borrow — только чтение.
         let tcb: &TaskObj = unsafe { &*UnsafeRef::into_raw(tcb) };
@@ -508,7 +514,7 @@ impl TcbManager {
     /// Стабильная ссылка задачи на себя в таблице объектов: `(idx, generation)`.
     /// Кэшируется планировщиком — горячий путь не ищет задачу по Uuid.
     pub fn self_slot(&self, task_id: &TaskId) -> Option<SlotRef> {
-        let inner = self.inner.borrow();
+        let inner = self.inner.read();
         let tcb = find_task(&inner, task_id)?;
         // SAFETY: только чтение.
         let tcb: &TaskObj = unsafe { &*UnsafeRef::into_raw(tcb) };
@@ -521,7 +527,7 @@ impl TcbManager {
     /// TargetRef на живую (не Dead) задачу — цель для capability.
     /// `None` — задача не существует или уже мертва (поколение побито).
     pub(crate) fn target_ref(&self, task_id: &TaskId) -> Option<TargetRef> {
-        let inner = self.inner.borrow();
+        let inner = self.inner.read();
         let tcb = find_task(&inner, task_id)?;
         // SAFETY: только чтение.
         let tcb: &TaskObj = unsafe { &*UnsafeRef::into_raw(tcb) };
@@ -533,15 +539,15 @@ impl TcbManager {
 
     /// Число живых задач.
     pub fn count(&self) -> usize {
-        let inner = self.inner.borrow();
+        let inner = self.inner.read();
         inner.by_uuid.iter().count()
     }
 
     /// Обход всех задач в порядке возрастания `task_id` (редкий путь:
     /// uuid-дерево). Callback получает копии, TCB наружу не утекает.
-    /// Вызов методов менеджера из callback — паника RefCell.
+    /// Вызов мутаций менеджера из callback — дедлок (write под read).
     pub fn for_each(&self, mut f: impl FnMut(TaskView)) {
-        let inner = self.inner.borrow();
+        let inner = self.inner.read();
         for tcb in inner.by_uuid.iter() {
             f(TaskView {
                 task_id: tcb.task_id,
@@ -553,14 +559,14 @@ impl TcbManager {
 
     /// Первая задача реестра (курсорный обход без удержания borrow).
     pub(crate) fn first_task(&self) -> Option<TaskId> {
-        let inner = self.inner.borrow();
+        let inner = self.inner.read();
         inner.by_uuid.front().get().map(|t| t.task_id)
     }
 
     /// Следующая задача строго после `task_id` (для дроп-обхода менеджера
     /// capability без аллокаций и без вложенных borrow).
     pub(crate) fn next_task_after(&self, task_id: &TaskId) -> Option<TaskId> {
-        let inner = self.inner.borrow();
+        let inner = self.inner.read();
         let cursor = inner.by_uuid.lower_bound(Bound::Excluded(task_id));
         cursor.get().map(|t| t.task_id)
     }
@@ -575,7 +581,7 @@ impl TcbManager {
     /// порядок «generation, потом ресурсы» из плана. КАСКАД: смерть задачи
     /// гасит все её живые потоки (каждый — через свой автомат с хуками
     /// планировщика; сбор потока идёт без удержания borrow, чтобы
-    /// `thread_set_state` не реентерил RefCell).
+    /// `thread_set_state` не реентерил лок менеджера).
     ///
     /// При зарегистрированном планировщике переход сначала уведомляет бекенд
     /// (`enqueue` в `Ready`, `deschedule` в `Blocked`/`Suspended`/`Dead`; в
@@ -586,7 +592,7 @@ impl TcbManager {
     pub fn set_state(&self, task_id: &TaskId, to: TaskState) -> Result<TaskState, TaskError> {
         // Фаза 1: перевод задачи под borrow + сбор живых потоков для каскада.
         let (from, live_threads) = {
-            let inner = self.inner.borrow_mut();
+            let inner = self.inner.write();
 
             let node = find_task(&inner, task_id).ok_or(TaskError::TaskNotFound(*task_id))?;
             // SAFETY: эксклюзивный доступ под borrow_mut.
@@ -653,7 +659,7 @@ impl TcbManager {
     /// При зарегистрированном планировщике бекенд уведомляется ДО применения
     /// (`on_priority_change`); отказ откатывает смену приоритета.
     pub fn set_priority(&self, task_id: &TaskId, priority: TaskPriority) -> Result<(), TaskError> {
-        let inner = self.inner.borrow_mut();
+        let inner = self.inner.write();
 
         let node = find_task(&inner, task_id).ok_or(TaskError::TaskNotFound(*task_id))?;
         // SAFETY: эксклюзивный доступ под borrow_mut.
@@ -682,7 +688,7 @@ impl TcbManager {
         task_id: &TaskId,
         f: impl FnOnce(&HandleTable) -> R,
     ) -> Option<R> {
-        let inner = self.inner.borrow();
+        let inner = self.inner.read();
         let node = find_task(&inner, task_id)?;
         // SAFETY: под borrow — совместный доступ; мутации только через
         // with_caps_mut (контракт менеджера).
@@ -698,7 +704,7 @@ impl TcbManager {
         task_id: &TaskId,
         f: impl FnOnce(&mut HandleTable) -> R,
     ) -> Option<R> {
-        let inner = self.inner.borrow_mut();
+        let inner = self.inner.write();
         let node = find_task(&inner, task_id)?;
         // SAFETY: под borrow_mut — эксклюзивный доступ к объекту задачи.
         let tcb: &mut TaskObj = unsafe { &mut *UnsafeRef::into_raw(node) };
@@ -713,7 +719,7 @@ impl TcbManager {
         slot: SlotRef,
         f: impl FnOnce(&TaskObj) -> R,
     ) -> Option<R> {
-        let inner = self.inner.borrow();
+        let inner = self.inner.read();
         let tcb = inner.tasks.get(slot.idx, slot.generation)?;
         Some(f(tcb))
     }

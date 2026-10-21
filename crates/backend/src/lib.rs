@@ -39,7 +39,6 @@ pub mod ctxswitch;
 pub mod gate;
 pub mod ioapic;
 pub mod iommu;
-pub mod klock;
 pub mod lapic;
 pub mod memory;
 pub mod platform;

@@ -180,9 +180,16 @@ pub trait KernelGlue: Send + Sync {
     /// Домен-владелец потока (per-CPU зеркало текущей задачи).
     fn thread_owner(&self, thread: ThreadId) -> Option<TaskId>;
 
-    /// Перевести поток в Running (диспетчеризация; без хука в ядре —
-    /// состояние ставит гейт после переключения).
-    fn mark_running(&self, thread: ThreadId);
+    /// Перевести поток в Running (диспетчеризация; переход Ready→Running
+    /// под локом менеджера). Возврат `false` — переход не состоялся
+    /// (поток Dead/занят): диспетчеризация ОБЯЗАНА взять следующего,
+    /// не входя в этого (SMP v0.12: защита от воскрешения убитого
+    /// в окне между валидацией и запуском).
+    fn mark_running(&self, thread: ThreadId) -> bool;
+
+    /// Состояние потока (None — потока нет). Диспетчеризация фильтрует
+    /// протухшие записи готовности (ленивый deschedule SMP v0.12).
+    fn thread_state(&self, thread: ThreadId) -> Option<TaskState>;
 
     /// Забрать материализованный возврат заблокированного сискола
     /// (ядро пишет его при пробуждении; None — возврата нет).
@@ -205,7 +212,7 @@ pub trait KernelGlue: Send + Sync {
     fn live_thread_count(&self) -> usize;
 
     /// v0.10, CPU-квоты: поток `thread` уступил CPU, потребив `ticks`
-    /// тиков (вытеснение/уступка — гейт планировщика под BKL). Ядро
+    /// тиков (вытеснение/уступка — preempt-шаг гейта). Ядро
     /// заряжает их домену-владельцу; возврат `true` — домен за
     /// пределом `cpu_quota`: гейт обязан запарковать поток (троттлинг)
     /// до границы периода вместо возврата в очередь готовности.
@@ -216,13 +223,44 @@ pub trait KernelGlue: Send + Sync {
         false
     }
 
+    /// v0.12, демонтаж BKL: возврат вытесненного потока в готовность
+    /// (rotate preempt-шага) — переход Running -> Ready ПОД хуком
+    /// `enqueue` планировщика (публикация в кольцо готовности).
+    ///
+    /// Гейт обязан СОХРАНИТЬ КОНТЕКСТ ДО этого вызова: после перехода
+    /// другой CPU может немедленно выбрать и войти в поток. Возврат
+    /// `false` — переход не состоялся (поток убит/приостановлен в окне
+    /// вытеснения): ре-очередь не нужна, гейт просто диспетчеризует
+    /// следующего.
+    ///
+    /// Дефолт — `false` (планировщик без ре-очереди: бекенды,
+    /// не реализующие ленивый deschedule).
+    fn requeue_thread(&self, _thread: ThreadId) -> bool {
+        false
+    }
+
+    /// v0.12, CPU-квоты: троттл-парковка вытесненного потока — переход
+    /// Running -> Ready БЕЗ публикации в очередь готовности (поток
+    /// вернётся в готовность на границе CPU-периода). Гейт вызывает
+    /// ПОСЛЕ сохранения контекста и только при `true` от
+    /// [`KernelGlue::on_timeslice_consumed`]; затем паркует поток в
+    /// троттл-лист бекенда.
+    ///
+    /// Возврат `false` — переход не состоялся (поток убит в окне):
+    /// в троттл-лист его класть нельзя.
+    ///
+    /// Дефолт — `false` (квоты не поддержаны).
+    fn throttle_thread(&self, _thread: ThreadId) -> bool {
+        false
+    }
+
     /// v0.10, CPU-квоты: граница периода — сбросить учёт потребления всех
-    /// доменов (вызывает бекенд планировщика под BKL; потоки из
+    /// доменов (вызывает бекенд планировщика; потоки из
     /// троттл-листа в готовность возвращает сам бекенд).
     fn on_cpu_period(&self) {}
 
     /// v0.11, внешние линии: событие на линии GSI (IOAPIC; бекенд — из
-    /// обработчика прерываний под BKL). Ядро доставляет его драйверу —
+    /// обработчика прерываний). Ядро доставляет его драйверу —
     /// signal-слово в endpoint привязки (IrqRouter). Возврат `true` —
     /// событие учтено (линия привязана), `false` — линии нет (spurious).
     ///
@@ -318,6 +356,10 @@ struct Glue<MMAP: MMAPInterface + 'static> {
 // гасит IF), таймер приходит только в user-режиме; значит все вызовы Glue
 // — строго последовательны, RefCell-контракт ядра не нарушается. SMP
 // потребует big-kernel-lock на входах (OFF_DEPTH) — задокументировано.
+// SAFETY (v0.12): до — сериализация BKL (RefCell-менеджеры под одним
+// глобальным замком); теперь менеджеры GCTL синхронизированы каждый
+// своим локом (KRwLock/KSpin/атомики; ранги — см. `kernel::sync`),
+// raw-указатели таблиц трогаются только generation-проверенными путями.
 unsafe impl<MMAP: MMAPInterface + ASIDInterface + 'static> Send for Glue<MMAP> {}
 unsafe impl<MMAP: MMAPInterface + ASIDInterface + 'static> Sync for Glue<MMAP> {}
 
@@ -379,13 +421,20 @@ impl<MMAP: MMAPInterface + KMAPInterface + ASIDInterface + 'static> KernelGlue f
         self.gctl.task_manager().thread_task(&thread)
     }
 
-    fn mark_running(&self, thread: ThreadId) {
-        // Ready→Running; ошибки (например, Dead-каскад в полёте) не
-        // фатальны — гейт всё равно уходит в этот контекст.
-        let _ = self
-            .gctl
+    fn mark_running(&self, thread: ThreadId) -> bool {
+        // Ready→Running под write-гардом менеджера: провал (Dead-каскад
+        // в полёте) = не входить в поток (SMP v0.12).
+        self.gctl
             .task_manager()
-            .thread_set_state(&thread, TaskState::Running);
+            .thread_set_state(&thread, TaskState::Running)
+            .is_ok()
+    }
+
+    fn thread_state(&self, thread: ThreadId) -> Option<TaskState> {
+        self.gctl
+            .task_manager()
+            .thread_view(&thread)
+            .map(|v| v.state)
     }
 
     fn take_syscall_ret(&self, thread: ThreadId) -> Option<usize> {
@@ -485,6 +534,26 @@ impl<MMAP: MMAPInterface + KMAPInterface + ASIDInterface + 'static> KernelGlue f
 
     fn on_cpu_period(&self) {
         self.gctl.task_manager().on_cpu_period();
+    }
+
+    fn requeue_thread(&self, thread: ThreadId) -> bool {
+        // Running -> Ready (+ enqueue-хук): ленивый deschedule валидирует
+        // записи кольца по состоянию — публикация обязана идти через
+        // автомат состояний, а не мимо него (баг bring-up v0.12: rotate
+        // без перехода — pick отсеял ВСЕ вытеснённые потоки как stale).
+        self.gctl
+            .task_manager()
+            .thread_set_state(&thread, TaskState::Ready)
+            .is_ok()
+    }
+
+    fn throttle_thread(&self, thread: ThreadId) -> bool {
+        // Running -> Ready БЕЗ очереди готовности: поток уходит в
+        // троттл-лист бекенда до границы периода.
+        self.gctl
+            .task_manager()
+            .thread_park_throttled(&thread)
+            .is_ok()
     }
 
     /// v0.11: событие внешней линии (IOAPIC) — IrqRouter кладёт

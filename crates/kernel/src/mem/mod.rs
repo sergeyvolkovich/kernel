@@ -1,6 +1,9 @@
 use alloc::collections::BTreeMap;
 use attachable_slab_allocator::{SlabBox, SlabCache, locks::SpinLock};
-use core::cell::{Cell, RefCell, UnsafeCell};
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use crate::sync::KSpin;
 use heapless::{arc_pool, pool::arc::ArcPool};
 use llfree::LLFree;
 use spin::{LazyLock, Mutex, Once};
@@ -251,18 +254,26 @@ pub struct MemoryManager<MmapWraper: MMAPInterface, AP: ArcPool<Data = LLFree<'s
     /// [`Self::with_facade`] (интерьерный мутабельный доступ по сырой
     /// ссылке; однопоточный контракт крейта — тот же рефлекс, что
     /// UnsafeRef в интрузивных контейнерах).
-    facades: RefCell<BTreeMap<crate::task::TaskId, *mut UFacade<MmapWraper, AP>>>,
+    facades: KSpin<BTreeMap<crate::task::TaskId, *mut UFacade<MmapWraper, AP>>>,
     /// Рантайм-фасады v0.9 (владение менеджером): TASK_CREATE-порождённые
     /// пространства. Фасад инициализации (kinit/платформа) здесь НЕ лежит
     /// — он «вечный» (leak), разрушение — платформенная ответственность.
-    owned: RefCell<BTreeMap<crate::task::TaskId, FacadeBox<MmapWraper, AP>>>,
+    owned: KSpin<BTreeMap<crate::task::TaskId, FacadeBox<MmapWraper, AP>>>,
+    /// SMP v0.12: лок операций фасадов (ранг KMEM — лист; см. `sync`).
+    /// Сериализует [`Self::with_facade`] и все изменения таблиц привязок:
+    /// два потока одного домена не получают параллельный `&mut UFacade`,
+    /// многошаговые операции роутера (`transfer`/`map_external_at`) держат
+    /// его ОТ начала до конца (TOCTOU физики региона закрыт). Единственный
+    /// ядровый лок, под которым ядро ждёт cross-CPU (TLB shootdown ACK):
+    /// его ожидатели всегда на «глубине 0» — ACK доставляется в спине.
+    ops: KSpin<()>,
     /// Геометрия рантайм-пространств (копится с первого `configure_spaces`):
     /// окно фасада (страниц) + базы. Политика платформы, устанавливается
-    /// startup-кодом ДО первого TASK_CREATE.
-    runtime_window_pages: Cell<usize>,
-    runtime_cpu_count: Cell<usize>,
-    runtime_base: Cell<VirtualADDR>,
-    runtime_geometry_set: Cell<bool>,
+    /// startup-кодом ДО первого TASK_CREATE (SMP v0.12: атомики).
+    runtime_window_pages: AtomicUsize,
+    runtime_cpu_count: AtomicUsize,
+    runtime_base: AtomicUsize,
+    runtime_geometry_set: AtomicBool,
 }
 
 impl<MmapWraper: MMAPInterface, AP: ArcPool<Data = LLFree<'static>>> MemoryManager<MmapWraper, AP> {
@@ -281,12 +292,13 @@ impl<MmapWraper: MMAPInterface, AP: ArcPool<Data = LLFree<'static>>> MemoryManag
             // крейт не доверяет железу.
             kmap: KMap::new(IsolationPolicy::conservative()),
             asid_allocator: None,
-            facades: RefCell::new(BTreeMap::new()),
-            owned: RefCell::new(BTreeMap::new()),
-            runtime_window_pages: Cell::new(0),
-            runtime_cpu_count: Cell::new(1),
-            runtime_base: Cell::new(VirtualADDR(0)),
-            runtime_geometry_set: Cell::new(false),
+            facades: KSpin::new(BTreeMap::new()),
+            owned: KSpin::new(BTreeMap::new()),
+            ops: KSpin::new(()),
+            runtime_window_pages: AtomicUsize::new(0),
+            runtime_cpu_count: AtomicUsize::new(1),
+            runtime_base: AtomicUsize::new(0),
+            runtime_geometry_set: AtomicBool::new(false),
         })
     }
 
@@ -296,42 +308,67 @@ impl<MmapWraper: MMAPInterface, AP: ArcPool<Data = LLFree<'static>>> MemoryManag
     /// `FacadeBox`). Повторная привязка задачи перезаписывает прошлую —
     /// платформа отвечает за непересечение времени жизни боксов.
     pub fn bind_facade(&self, task: crate::task::TaskId, facade: &FacadeBox<MmapWraper, AP>) {
+        let _ops = self.ops.lock();
         self.facades
-            .borrow_mut()
+            .lock()
             .insert(task, facade.as_ptr() as *mut UFacade<MmapWraper, AP>);
     }
 
     /// Снять привязку (ОБЯЗАТЕЛЬНО до дропа фасадного бокса).
     /// Возвращает, была ли привязка.
     pub fn unbind_facade(&self, task: &crate::task::TaskId) -> bool {
-        self.facades.borrow_mut().remove(task).is_some()
+        let _ops = self.ops.lock();
+        self.facades.lock().remove(task).is_some()
     }
 
     /// Фасад привязан? (аудит/тесты).
     pub fn has_facade(&self, task: &crate::task::TaskId) -> bool {
-        self.facades.borrow().contains_key(task)
+        self.facades.lock().contains_key(task)
     }
 
     /// Доступ к фасаду задачи для изменения (сисколы памяти, IPC-элементы).
     /// `None` — задача без фасада (не регистрировала или уже сняла).
     ///
+    /// SMP v0.12: операция исполняется под [`Self::ops`] (ранг KMEM —
+    /// лист): параллельные `&mut UFacade` исключены, TLB shootdown
+    /// внутри операции доставляет ACK ожидающим (глубина 0).
+    ///
     /// SAFETY-контракт: живость указателя гарантирует парой
     /// `bind_facade`/`unbind_facade` (платформа обязана снять привязку до
-    /// дропа бокса); однопоточный контракт крейта делает мутабельный доступ
-    /// по сырой ссылке корректным.
+    /// дропа бокса); эксклюзивность — лок `ops`.
     pub fn with_facade<R>(
         &self,
         task: &crate::task::TaskId,
         f: impl FnOnce(&mut UFacade<MmapWraper, AP>) -> R,
     ) -> Option<R> {
-        let ptr = *self.facades.borrow().get(task)?;
-        // SAFETY: контракт bind/unbind + однопоточность.
+        let ops = self.ops.lock();
+        self.with_facade_under(&ops, task, f)
+    }
+
+    /// То же под УЖЕ взятым ops-гардом (многошаговые операции роутера:
+    /// `transfer`/`map_external_at` держат сериализацию от чтения физики
+    /// региона до завершения отображения — TOCTOU кадров закрыт).
+    pub(crate) fn with_facade_under<R>(
+        &self,
+        _ops: &crate::sync::KSpinGuard<'_, ()>,
+        task: &crate::task::TaskId,
+        f: impl FnOnce(&mut UFacade<MmapWraper, AP>) -> R,
+    ) -> Option<R> {
+        let ptr = *self.facades.lock().get(task)?;
+        // SAFETY: контракт bind/unbind + ops-лок.
         Some(f(unsafe { &mut *ptr }))
+    }
+
+    /// Гард операций подсистемы памяти (транзакции роутера/спавна).
+    /// Ранг KMEM — лист: под этим гардом ДРУГИЕ ядровые локи не берутся
+    /// (кроме внутренних атомиков аллокаторов).
+    pub(crate) fn ops_guard(&self) -> crate::sync::KSpinGuard<'_, ()> {
+        self.ops.lock()
     }
 
     /// Число привязанных фасадов (аудит).
     pub fn bound_facade_count(&self) -> usize {
-        self.facades.borrow().len()
+        self.facades.lock().len()
     }
 
     /// Зарегистрировать пул тегов ASID/PCID (только один раз, как
@@ -507,10 +544,11 @@ impl<MmapWraper: MMAPInterface, AP: ArcPool<Data = LLFree<'static>>> MemoryManag
         cpu_count: usize,
         base: VirtualADDR,
     ) {
-        self.runtime_window_pages.set(window_pages);
-        self.runtime_cpu_count.set(cpu_count);
-        self.runtime_base.set(base);
-        self.runtime_geometry_set.set(true);
+        self.runtime_window_pages
+            .store(window_pages, Ordering::Relaxed);
+        self.runtime_cpu_count.store(cpu_count, Ordering::Relaxed);
+        self.runtime_base.store(base.0, Ordering::Relaxed);
+        self.runtime_geometry_set.store(true, Ordering::Relaxed);
     }
 
     /// Создать адресное пространство задачи в РАНТАЙМЕ (через &self —
@@ -529,7 +567,7 @@ impl<MmapWraper: MMAPInterface, AP: ArcPool<Data = LLFree<'static>>> MemoryManag
     where
         MmapWraper: KMAPInterface,
     {
-        if !self.runtime_geometry_set.get() {
+        if !self.runtime_geometry_set.load(Ordering::Relaxed) {
             return Err(MemErrorCode::InvalidArgument(
                 "runtime space geometry is not configured",
             ));
@@ -537,12 +575,13 @@ impl<MmapWraper: MMAPInterface, AP: ArcPool<Data = LLFree<'static>>> MemoryManag
         if self.has_facade(&task) {
             return Err(MemErrorCode::AlreadyMapped);
         }
+        let ops = self.ops.lock();
         let facade = UFacade::new_with_kernel(
             self.p_allocator.clone(),
             mmap_interface,
-            self.runtime_window_pages.get(),
-            self.runtime_cpu_count.get(),
-            self.runtime_base.get(),
+            self.runtime_window_pages.load(Ordering::Relaxed),
+            self.runtime_cpu_count.load(Ordering::Relaxed),
+            VirtualADDR(self.runtime_base.load(Ordering::Relaxed)),
             &self.kmap,
         )?;
         // Слот под Mutex (рантайм-путь): alloc() возвращает ВЛАДЕЮЩИЙ бокс
@@ -553,9 +592,12 @@ impl<MmapWraper: MMAPInterface, AP: ArcPool<Data = LLFree<'static>>> MemoryManag
         unsafe { core::ptr::write(slot.as_ptr(), facade) };
         // Привязка ДО помещения во владение: с этой точки сисколы
         // памяти задачи находят фасад; ошибка ниже откатит привязку.
+        // Вся пара «привязка + владение» — под ops-гардом: параллельного
+        // окна «фасад виден, но ещё не owned» не существует.
         let ptr = slot.as_ptr() as *mut UFacade<MmapWraper, AP>;
-        self.facades.borrow_mut().insert(task, ptr);
-        self.owned.borrow_mut().insert(task, slot);
+        self.facades.lock().insert(task, ptr);
+        self.owned.lock().insert(task, slot);
+        drop(ops);
         Ok(())
     }
 
@@ -564,23 +606,30 @@ impl<MmapWraper: MMAPInterface, AP: ArcPool<Data = LLFree<'static>>> MemoryManag
     /// нет ИЛИ оно не рантайм-ное (kinit-фасад «вечный»: владение не у
     /// менеджера).
     pub fn destroy_task_space(&self, task: &crate::task::TaskId) -> Result<(), MemErrorCode> {
-        let removed = self.owned.borrow_mut().remove(task);
+        // ops держится ДО дропа бокса: пока фасад разрушается, никакой
+        // параллельный with_facade не держит его по сырой ссылке.
+        let ops = self.ops.lock();
+        let removed = self.owned.lock().remove(task);
         match removed {
             Some(_box) => {
                 // Сначала снятие привязки (контракт bind/unbind), затем
                 // дроп бокса-владельца (порядок: пользователь уже мёртв,
                 // сисколы этого фасада больше не приходят).
-                self.unbind_facade(task);
+                self.facades.lock().remove(task);
                 drop(_box);
+                drop(ops);
                 Ok(())
             }
-            None => Err(MemErrorCode::NotFound),
+            None => {
+                drop(ops);
+                Err(MemErrorCode::NotFound)
+            }
         }
     }
 
     /// Число рантайм-пространств под владением менеджера (аудит).
     pub fn owned_space_count(&self) -> usize {
-        self.owned.borrow().len()
+        self.owned.lock().len()
     }
 }
 
@@ -606,6 +655,20 @@ impl<'a, MMAP: MMAPInterface> MemRouterImpl<'a, MMAP> {
     ) -> Option<(VirtualADDR, PhysADDR, usize)> {
         self.mm
             .with_facade(&task, |f| f.region_window(vaddr))
+            .flatten()
+    }
+
+    /// Вариант `region_info` под УЖЕ взятым ops-гардом (многошаговые
+    /// операции `transfer`/`map_external_at`: физика региона и её
+    /// отображение — одна критсекция KMEM, TOCTOU кадров исключён).
+    fn region_info_under(
+        &self,
+        ops: &crate::sync::KSpinGuard<'_, ()>,
+        task: crate::task::TaskId,
+        vaddr: VirtualADDR,
+    ) -> Option<(VirtualADDR, PhysADDR, usize)> {
+        self.mm
+            .with_facade_under(ops, &task, |f| f.region_window(vaddr))
             .flatten()
     }
 }
@@ -665,9 +728,12 @@ impl<MMAP: MMAPInterface> MemRouter for MemRouterImpl<'_, MMAP> {
         if pages == 0 {
             return Err(MemErrorCode::InvalidArgument("pages must be > 0"));
         }
+        // SMP v0.12: вся операция — под ОДНИМ ops-гардом (физика региона
+        // не может уйти в пул между чтением и отображением).
+        let ops = self.mm.ops_guard();
         // 1. Регион источника: (v_base, p_base, region_pages).
         let (v_base, p_base, region_pages) = self
-            .region_info(src, VirtualADDR(src_vaddr))
+            .region_info_under(&ops, src, VirtualADDR(src_vaddr))
             .ok_or(MemErrorCode::NotFound)?;
         let page_off = (src_vaddr - v_base.0) / crate::hal::traits::mmap::PAGE_SIZE;
         if src_vaddr < v_base.0 || page_off + pages > region_pages {
@@ -685,12 +751,15 @@ impl<MMAP: MMAPInterface> MemRouter for MemRouterImpl<'_, MMAP> {
         }
 
         // 3. Отображение у получателя (внешние кадры; у источника остаются).
-        let dst_vaddr = self.map_external(dst, window_paddr, pages, flags)?;
+        let dst_vaddr = self
+            .mm
+            .with_facade_under(&ops, &dst, |f| f.map_external(window_paddr, pages, flags))
+            .unwrap_or(Err(MemErrorCode::NotFound))?;
 
         // 4. Grant: окно у источника снимается без возврата кадров пулу.
         if grant {
             self.mm
-                .with_facade(&src, |f| f.detach_region(v_base))
+                .with_facade_under(&ops, &src, |f| f.detach_region(v_base))
                 .unwrap_or(Err(MemErrorCode::NotFound))?;
         }
         Ok(dst_vaddr.0)
@@ -708,10 +777,12 @@ impl<MMAP: MMAPInterface> MemRouter for MemRouterImpl<'_, MMAP> {
         if pages == 0 {
             return Err(MemErrorCode::InvalidArgument("pages must be > 0"));
         }
+        // SMP v0.12: физика региона и отображение — одна критсекция.
+        let ops = self.mm.ops_guard();
         // 1. Физика источника: окно региона, содержащего src_vaddr
         //    (выравнивание вниз до база региона — как transfer).
         let (v_base, p_base, region_pages) = self
-            .region_info(src, VirtualADDR(src_vaddr))
+            .region_info_under(&ops, src, VirtualADDR(src_vaddr))
             .ok_or(MemErrorCode::NotFound)?;
         let page_off = (src_vaddr - v_base.0) / crate::hal::traits::mmap::PAGE_SIZE;
         if src_vaddr < v_base.0
@@ -726,7 +797,7 @@ impl<MMAP: MMAPInterface> MemRouter for MemRouterImpl<'_, MMAP> {
         // 2. Фиксированное отображение у получателя (external = true:
         //    кадры — собственность источника, смерть цели их не тронет).
         self.mm
-            .with_facade(&dst, |f| {
+            .with_facade_under(&ops, &dst, |f| {
                 f.map_fixed(VirtualADDR(dst_vaddr), window_paddr, pages, flags, true)
             })
             .unwrap_or(Err(MemErrorCode::NotFound))?;

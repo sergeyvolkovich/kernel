@@ -4,6 +4,16 @@
 // возвращается (продолжение прерванного), либо уходит в
 // [`crate::sched::schedule_next`] без возврата (блокировка/смерть/
 // вытеснение: фрейм сохранён в контекст потока, ядровый стек свободен).
+//
+// SMP v0.12 — БЕЗ Big Kernel Lock (klock.rs демонтирован): входы в ядро
+// НЕ сериализуются глобальным замком. Синхронизация — fine-grained
+// локами менеджеров ядра (KRwLock/KSpin, ранги — см. `kernel::sync`)
+// + lock-free структуры планировщика (sched.rs). IF-дисциплина: вход —
+// IF=0 (гейты); лок берётся/ждётся по правилам sync (спин на глубине
+// 0 — с IF=1: IPI доставляются, shootdown-ACK приходит). Переключение
+// контекста (schedule_next/enter_user) локов НЕ держит: все гарды
+// отпущены до входа в пользователя (контекст — единоличное владение
+// CPU после эксклюзивного pop из готовности).
 
 use alloc::boxed::Box;
 
@@ -46,9 +56,8 @@ struct SysFrame {
 /// вытеснении — не возвращается (контекст сохранён, диспетчеризация
 /// переключила CPU на другой поток).
 ///
-/// SMP v0.6: вход — захват BKL (klock.rs); все не-возвратные пути
-/// освобождают его внутри (finalize_and_enter); нормальный возврат —
-/// release перед sysret. cpu — из GS (per-CPU), не константа 0.
+/// SMP v0.12: без BKL — диспетчер берёт локи менеджеров по мере нужды
+/// (RAII-гарды, дисциплина рангов `kernel::sync`). cpu — из GS.
 #[unsafe(no_mangle)]
 extern "C" fn syscall_c(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> i64 {
     let glue = kernel_glue();
@@ -58,9 +67,6 @@ extern "C" fn syscall_c(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6
         kpanic("gate: syscall with no current thread (GS/percpu broken?)");
     }
 
-    // BKL: ядро (RefCell-структуры GCTL) — только под замком. Вход с
-    // IF=0 (FMASK); захват спином с IF=1 (доставка IPI — см. klock).
-    crate::klock::acquire();
     let cpu_id = arch::percpu::cpu_id() as usize;
 
     // Раскладка SyscallArgs — конвенция ядра (`syscall::types`, см.
@@ -78,40 +84,71 @@ extern "C" fn syscall_c(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6
         a4 as usize,
         a5 as usize,
     ]);
+
+    // SMP v0.12: КОНТЕКСТ-ВХОД — до диспетчера, безусловно.
+    //
+    // Любая публикация блокировки внутри диспетча (IPC send/recv/call,
+    // recv_any, DEVICE_CLAIM: перевод в Blocked + парковка в очередь)
+    // оказывается ПОСЛЕ сохранения контекста — cross-CPU пробуждение
+    // (claim → mailbox → Ready → enqueue) не может войти в поток со
+    // старым контекстом (первый вход падал бы в start_info — рестарт
+    // с точки входа). rax здесь = номер сискола: возврат блокировки
+    // материализуется пробуждением (`syscall_ret` в
+    // `finalize_and_enter`), вытеснение сохранит rax=ret поверх.
+    //
+    // Повторного сохранения на блок-пути НЕТ: оно затёрло бы контекст
+    // СЛЕДУЮЩЕГО блокирования потока после повторного входа и быстрого
+    // повторного парка на другом CPU.
+    {
+        let frame =
+            unsafe { &*(arch::percpu::read_u64(arch::percpu::OFF_FRAME) as *const SysFrame) };
+        let user_rsp = unsafe { arch::percpu::read_u64(arch::percpu::OFF_USER_RSP) };
+        sched::scheduler().save_context(thread, Box::new(frame_to_ctx(frame, user_rsp, nr)));
+    }
+
     let ret = glue.dispatch(cpu_id, task, thread, nr, &args);
 
     // Смерть потока (TASK_EXIT/каскад): reap + диспетчеризация.
+    // Проверка монотонна (Dead терминален) — гонки нет: сработает и
+    // позже; повторный reap идемпотентен.
     if glue.thread_dead(thread) {
         sched::scheduler().drop_context(thread);
         glue.reap_thread(thread);
         sched::schedule_next();
     }
 
-    // Блокировка (IPC/claim): фрейм -> контекст, дальше без возврата.
-    if glue.thread_blocked(thread) {
-        // v0.10: блокировка — тоже конец отрезка исполнения: зарядить
-        // домену потреблённые тики (минимум 1 за проход, как у preempt-
-        // шага — иначе «вычислить-и-заблокироваться» жил бы вне квот;
-        // решением троттлить пренебрегаем: поток уже паркуется сам).
-        if let Some(cur) = sched::scheduler().current_thread() {
-            let used = sched::scheduler().take_slice_used().max(1) as usize;
-            let _ = glue.on_timeslice_consumed(cur, used);
+    // Блокировка (IPC/claim): решение — по per-CPU защёлке диспетчера
+    // (`record_block_latch` в хендлерах), НЕ по повторному чтению TCB:
+    // между диспетчем и чтением cross-CPU пробуждение могло уже вывести
+    // поток в Running — sysret дал бы ДВОЙНОЙ запуск (класс гонок,
+    // который раньше закрывал BKL).
+    if pkg_generic_interface::syscall::take_block_latch(cpu_id) {
+        if glue.thread_blocked(thread) {
+            // v0.10: блокировка — тоже конец отрезка исполнения: зарядить
+            // домену потреблённые тики (минимум 1 за проход, как у preempt-
+            // шага — иначе «вычислить-и-заблокироваться» жил бы вне квот;
+            // решением троттлить пренебрегаем: поток уже паркуется сам).
+            if let Some(cur) = sched::scheduler().current_thread() {
+                let used = sched::scheduler().take_slice_used().max(1) as usize;
+                let _ = glue.on_timeslice_consumed(cur, used);
+            }
         }
-        let frame =
-            unsafe { &*(arch::percpu::read_u64(arch::percpu::OFF_FRAME) as *const SysFrame) };
-        let user_rsp = unsafe { arch::percpu::read_u64(arch::percpu::OFF_USER_RSP) };
-        let ctx = frame_to_ctx(frame, user_rsp, ret as u64);
-        sched::park_current(Box::new(ctx));
+        // Поток ещё Blocked — обычный парк (контекст уже сохранён
+        // входом). Уже разбужен/исполняется на другом CPU — свой фрейм
+        // просто бросаем: идентичный контекст той же точки входа
+        // сохранён на входе и принят другим CPU. Без sysret в обоих
+        // случаях — только диспетчеризация.
+        sched::schedule_next();
     }
 
     // Вытеснение (квант истёк/yield/wrap-периода): единый preempt-шаг
     // v0.10 — refill CPU-периода, заряд квоты домену, rotate или
-    // троттл-парк; не возвращается (BKL отпустит вход следующего).
+    // троттл-парк; не возвращается (вход следующего — свои локи).
     if sched::scheduler().take_need_resched() {
         let frame =
             unsafe { &*(arch::percpu::read_u64(arch::percpu::OFF_FRAME) as *const SysFrame) };
         let user_rsp = unsafe { arch::percpu::read_u64(arch::percpu::OFF_USER_RSP) };
-        let mut ctx = frame_to_ctx(frame, user_rsp, ret as u64);
+        let ctx = frame_to_ctx(frame, user_rsp, ret as u64);
         // ВНИМАНИЕ: frame.rip — это сохранённый syscall-гейтом rcx, т.е.
         // rip ПОСЛЕ инструкции syscall (+2 уже учтён железом). Баг v0.5:
         // здесь делали rip += 2 — двойное продвижение отправляло поток в
@@ -121,9 +158,9 @@ extern "C" fn syscall_c(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6
         sched::preempt_step(boxed); // не возвращается
     }
 
-    // Возврат в пользователя: отпустить BKL ДО sysret (IF восстановит
-    // sysret из r11 = user-rflags).
-    crate::klock::release();
+    // Возврат в пользователя: локов не держим (RAII-гарды менеджеров
+    // отработали внутри dispatch-цепочки); IF восстановит sysret из
+    // r11 = user-rflags.
     ret as i64
 }
 
@@ -200,7 +237,7 @@ extern "C" fn timer_c(frame: *mut TickFrame) {
     // v0.10: глобальный тик CPU-периода — ДО развилки user/kernel:
     // idle/ядровые тики тоже двигают период (иначе троттл-лист зависнет
     // без будящего источника). Граница — плюс флаг перепланировки себе:
-    // preempt-путь закроет её под BKL (refill), idle — на будке.
+    // preempt-путь закроет её (refill), idle — на будке.
     if sched::scheduler().note_wall_tick() {
         arch::percpu::set_need_resched();
     }
@@ -209,35 +246,33 @@ extern "C" fn timer_c(frame: *mut TickFrame) {
 
     if !from_user {
         // Прервано ядро: idle/hlt (готовность могла прибавиться — idle
-        // сам перепроверит) ИЛИ BKL-спин чужого захвата (SMP: вложение
-        // одного таймера в ядровый стек — дисциплина см. gate.rs шапка;
-        // здесь возврат без BKL). Быстрый путь без замка. Флаг
-        // need_resched от wrap останется — его снимет следующий вход
-        // в пользователя (выход из сискола/пользовательский тик).
+        // сам перепроверит) ИЛИ спин на локах ядра другого CPU (SMP
+        // v0.12: вложение таймера в ядровый стек; дисциплина — см.
+        // шапку; все локи — короткие, вложенный тик возвращается
+        // без единого захвата). Флаг need_resched от wrap останется —
+        // его снимет следующий вход в пользователя.
         return;
     }
 
-    // Тик планировщика: квант СВОЕГО CPU (GS, без BKL — атомики
-    // per-CPU; ядро-структуры не трогаем).
+    // Тик планировщика: квант СВОЕГО CPU (GS, атомики per-CPU;
+    // ядро-структуры не трогаем).
     use pkg_generic_interface::task::SchedulerInterface;
     use pkg_generic_interface::task::SchedulerInterface as _;
     sched::scheduler().perform_tick(1);
 
     // Вытеснение — только если просят (квант/IPI-resched): остальное
-    // требует ядра -> BKL. Быстрые тики (квант жив) идут без замка.
+    // требует ядра -> preempt-шаг. Быстрые тики (квант жив) — мимо.
     if !sched::scheduler().take_need_resched() {
         return;
     }
 
-    // Потенциальное вытеснение: glue-обращения — под BKL. Захват с
-    // IF=1-спином: конкурент может держать ядро, наш IPI/EOI уже
-    // отработали (EOI в начале обработчика).
-    crate::klock::acquire();
+    // Потенциальное вытеснение: glue-обращения preempt-шага берут
+    // локи менеджеров по дисциплине sync (спины — с IF при глубине 0:
+    // pending IPI/EOI уже отработали, EOI — в начале обработчика).
     let thread = cpu::current_thread();
     if thread.as_u128() == 0 {
         // Тик до первого входа в пользователя (kinit) — невозможно
         // (from_user), но безопасно выйти.
-        crate::klock::release();
         return;
     }
     // v0.10: единый preempt-шаг работает и для ЕДИНСТВЕННОГО потока —
@@ -279,25 +314,34 @@ extern "C" fn timer_c(frame: *mut TickFrame) {
 
 /// Внешнее прерывание IOAPIC (asm: irq_entry_N -> irq_common -> сюда).
 ///
-/// Дисциплина BKL: под замком IF=0 — сюда НЕЛЬЗЯ попасть с depth != 0
-/// (контракт klock); пояс безопасности считает потерю (не паника).
+/// SMP v0.12: держатели локов ядра всегда IF=0 — сюда нельзя попасть,
+/// пока кто-то держит лок (прерывание физически невозможно). Обработчик
+/// помечает себя «в ядре» (depth+1) ДО обращений к менеджерам: тогда
+/// его собственные спины на занятых локах идут с IF=0 и вложение
+/// внешних прерываний ограничено одним уровнем (окно спина глубины 0).
 /// EOI сразу (QEMU по TMR-вектору рассылает широковещательный EOI
 /// IOAPIC — remote_irr level-линий гасится эмулятором).
 ///
-/// Доставка: BKL -> glue.on_external_irq(gsi) -> IrqRouter -> signal-слово
-/// (= gsi) в endpoint драйвера; склейки/пробуждения — внутренности IPC.
-/// Переключения контекста НЕТ: разбуженный поток подберёт ближайший
-/// sysret/тик (нужен resched-флаг — его ставят пути пробуждения).
+/// Доставка: glue.on_external_irq(gsi) -> IrqRouter -> signal-слово
+/// (= gsi) в endpoint драйвера; склейки/пробуждения — внутренности IPC
+/// (per-gate локи). Переключения контекста НЕТ: разбуженный поток
+/// подберёт ближайший sysret/тик (нужен resched-флаг — его ставят
+/// пути пробуждения).
 #[unsafe(no_mangle)]
 extern "C" fn irq_c(_frame: *mut TickFrame, gsi: u32) {
     lapic::eoi();
-    if crate::klock::held() {
+    // Пояс безопасности (не должен срабатывать при IF-дисциплине):
+    // глубина > 0 = мы прервали держателя лока — событие теряется
+    // с счётчиком, не паникой.
+    if pkg_generic_interface::sync::lock_depth() > 0 {
         crate::ioapic::note_dropped();
         return;
     }
-    crate::klock::acquire();
+    // Маркер «в ядре»: спины этого хендлера — с IF=0 (безграничное
+    // вложение level-линий исключено); снятие — на выходе.
+    pkg_generic_interface::sync::depth_enter();
     kernel_glue().on_external_irq(gsi);
-    crate::klock::release();
+    pkg_generic_interface::sync::depth_exit();
 }
 
 // ───────────────────── Фолты ─────────────────────
@@ -367,16 +411,15 @@ extern "C" fn fault_c(frame: *mut FaultFrame, vec: u8) -> ! {
         kpanic("gate: KERNEL FAULT (bug) — see serial log");
     }
 
-    // User-фолт: смерть домена — путь через ядро, под BKL.
-    crate::klock::acquire();
-
+    // User-фолт: смерть домена — пути ядра берут локи менеджеров
+    // сами (дисциплина sync; спины — по правилам IF).
     // vec — номер вектора от asm-точки (14=#PF, 13=#GP, 8=#DF): все
     // юзер-фолты v0.5 фатальны для домена, но диагностика обязана
     // показывать настоящий вектор (баг v0.5.2: печатали 0).
     let addr = cpu::cr2();
     glue.user_fault(thread, vec, f.err, addr, f.rip);
-    // user_fault гасит домен: добить диспетчеризацией (BKL отпустит
-    // finalize_and_enter следующего потока).
+    // user_fault гасит домен: добить диспетчеризацией (следующий
+    // поток войдёт в пользователя без чужих локов).
     sched::scheduler().drop_context(thread);
     glue.reap_thread(thread);
     sched::schedule_next()
@@ -396,9 +439,10 @@ pub fn activate_thread_space(thread: uuid::Uuid) -> bool {
     ok
 }
 
-/// Пометить Running (после переключения).
-pub fn mark_running(thread: uuid::Uuid) {
-    kernel_glue().mark_running(thread);
+/// Пометить Running (до входа в пользователя; Ready→Running под локом
+/// менеджера). `false` — переход не состоялся (поток погашен): не входить.
+pub fn mark_running(thread: uuid::Uuid) -> bool {
+    kernel_glue().mark_running(thread)
 }
 
 /// Reap мёртвого (контекст + TCB).
@@ -411,14 +455,13 @@ pub fn reap_thread(thread: uuid::Uuid) {
 
 /// Финализировать вход: материализованный возврат блокировки -> rax.
 ///
-/// SMP: ПОСЛЕДНЯЯ точка ядра перед iretq — освобождение BKL (инвариант:
-/// каждый не-возвратный путь диспетчеризации приводит сюда).
+/// SMP v0.12: локов НЕ держим (контекст — единоличное владение после
+/// эксклюзивного pop из готовности; все гарды диспетчеризации отработали).
 pub fn finalize_and_enter(thread: uuid::Uuid, mut ctx: Box<UserCtx>) -> ! {
     if let Some(r) = kernel_glue().take_syscall_ret(thread) {
         ctx.rax = r as u64;
     }
     let leaked: &'static mut UserCtx = alloc::boxed::Box::leak(ctx);
-    crate::klock::release();
     // SAFETY: контекст валиден (построен/сохранён гейтом), вход не
     // возвращается.
     unsafe { crate::ctxswitch::enter_user(leaked) }
@@ -432,9 +475,10 @@ pub fn enter_user(ctx: &'static mut UserCtx) -> ! {
 /// Idle: нет готовых потоков. Ждём прерываний; если живых потоков нет —
 /// сообщение и сон навсегда (нормальный конец демонстрации: init вышел).
 ///
-/// SMP-инвариант: вызывается ТОЛЬКО из schedule_next (BKL держится);
-/// перед сном BKL отпускается, при будке (появилась готовность) —
-/// перевзват и снова schedule_next (без возврата).
+/// SMP v0.12: локов НЕ держим (schedule_next привёл сюда с пустыми
+/// руками; has_ready — lock-free peek, refill/dispatch берут локи
+/// на своих отрезках). Прерывания будят; гонки «разобрали без нас»
+/// невозможны — schedule_next на пустом кольце просто вернётся сюда.
 pub fn idle_loop() -> ! {
     // Fatal-пути startup могут дойти сюда ДО установки glue (boot_info
     // протокол/ELF/пулы): без ядра нет и диспетчеризации — честное
@@ -447,17 +491,32 @@ pub fn idle_loop() -> ! {
             x86_64::instructions::interrupts::enable_and_hlt();
         }
     };
-    // Сообщение печатается под BKL (путь сюда — из schedule_next).
     let live = glue.live_thread_count();
+    // ДИАГНОСТИКА v0.12 bring-up (первый вход в idle, один раз):
+    // снимок здоровья очереди готовности — enq/pop должны сходиться,
+    // stale — только легаси-записи задач и записи, протухшие между
+    // enqueue и pick (ленивый deschedule), markfail — 0 в норме.
+    {
+        static ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        if !ONCE.swap(true, core::sync::atomic::Ordering::AcqRel) {
+            let d = sched::dbg_snapshot();
+            let line = alloc::format!(
+                "\r\n[kernel] sched dbg: enq={} pop={} stale={} markfail={} enter={}\r\n",
+                d[0],
+                d[1],
+                d[2],
+                d[3],
+                d[4]
+            );
+            crate::console::kprint_str(&line);
+        }
+    }
     let msg = if live == 0 {
         "\r\n[kernel] all user threads gone — halting (boot chain OK)\r\n"
     } else {
         "\r\n[kernel] idle: no runnable threads (all blocked) — waiting\r\n"
     };
     crate::console::kprint_str(msg);
-    // Сон без BKL: прерывания будят (таймер/IPI), has_ready — атомики
-    // готовности (без ядра), перезапуск диспетчеризации — под замком.
-    crate::klock::release();
     loop {
         x86_64::instructions::interrupts::enable_and_hlt();
         // v0.10: границу CPU-периода закрывает и idle — его тики
@@ -465,26 +524,18 @@ pub fn idle_loop() -> ! {
         // в idle нет: троттл-лист разбудим сами, иначе замороженные
         // домены проспали бы до чужого пользовательского входа.
         if sched::scheduler().period_wrap_pending() {
-            crate::klock::acquire();
             sched::cpu_period_refill_if_due();
-            if sched::scheduler().has_ready() {
-                sched::schedule_next(); // не возвращается (BKL отпустит вход)
-            }
-            crate::klock::release();
-        }
-        // Проснулись (тик/IPI): если появились готовые — вернуться в
-        // диспетчеризацию (повторная проверка под BKL: между hlt и
-        // захватом поток могли разобрать).
-        if sched::scheduler().has_ready() {
-            crate::klock::acquire();
             if sched::scheduler().has_ready() {
                 sched::schedule_next(); // не возвращается
             }
-            // Разобрали без нас — снова спать.
-            crate::klock::release();
         }
-        // Нет готовых: продолжить сон (двойная проверка не нужна —
-        // следующий таймер/IPI разбудит снова).
+        // Проснулись (тик/IPI): появились готовые — в диспетчеризацию.
+        // Возврат из schedule_next сюда невозможен: он либо входит в
+        // поток (не возвращается), либо сам возвращается в idle-цикл.
+        if sched::scheduler().has_ready() {
+            sched::schedule_next(); // не возвращается
+        }
+        // Нет готовых: продолжить сон (следующий таймер/IPI разбудит).
     }
 }
 

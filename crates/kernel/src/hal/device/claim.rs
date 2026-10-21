@@ -35,7 +35,11 @@
 
 use alloc::{boxed::Box, vec::Vec};
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use thiserror::Error;
+
+use crate::sync::KSpin;
 
 use crate::capability::{CapabilityManager, ObjId};
 use crate::hal::types::DevicePath;
@@ -143,37 +147,37 @@ pub struct ClaimStatus {
 /// Подключение подсистем (задачи/capability/IPC) — параметрами методов,
 /// как у `DeviceManager::export_capabilities(&tasks, &caps, ..)`.
 pub struct DeviceClaimRegistry {
-    locks: core::cell::RefCell<Vec<DeviceLock>>,
-    /// Счётчик hot-removal событий (эпоха отравления).
-    removal_epoch: core::cell::Cell<u64>,
+    locks: KSpin<Vec<DeviceLock>>,
+    /// Счётчик hot-removal событий (эпоха отравления; SMP v0.12 — атомик).
+    removal_epoch: AtomicU64,
 }
 
 impl DeviceClaimRegistry {
     /// Пустой реестр.
     pub fn new() -> Self {
         Self {
-            locks: core::cell::RefCell::new(Vec::new()),
-            removal_epoch: core::cell::Cell::new(0),
+            locks: KSpin::new(Vec::new()),
+            removal_epoch: AtomicU64::new(0),
         }
     }
 
     /// Число локов (аудит).
     pub fn count(&self) -> usize {
-        self.locks.borrow().len()
+        self.locks.lock().len()
     }
 
     /// Найти/создать лок устройства. Очередь ожидания берётся у
     /// планировщика (если он есть); без планировщика лок работает только
     /// в try-режиме (блокировка претендентов невозможна).
     fn ensure_lock(&self, tasks: &TcbManager, device: &DevicePath) -> Result<(), ClaimError> {
-        if self.locks.borrow().iter().any(|l| &l.device == device) {
+        if self.locks.lock().iter().any(|l| &l.device == device) {
             return Ok(());
         }
         let wait_queue = tasks
             .scheduler()
             .map(|s| s.block_queue_create().unwrap_or_default())
             .unwrap_or_default();
-        self.locks.borrow_mut().push(DeviceLock {
+        self.locks.lock().push(DeviceLock {
             device: device.clone(),
             owner: None,
             wait_queue,
@@ -225,7 +229,7 @@ impl DeviceClaimRegistry {
         mode: crate::ipc::BlockMode,
     ) -> Result<ClaimOutcome, ClaimError> {
         self.ensure_lock(tasks, device)?;
-        let mut locks = self.locks.borrow_mut();
+        let mut locks = self.locks.lock();
         let lock = locks
             .iter_mut()
             .find(|l| &l.device == device)
@@ -251,6 +255,10 @@ impl DeviceClaimRegistry {
                 Ok(ClaimOutcome::Acquired)
             }
             // Занято другой задачей — блокировка претендента.
+            // SMP v0.12: парковка идёт ПОД CLAIM-локом (вместе с проверкой
+            // владельца выше — одна критсекция): release на другом CPU не
+            // может «промахнуться» мимо претендента между его проверкой и
+            // публикацией в wait_queue (lost-wakeup закрыт).
             Some(_) => {
                 if mode == crate::ipc::BlockMode::Try {
                     return Err(ClaimError::Task(TaskError::ThreadWaitState(thread)));
@@ -259,8 +267,8 @@ impl DeviceClaimRegistry {
                     return Err(ClaimError::NoWaitQueue);
                 }
                 let queue = lock.wait_queue;
-                drop(locks);
                 // Двухфазный контракт BlockQueueId: состояние -> парковка.
+                // Оба шага — ПОД CLAIM-локом (см. комментарий ветки).
                 tasks.thread_set_state(&thread, TaskState::Blocked)?;
                 tasks.with_thread(&thread, |t| {
                     t.wait = Some(ThreadWait::Queue {
@@ -288,7 +296,7 @@ impl DeviceClaimRegistry {
         device: &DevicePath,
         by: Option<TaskId>,
     ) -> Result<Option<TaskId>, ClaimError> {
-        let mut locks = self.locks.borrow_mut();
+        let mut locks = self.locks.lock();
         let Some(lock) = locks.iter_mut().find(|l| &l.device == device) else {
             return Err(ClaimError::DeviceNotFound);
         };
@@ -339,7 +347,7 @@ impl DeviceClaimRegistry {
 
     /// Статус лока устройства (сискол DEVICE_CLAIM_STATUS).
     pub fn status(&self, tasks: &TcbManager, device: &DevicePath) -> Option<ClaimStatus> {
-        let locks = self.locks.borrow();
+        let locks = self.locks.lock();
         let lock = locks.iter().find(|l| &l.device == device)?;
         let waiters = if lock.wait_queue == BlockQueueId::default() {
             0
@@ -376,17 +384,17 @@ impl DeviceClaimRegistry {
         ipc: &IpcManager,
         device: &DevicePath,
     ) -> Result<Option<TaskId>, ClaimError> {
-        self.removal_epoch.set(self.removal_epoch.get() + 1);
+        self.removal_epoch.fetch_add(1, Ordering::Relaxed);
         // Снимаем владение/гейт и рвём лок — одним заимствованием.
         let (owner, notify_gate, queue) = {
-            let mut locks = self.locks.borrow_mut();
+            let mut locks = self.locks.lock();
             let Some(lock) = locks.iter_mut().find(|l| &l.device == device) else {
                 return Ok(None);
             };
             let owner = lock.owner.take();
             let gate = lock.notify_gate.take();
             lock.gone = true;
-            lock.gone_epoch = self.removal_epoch.get();
+            lock.gone_epoch = self.removal_epoch.load(Ordering::Relaxed);
             (owner, gate, lock.wait_queue)
         };
 
@@ -419,12 +427,7 @@ impl DeviceClaimRegistry {
     /// Устройство снова видно шиной (повторное появление после
     /// hot-removal): «отравление» снимается, лок свободен.
     pub fn device_alive_again(&self, device: &DevicePath) {
-        if let Some(lock) = self
-            .locks
-            .borrow_mut()
-            .iter_mut()
-            .find(|l| &l.device == device)
-        {
+        if let Some(lock) = self.locks.lock().iter_mut().find(|l| &l.device == device) {
             lock.gone = false;
         }
     }
@@ -435,7 +438,7 @@ impl DeviceClaimRegistry {
         let mut freed = Vec::new();
         let devices: Vec<DevicePath> = self
             .locks
-            .borrow()
+            .lock()
             .iter()
             .filter(|l| l.owner == Some(*task))
             .map(|l| l.device.clone())
@@ -451,7 +454,7 @@ impl DeviceClaimRegistry {
     /// Локи, удерживаемые задачей (аудит).
     pub fn locks_of(&self, task: &TaskId) -> Vec<DevicePath> {
         self.locks
-            .borrow()
+            .lock()
             .iter()
             .filter(|l| l.owner == Some(*task))
             .map(|l| l.device.clone())

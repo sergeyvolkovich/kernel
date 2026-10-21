@@ -87,7 +87,12 @@ impl SyscallHandler for IpcSendHandler {
 
         match ipc.send(ctx.tasks, ctx.caps, ctx.memory, ctx.thread, ep, msg, mode)? {
             // Блокировка: Ok(0) + поток в Blocked (возврат при встрече).
-            SendOutcome::Blocked => Ok(0),
+            // SMP v0.12: защёлка — гейт уходит в диспетчеризацию без
+            // повторного (racy) чтения состояния потока.
+            SendOutcome::Blocked => {
+                crate::syscall::record_block_latch(ctx.cpu);
+                Ok(0)
+            }
             _ => Ok(0),
         }
     }
@@ -121,7 +126,10 @@ impl SyscallHandler for IpcRecvHandler {
                 Ok(word0)
             }
             // Поток заблокирован: сообщение окажется в ящике при встрече.
-            RecvOutcome::Blocked => Ok(0),
+            RecvOutcome::Blocked => {
+                crate::syscall::record_block_latch(ctx.cpu);
+                Ok(0)
+            }
         }
     }
 }
@@ -152,7 +160,7 @@ impl SyscallHandler for IpcCallHandler {
         // Отправка с фазой call: после доставки сообщения поток сразу
         // переходит к приёму на reply-гейте (then_recv).
         let src = resolve_gate(ctx, ep)?;
-        ipc.send_to_gate(
+        let outcome = ipc.send_to_gate(
             ctx.tasks,
             ctx.caps,
             ctx.memory,
@@ -162,6 +170,12 @@ impl SyscallHandler for IpcCallHandler {
             mode,
             Some(reply),
         )?;
+        // SMP v0.12: фаза call могла отправителя сразу заблокировать
+        // (буфер гейта полон — парковка в send_q; либо переблокировка на
+        // reply-гейте) — защёлка для гейта.
+        if matches!(outcome, crate::ipc::SendOutcome::Blocked) {
+            crate::syscall::record_block_latch(ctx.cpu);
+        }
         // Ответ (если уже пришёл) — в почтовом ящике.
         Ok(0)
     }
@@ -214,7 +228,10 @@ impl SyscallHandler for IpcRecvAnyHandler {
                 ipc.mailbox_set(ctx.tasks, ctx.thread, msg);
                 Ok(word0)
             }
-            RecvOutcome::Blocked => Ok(0),
+            RecvOutcome::Blocked => {
+                crate::syscall::record_block_latch(ctx.cpu);
+                Ok(0)
+            }
         }
     }
 }

@@ -26,6 +26,8 @@
 
 use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use intrusive_collections::{Bound, KeyAdapter, RBTree, RBTreeLink, UnsafeRef, intrusive_adapter};
 
 use crate::capability::ObjId;
@@ -120,15 +122,15 @@ impl<'a> KeyAdapter<'a> for ThreadAdapter {
 
 /// Таблица/реестр потоков внутри [`TcbManager`] (поле `TcbInner::threads`).
 /// `pub(crate)`: менеджер собирает/дробит её вместе с таблицей задач под
-/// одним RefCell-контрактом однопоточности.
+/// одним KRwLock-контрактом менеджера (SMP v0.12).
 pub(crate) struct ThreadInner {
     /// Порядок полей важен для дропа: реестр снимаем раньше таблицы.
     pub(crate) by_uuid: RBTree<ThreadAdapter>,
     pub(crate) threads: PagedTable<ThreadObj, THREAD_PAGE_SLOTS, THREAD_DIR_LEN>,
-    /// Живые (не Dead) потоки ВСЕЙ системы — ленивый счётчик (v0.10):
-    /// инкремент в `create_thread`, декремент в Dead-переходе потока.
-    /// Заменяет O(n)-обход в `total_thread_count` (idle-диагностика).
-    pub(crate) total_live: usize,
+    /// Живые (не Dead) потоки ВСЕЙ системы — ленивый счётчик (v0.10).
+    /// SMP v0.12: атомик — Dead-переходы на разных CPU идут параллельно,
+    /// а транзакции IPC держат write-гард менеджера без &mut поля.
+    pub(crate) total_live: AtomicUsize,
 }
 
 impl ThreadInner {
@@ -136,7 +138,7 @@ impl ThreadInner {
         Ok(Self {
             by_uuid: RBTree::new(ThreadAdapter::new()),
             threads: PagedTable::new().map_err(|_| TaskError::OutOfMemory)?,
-            total_live: 0,
+            total_live: AtomicUsize::new(0),
         })
     }
 }
@@ -162,11 +164,11 @@ impl TcbManager {
         entry: usize,
         stack_top: usize,
     ) -> Result<(), TaskError> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.write();
 
         // Владелец существует и жив?
         let owner_node = find_task(&inner, &owner).ok_or(TaskError::TaskNotFound(owner))?;
-        // SAFETY: под borrow_mut — эксклюзивный доступ.
+        // SAFETY: под write-гардом — эксклюзивный доступ.
         let owner_tcb = unsafe { &*UnsafeRef::into_raw(owner_node) };
         if owner_tcb.state == TaskState::Dead {
             return Err(TaskError::TaskNotFound(owner));
@@ -238,21 +240,21 @@ impl TcbManager {
         // Свежая находка узла: первая (проверка квоты) уже отдала
         // UnsafeRef в into_raw — consuming-семантика.
         if let Some(owner_node) = find_task(&inner, &owner) {
-            // SAFETY: эксклюзивный доступ под borrow_mut; узел жив.
+            // SAFETY: эксклюзивный доступ под write-гардом; узел жив.
             let owner_tcb: &mut TaskObj = unsafe { &mut *UnsafeRef::into_raw(owner_node) };
             owner_tcb.live_threads += 1;
         }
-        inner.threads.total_live += 1;
+        inner.threads.total_live.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     /// Разрушить TCB потока. Контракт: поток завершён (`Dead`) и не ждёт.
     pub fn destroy_thread(&self, thread_id: ThreadId) -> Result<(), TaskError> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.write();
 
         let node = find_thread(&inner, &thread_id).ok_or(TaskError::ThreadNotFound(thread_id))?;
         let self_idx = {
-            // SAFETY: под borrow_mut — эксклюзивный доступ.
+            // SAFETY: под write-гардом — эксклюзивный доступ.
             let t: &ThreadObj = unsafe { &*UnsafeRef::into_raw(node) };
             if t.state != TaskState::Dead {
                 return Err(TaskError::ThreadNotDead(thread_id));
@@ -268,9 +270,9 @@ impl TcbManager {
 
     /// Снимок состояния потока.
     pub fn thread_view(&self, thread_id: &ThreadId) -> Option<ThreadView> {
-        let inner = self.inner.borrow();
+        let inner = self.inner.read();
         let node = find_thread(&inner, thread_id)?;
-        // SAFETY: под borrow — только чтение.
+        // SAFETY: под read-гардом — только чтение.
         let t: &ThreadObj = unsafe { &*UnsafeRef::into_raw(node) };
         Some(ThreadView {
             thread_id: t.thread_id,
@@ -284,7 +286,7 @@ impl TcbManager {
 
     /// Владелец потока (задача-домен). `None` — потока нет.
     pub fn thread_task(&self, thread_id: &ThreadId) -> Option<TaskId> {
-        let inner = self.inner.borrow();
+        let inner = self.inner.read();
         let node = find_thread(&inner, thread_id)?;
         // SAFETY: только чтение.
         let t: &ThreadObj = unsafe { &*UnsafeRef::into_raw(node) };
@@ -293,7 +295,7 @@ impl TcbManager {
 
     /// Снимки всех потоков задачи (порядок — по возрастанию ThreadId).
     pub fn threads_of(&self, owner: &TaskId) -> Vec<ThreadView> {
-        let inner = self.inner.borrow();
+        let inner = self.inner.read();
         let mut out = Vec::new();
         for t in inner.threads.by_uuid.iter() {
             if &t.owner == owner {
@@ -315,9 +317,9 @@ impl TcbManager {
     /// v0.10: O(1) — ленивый счётчик GTCB `live_threads` (точки его
     /// ведения: `create_thread` и Dead-переход потока).
     pub fn thread_count(&self, owner: &TaskId) -> usize {
-        let inner = self.inner.borrow();
+        let inner = self.inner.read();
         match find_task(&inner, owner) {
-            // SAFETY: только чтение под borrow.
+            // SAFETY: только чтение под read-гардом.
             Some(node) => unsafe { (*UnsafeRef::into_raw(node)).live_threads },
             None => 0,
         }
@@ -327,8 +329,8 @@ impl TcbManager {
     ///
     /// v0.10: O(1) — ленивый системный счётчик `ThreadInner::total_live`.
     pub fn total_thread_count(&self) -> usize {
-        let inner = self.inner.borrow();
-        inner.threads.total_live
+        let inner = self.inner.read();
+        inner.threads.total_live.load(Ordering::Relaxed)
     }
 
     /// Перевести поток в `to` по автомату состояний (+ хуки планировщика).
@@ -342,54 +344,98 @@ impl TcbManager {
         thread_id: &ThreadId,
         to: TaskState,
     ) -> Result<TaskState, TaskError> {
-        let mut inner = self.inner.borrow_mut();
+        let inner = self.inner.write();
+        thread_set_state_locked(&inner, thread_id, to)
+    }
 
+    /// Троттл-парковка потока квотой (SMP v0.12): Running -> Ready БЕЗ
+    /// публикации в очередь готовности.
+    ///
+    /// Поток троттл-листа планировщика возвращается в готовность только
+    /// на границе CPU-периода (`unthrottle_all`): enqueue-хук здесь НЕ
+    /// звать — иначе поток оказался бы в кольце готовности, минуя
+    /// троттл-парк. Убийство потока в троттл-листе корректно: Dead-переход
+    /// вызывает `deschedule`, который вычищает троттл-лист бекенда.
+    ///
+    /// Возврат — прежнее состояние; `Err(InvalidTransition)` — поток
+    /// уже не Running (убит в окне вытеснения): парковать нельзя,
+    /// вызывающий (preempt-шаг) обязан бросить его без ре-очереди.
+    pub fn thread_park_throttled(&self, thread_id: &ThreadId) -> Result<TaskState, TaskError> {
+        let inner = self.inner.write();
         let node = find_thread(&inner, thread_id).ok_or(TaskError::ThreadNotFound(*thread_id))?;
-        // SAFETY: эксклюзивный доступ под borrow_mut.
+        // SAFETY: эксклюзивный доступ под write-гардом менеджера.
         let t: &mut ThreadObj = unsafe { &mut *UnsafeRef::into_raw(node) };
         let from = t.state;
-
-        if !from.can_transition_to(to) {
+        // Строго Running: троттл-парк — судьба ТОЛЬКО вытесненного
+        // исполнителя. Blocked (успел заблокироваться) и Suspended
+        // формально могут в Ready по автомату, но их готовность —
+        // владение их собственных путей (wakeup/resume), не квоты.
+        if from != TaskState::Running {
             return Err(TaskError::InvalidTransition {
                 task: *thread_id,
                 from,
-                to,
+                to: TaskState::Ready,
             });
         }
+        // Без scheduler-хука: публикация — владение бекенда (троттл-лист).
+        t.state = TaskState::Ready;
+        Ok(from)
+    }
 
-        if let Some(s) = inner.scheduler {
-            let notified = match to {
-                TaskState::Ready => s.enqueue(*thread_id),
-                TaskState::Blocked | TaskState::Suspended | TaskState::Dead => {
-                    s.deschedule(*thread_id)
-                }
-                TaskState::Running => Ok(()),
-            };
-            notified.map_err(TaskError::Scheduler)?;
-        }
-
-        if to == TaskState::Dead {
-            t.hdr.kill();
-            // IPC-состояние потока гасится вместе с ним.
-            t.wait = None;
-            t.mailbox = None;
-            t.blocked_msg = None;
-            t.parked.clear();
-            t.syscall_ret = None;
-            // v0.10: ленивые счётчики живых потоков (домен + система).
-            // Каскад смерти задачи и одиночные завершения сходятся здесь.
-            if from != TaskState::Dead {
-                if let Some(owner_node) = find_task(&inner, &t.owner) {
-                    // SAFETY: эксклюзивный доступ под borrow_mut.
-                    let owner_tcb: &mut crate::task::TaskObj =
-                        unsafe { &mut *UnsafeRef::into_raw(owner_node) };
-                    owner_tcb.live_threads = owner_tcb.live_threads.saturating_sub(1);
-                }
-                inner.threads.total_live = inner.threads.total_live.saturating_sub(1);
+    /// Транзакции IPC-парковки SMP v0.12 (зеркальные `recv_any_park` /
+    /// `send_thread_offer`): переход автомата + публикация причины
+    /// ожидания — ОДНА write-секция менеджера, чтобы встречная сторона
+    /// (send/recv по тому же потоку) не видела промежуточных состояний.
+    pub(crate) fn recv_any_park(
+        &self,
+        thread: &ThreadId,
+        try_mode: bool,
+    ) -> Result<RecvAnyPark, TaskError> {
+        let inner = self.inner.write();
+        {
+            let node = find_thread(&inner, thread).ok_or(TaskError::ThreadNotFound(*thread))?;
+            // SAFETY: эксклюзивный доступ под write-гардом.
+            let t: &mut ThreadObj = unsafe { &mut *UnsafeRef::into_raw(node) };
+            if let Some(m) = t.parked.pop_front() {
+                return Ok(RecvAnyPark::Msg(m));
+            }
+            if try_mode {
+                return Ok(RecvAnyPark::TryEmpty);
             }
         }
-        t.state = to;
-        Ok(from)
+        // Парк: переход Blocked (хук deschedule) + причина — одна секция.
+        thread_set_state_locked(&inner, thread, TaskState::Blocked)?;
+        let node = find_thread(&inner, thread).ok_or(TaskError::ThreadNotFound(*thread))?;
+        // SAFETY: эксклюзивный доступ под write-гардом.
+        let t: &mut ThreadObj = unsafe { &mut *UnsafeRef::into_raw(node) };
+        t.wait = Some(ThreadWait::RecvAny);
+        Ok(RecvAnyPark::Parked)
+    }
+
+    /// Зеркальная транзакция direct-IPC: [open-receive → claim] или
+    /// [парковка в очередь потока] — одна write-секция.
+    pub(crate) fn send_thread_offer(
+        &self,
+        to: &ThreadId,
+        msg: Box<IpcMessage>,
+    ) -> Result<SendThreadOffer, TaskError> {
+        let inner = self.inner.write();
+        let node = find_thread(&inner, to).ok_or(TaskError::ThreadNotFound(*to))?;
+        // SAFETY: эксклюзивный доступ под write-гардом.
+        let t: &mut ThreadObj = unsafe { &mut *UnsafeRef::into_raw(node) };
+        if t.state == TaskState::Blocked && matches!(t.wait, Some(ThreadWait::RecvAny)) {
+            // Claim: причина ожидания снята, возврат материализован; поток
+            // ещё Blocked — доставляющий переведёт его в Ready (вне локов
+            // менеджера: map-элементы — KMEM, ранг не пересекается).
+            t.wait = None;
+            t.syscall_ret = Some(0);
+            return Ok(SendThreadOffer::Claimed { msg });
+        }
+        if t.parked.len() >= crate::ipc::IPC_THREAD_PARK_MAX {
+            return Ok(SendThreadOffer::Full);
+        }
+        t.parked.push_back(msg);
+        Ok(SendThreadOffer::Parked)
     }
 
     /// Смена приоритета потока (хук `on_priority_change` планировщика).
@@ -398,10 +444,10 @@ impl TcbManager {
         thread_id: &ThreadId,
         priority: TaskPriority,
     ) -> Result<(), TaskError> {
-        let inner = self.inner.borrow_mut();
+        let inner = self.inner.write();
 
         let node = find_thread(&inner, thread_id).ok_or(TaskError::ThreadNotFound(*thread_id))?;
-        // SAFETY: эксклюзивный доступ под borrow_mut.
+        // SAFETY: эксклюзивный доступ под write-гардом.
         let t: &mut ThreadObj = unsafe { &mut *UnsafeRef::into_raw(node) };
 
         if let Some(s) = inner.scheduler {
@@ -419,9 +465,9 @@ impl TcbManager {
         thread_id: &ThreadId,
         f: impl FnOnce(&mut ThreadObj) -> R,
     ) -> Option<R> {
-        let inner = self.inner.borrow_mut();
+        let inner = self.inner.write();
         let node = find_thread(&inner, thread_id)?;
-        // SAFETY: эксклюзивный доступ под borrow_mut.
+        // SAFETY: эксклюзивный доступ под write-гардом.
         let t: &mut ThreadObj = unsafe { &mut *UnsafeRef::into_raw(node) };
         Some(f(t))
     }
@@ -480,6 +526,86 @@ impl TcbManager {
     }
 }
 
+// ==== Транзакции IPC (SMP v0.12) ====
+
+/// Исход `recv_any_park`: сообщение из парковочной очереди, парк в
+/// open-receive или try-отказ (без парка).
+pub(crate) enum RecvAnyPark {
+    /// Сообщение из очереди потока (владение).
+    Msg(Box<IpcMessage>),
+    /// Поток переведён в Blocked + RecvAny (ждёт `send_thread`).
+    Parked,
+    /// Try-режим: очереди не было, парк не выполнялся.
+    TryEmpty,
+}
+
+/// Исход `send_thread_offer`: claim открытого получателя (доставка —
+/// на вызывающем, ВНЕ локов менеджера), парковка в очередь потока или
+/// отказ по ёмкости.
+pub(crate) enum SendThreadOffer {
+    /// Получатель в open-receive и захвачен; сообщение возвращено
+    /// вызывающему для доставки (map-элементы/mailbox/wake).
+    Claimed { msg: Box<IpcMessage> },
+    /// Сообщение припарковано в очередь потока-получателя.
+    Parked,
+    /// Очередь потока полна ([`crate::ipc::IPC_THREAD_PARK_MAX`]).
+    Full,
+}
+
+/// Переход автомата состояний потока под УЖЕ взятым write-гардом
+/// менеджера (транзакции `recv_any_park`/IPC-парковки: переход и
+/// публикация причины ожидания — одна критсекция).
+pub(crate) fn thread_set_state_locked(
+    inner: &TcbInner,
+    thread_id: &ThreadId,
+    to: TaskState,
+) -> Result<TaskState, TaskError> {
+    let node = find_thread(inner, thread_id).ok_or(TaskError::ThreadNotFound(*thread_id))?;
+    // SAFETY: эксклюзивный доступ под write-гардом менеджера.
+    let t: &mut ThreadObj = unsafe { &mut *UnsafeRef::into_raw(node) };
+    let from = t.state;
+
+    if !from.can_transition_to(to) {
+        return Err(TaskError::InvalidTransition {
+            task: *thread_id,
+            from,
+            to,
+        });
+    }
+
+    if let Some(s) = inner.scheduler {
+        let notified = match to {
+            TaskState::Ready => s.enqueue(*thread_id),
+            TaskState::Blocked | TaskState::Suspended | TaskState::Dead => s.deschedule(*thread_id),
+            TaskState::Running => Ok(()),
+        };
+        notified.map_err(TaskError::Scheduler)?;
+    }
+
+    if to == TaskState::Dead {
+        t.hdr.kill();
+        // IPC-состояние потока гасится вместе с ним.
+        t.wait = None;
+        t.mailbox = None;
+        t.blocked_msg = None;
+        t.parked.clear();
+        t.syscall_ret = None;
+        // v0.10: ленивые счётчики живых потоков (домен + система).
+        // Каскад смерти задачи и одиночные завершения сходятся здесь.
+        if from != TaskState::Dead {
+            if let Some(owner_node) = find_task(inner, &t.owner) {
+                // SAFETY: эксклюзивный доступ под write-гардом.
+                let owner_tcb: &mut crate::task::TaskObj =
+                    unsafe { &mut *UnsafeRef::into_raw(owner_node) };
+                owner_tcb.live_threads = owner_tcb.live_threads.saturating_sub(1);
+            }
+            inner.threads.total_live.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    t.state = to;
+    Ok(from)
+}
+
 // ==== Служебные ====
 
 /// Поиск ThreadObj по Uuid (редкий путь — дерево). Возвращает невладеющую
@@ -490,13 +616,13 @@ pub(crate) fn find_thread(inner: &TcbInner, thread_id: &ThreadId) -> Option<Unsa
     Some(unsafe { UnsafeRef::from_raw(ptr.as_ptr()) })
 }
 
-/// Первый поток реестра (курсорный обход без удержания borrow).
+/// Первый поток реестра (курсорный обход без удержания гарда).
 #[allow(dead_code)]
 pub(crate) fn first_thread(inner: &TcbInner) -> Option<ThreadId> {
     inner.threads.by_uuid.front().get().map(|t| t.thread_id)
 }
 
-/// Следующий поток строго после `id` (обход без вложенных borrow).
+/// Следующий поток строго после `id` (обход без вложенных гардов).
 #[allow(dead_code)]
 pub(crate) fn next_thread_after(inner: &TcbInner, id: &ThreadId) -> Option<ThreadId> {
     let cursor = inner.threads.by_uuid.lower_bound(Bound::Excluded(id));
@@ -583,6 +709,40 @@ mod tests {
             tasks.create_thread(ghost, ghost, TaskPriority(1), 0, 0),
             Err(TaskError::TaskNotFound(_))
         ));
+    }
+
+    /// SMP v0.12: троттл-парковка — Running -> Ready БЕЗ enqueue-хука
+    /// (поток уходит в троттл-лист бекенда, НЕ в очередь готовности),
+    /// и отказ для потока, уже не Running (убит в окне вытеснения).
+    #[test]
+    fn thread_park_throttled_ready_without_enqueue() {
+        let tasks = manager();
+        let task = uuid_next();
+        tasks.create(task, TaskPriority::DEFAULT).unwrap();
+        let t1 = uuid_next();
+        tasks
+            .create_thread(t1, task, TaskPriority(10), 0x4000, 0x8000)
+            .unwrap();
+
+        // Диспетчеризация -> вытеснение по квоте: троттл-парк.
+        tasks.thread_set_state(&t1, TaskState::Running).unwrap();
+        let from = tasks.thread_park_throttled(&t1).unwrap();
+        assert_eq!(from, TaskState::Running);
+        assert_eq!(tasks.thread_view(&t1).unwrap().state, TaskState::Ready);
+
+        // Возобновление с границы периода: Ready -> Running легально
+        // (готовность возвращает бекенд — unthrottle_all).
+        tasks.thread_set_state(&t1, TaskState::Running).unwrap();
+
+        // Не-Running поток (Blocked) троттл-парковать нельзя — окно
+        // вытеснения закрыло убийство/блокировку на другом CPU.
+        tasks.thread_set_state(&t1, TaskState::Blocked).unwrap();
+        assert!(matches!(
+            tasks.thread_park_throttled(&t1),
+            Err(TaskError::InvalidTransition { .. })
+        ));
+        // Состояние не тронуто отказом.
+        assert_eq!(tasks.thread_view(&t1).unwrap().state, TaskState::Blocked);
     }
 
     #[test]

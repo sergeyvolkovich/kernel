@@ -34,7 +34,9 @@
 // получает async-IPC и читает кольца без копий.
 
 use alloc::{collections::BTreeMap, vec::Vec};
-use core::cell::{Cell, RefCell};
+use core::cell::Cell;
+
+use crate::sync::KSpin;
 
 use llfree::{Alloc, Classing, Request};
 
@@ -212,7 +214,7 @@ struct ShmRegion {
 /// кольцами напрямую; ядро участвует только в трёх точках — создание
 /// региона, настройка геометрии и doorbell-сигналы.
 pub struct ShmManager {
-    regions: RefCell<BTreeMap<ShmId, ShmRegion>>,
+    regions: KSpin<BTreeMap<ShmId, ShmRegion>>,
     next_id: Cell<u64>,
     /// Общий физический пул (разделяется с MemoryManager).
     p_allocator: Arc<ARCPool>,
@@ -225,7 +227,7 @@ impl ShmManager {
     pub fn new(p_allocator: Arc<ARCPool>) -> Self {
         let (cl, _) = Classing::simple(1);
         Self {
-            regions: RefCell::new(BTreeMap::new()),
+            regions: KSpin::new(BTreeMap::new()),
             next_id: Cell::new(1),
             p_allocator,
             alloc_class: cl.default,
@@ -234,13 +236,13 @@ impl ShmManager {
 
     /// Число живых регионов (аудит).
     pub fn count(&self) -> usize {
-        self.regions.borrow().len()
+        self.regions.lock().len()
     }
 
     /// Владелец региона (v0.9: проверка права на операции SHM — доступ
     /// к чужому региону по угаданному ShmId правом не является).
     pub fn owner_of(&self, id: ShmId) -> Option<TaskId> {
-        self.regions.borrow().get(&id).map(|r| r.owner)
+        self.regions.lock().get(&id).map(|r| r.owner)
     }
 
     /// Создать регион из `pages` физических кадров (zero-copy: кадры
@@ -262,7 +264,7 @@ impl ShmManager {
 
         let id = ShmId(self.next_id.get());
         self.next_id.set(self.next_id.get() + 1);
-        self.regions.borrow_mut().insert(
+        self.regions.lock().insert(
             id,
             ShmRegion {
                 id,
@@ -279,7 +281,7 @@ impl ShmManager {
 
     /// Снимок региона (сисколы SHM_*: геометрия, doorbell, база).
     pub fn info(&self, id: ShmId) -> Option<ShmInfo> {
-        let regions = self.regions.borrow();
+        let regions = self.regions.lock();
         regions.get(&id).map(|r| ShmInfo {
             id: r.id,
             base: r.base,
@@ -299,7 +301,7 @@ impl ShmManager {
         cq_entries: usize,
         entry_words: usize,
     ) -> Result<RingLayout, ShmError> {
-        let mut regions = self.regions.borrow_mut();
+        let mut regions = self.regions.lock();
         let region = regions.get_mut(&id).ok_or(ShmError::NotFound(id))?;
         if region.ring.is_some() {
             return Err(ShmError::RingExists(id));
@@ -312,7 +314,7 @@ impl ShmManager {
 
     /// Привязать doorbell-endpoint (signal при submit — RING_DOORBELL).
     pub fn bind_doorbell(&self, id: ShmId, gate: ObjId) -> Result<(), ShmError> {
-        let mut regions = self.regions.borrow_mut();
+        let mut regions = self.regions.lock();
         let region = regions.get_mut(&id).ok_or(ShmError::NotFound(id))?;
         region.doorbell = Some(gate);
         Ok(())
@@ -320,7 +322,7 @@ impl ShmManager {
 
     /// Doorbell-endpoint региона (сискол RING_DOORBELL резолвит signal).
     pub fn doorbell_gate(&self, id: ShmId) -> Option<ObjId> {
-        self.regions.borrow().get(&id).and_then(|r| r.doorbell)
+        self.regions.lock().get(&id).and_then(|r| r.doorbell)
     }
 
     /// Сигнал doorbell: производитель сабмитит SQE и звенит в колокол
@@ -347,7 +349,7 @@ impl ShmManager {
         id: ShmId,
         flags: MMAPMemoryFlags,
     ) -> Result<usize, ShmError> {
-        let regions = self.regions.borrow();
+        let regions = self.regions.lock();
         let region = regions.get(&id).ok_or(ShmError::NotFound(id))?;
         let vaddr = router.map_external(task, region.base, region.pages, flags)?;
         Ok(vaddr.0)
@@ -358,7 +360,7 @@ impl ShmManager {
     pub fn destroy(&self, id: ShmId) -> Result<(), ShmError> {
         let region = self
             .regions
-            .borrow_mut()
+            .lock()
             .remove(&id)
             .ok_or(ShmError::NotFound(id))?;
         let order = region
@@ -375,7 +377,7 @@ impl ShmManager {
     /// Регионы задачи (аудит/разрушение домена).
     pub fn regions_of(&self, owner: &TaskId) -> Vec<ShmId> {
         self.regions
-            .borrow()
+            .lock()
             .values()
             .filter(|r| &r.owner == owner)
             .map(|r| r.id)

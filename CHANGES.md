@@ -1,5 +1,128 @@
 # rust-l4: изменения по версиям (workspace)
 
+# v0.12 — Демонтаж Big Kernel Lock: fine-grained + lock-free SMP
+
+### Сделано
+
+**BKL удалён (`backend/src/klock.rs` — удалён; новый `kernel/src/sync.rs`):**
+- Прежде: один AtomicBool сериализовал ВСЕ входы в ядро (сисколы,
+  тик, фолты, внешние IRQ, диспетчеризация) — контракт однопоточности
+  крейта (RefCell-менеджеры). Теперь: каждая подсистема — собственный
+  короткий лок, горячие пути — атомики/lock-free.
+- `sync.rs` — примитивы с IF-дисциплиной: держатель лока всегда IF=0;
+  спин-ожидание на глубине 0 — с IF=1 (доставка IPI: shootdown-ACK);
+  вложенное ожидание (TCB/SCHED, чьи держатели не ждут cross-CPU) —
+  IF=0; внешние IRQ физически не прерывают держателя → самодедлок
+  хендлера невозможен. Хуки wait/wake/depth ставит бекенд в GS:DEPTH
+  до старта SMP (host-тесты — no-op-хуки). Ранги захвата:
+  GATE > CLAIM > TCB > SCHED; CAP/KMEM/SHM/IrqRouter/Registry — листья.
+- `KSpin<T>`/`KRwLock<T>` (RAII, depth-хуки), `RawGate` — статическая
+  таблица пер-гейт локов `GATE_LOCKS[256]` (ёмкость cspace 16x16,
+  нет проблемы времени жизни), `MpmcQueue` — кольцо Вьюкова
+  (без аллокаций/ABA/реаллокации, ёмкость 1024 ≥ квота 512 потоков).
+
+**Менеджеры ядра — fine-grained (RefCell → атомарные локи):**
+- `TcbManager` — KRwLock (write для мутаций/транзакций, read для
+  снапшотов); транзакции IPC-парковки `recv_any_park`/
+  `send_thread_offer` — [переход + публикация] одной write-секцией.
+- `CapabilityManager` — gates/irqs под KSpin + пер-гейт RawGate для
+  rendezvous; `MemoryManager` — ops-лок (сериализует `with_facade`,
+  закрывает гонку параллельного `&mut UFacade` двух потоков одного
+  домена; TLB-shootdown — единственный лок, под которым ядро ждёт
+  cross-CPU, его waiter'ы всегда глубина 0 → IF=1-спин жив).
+- `ShmManager`, `DeviceClaimRegistry` (парк под CLAIM-локом —
+  lost-wakeup закрыт), `IrqRouter`, `SyscallRegistry`, `IpcManager`
+  (счётчики — атомики); IOMMU-агрегатор — ops-лок.
+
+**IPC rendezvous — пер-гейт критсекции (`kernel/src/ipc/mod.rs`):**
+- send: [claim ждущего получателя] / [буфер] / [парк отправителя] —
+  одна секция RawGate(gate); доставка — ВНЕ лока (map-элементы —
+  KMEM; ранг GATE→KMEM запрещён — ABBA call-фаз устранён).
+- recv: [буфер → refill из send_q] / [claim отправителя] — секция;
+  завершение фазы call (`complete_sender`) — вне лока (GATE→GATE
+  запрещён — ABBA пары встречных ipc_call).
+
+**Планировщик — lock-free готовность (`backend/src/sched.rs`):**
+- Очередь готовности — MPMC-кольцо: enqueue из хуков TCB (под
+  write-гардом — MPMC локов не берёт, инверсии рангов нет), pick —
+  без чужих локов; + resched-IPI будит idle-CPU.
+- Ленивый deschedule: запись остаётся в кольце, pick отсеивает по
+  ФАКТИЧЕСКОМУ состоянию TCB (Dead-каскад «kill в момент rotate» —
+  отсеется, воскрешения нет); финальная защита — `mark_running`
+  (Ready→Running под write-гардом: провал = мимо, без входа).
+- need_resched/quantum/slice_used — GS per-CPU (как прежде);
+  CPU-период — атомики (как v0.10).
+
+**Гонки, которые закрывал BKL — закрыты явно (bring-up фиксы):**
+- *Rotate/троттл мимо автомата состояний*: preempt-шаг прежде пушал
+  поток в кольцо/троттл-лист БЕЗ перехода Running→Ready — ленивая
+  валидация pick отсеивала ВСЕ вытесненные как «stale» (демо
+  зависало на первом же yield воркера). Теперь: `KernelGlue::
+  requeue_thread` (Ready + enqueue-хук) и `KernelGlue::
+  throttle_thread` → `TcbManager::thread_park_throttled` (Ready БЕЗ
+  очереди — в троттл-лист до границы периода).
+- *Публикация блокировки до сохранения контекста*: диспетчер
+  паркуется в очередь, гейт сохранял фрейм ПОСЛЕ — cross-CPU
+  пробуждение входило в поток со старым контекстом (первый блок —
+  рестарт с start_info!). Теперь: контекст-вход — `syscall_c`
+  сохраняет фрейм ДО диспетчера безусловно (повторное сохранение на
+  блок-пути удалено — оно затирало бы контекст СЛЕДУЮЩЕГО
+  блокирования после быстрого повторного парка на другом CPU).
+  preempt-шаг сохраняет контекст ДО публикации готовности.
+- *Check-then-act на выходе гейта*: «заблокирован?» решалось
+  повторным чтением TCB — за окно поток успевал разбухнуть и бежать
+  на другом CPU → sysret = ДВОЙНОЙ запуск. Теперь: per-CPU защёлка
+  `syscall::{record,take}_block_latch` — хендлеры блокировки (IPC
+  send/recv/call/recv_any, DEVICE_CLAIM) ставят её, гейт решает по
+  данным СВОЕГО CPU; уже-разбуженный фрейм честно бросается
+  (идентичный контекст входа принят другим CPU).
+
+**Верификация (QEMU q35, OVMF, TCG SMP=2, EXIT=124 = холд после демо):**
+- baseline / Intel VT-d (intremap=on) / AMD-Vi (intremap=on) — все
+  демо v0.7–v0.11 зелёные в каждой конфигурации: SMP-стресс 0x4000
+  инкрементов без потерь (миграция по yield), IOMMU smoke (map+huge+
+  irq+unmap+detach) у обоих вендоров, песочница HELD (9+ нарушений
+  блокированы), CPU-квота HELD (cpu_used=3/events=1), PIE-спавн на
+  двух базах, IOAPIC COM1 → L4-signal, init exit 0.
+- Счётчики кольца готовности (diag once в idle): enq==pop==157,
+  stale=6 (легаси task-level записи + протухшие между enqueue и
+  pick), markfail=0, enter=151 — во всех трёх прогонах.
+- Host-тесты: 150 (было 149: +thread_park_throttled_ready_without_
+  enqueue); rustfmt чисто.
+
+### Открытые пункты (v0.13+)
+
+- Убрать легаси task-level `set_state(Ready)` → enqueue UUID задач в
+  кольцо (шум stale-записей; потоки — единственный исполняемый вид).
+- per-CPU contexts-кэш вместо одной BTreeMap под KSpin (горячий путь
+  контекст-входа; контенция на каждом сисколе).
+- Убрать диагностику bring-up (DBG_*-счётчики sched) после стабилизации.
+- TSC-deadline суб-тиковая точность квот; enqueue-проверка квоты
+  пробуждённых IPC (окно перерасхода ≤ живые_потоки × квант).
+
+# v0.11 — PIE-спавн + IOAPIC (внешние линии как L4-сообщения)
+
+### Сделано
+
+- Крейт `pie`: юзерспейс-загрузчик образов — ELF64 без аллокаций
+  (план PT_LOAD W^X; RELA только R_X86_64_RELATIVE, иначе fail-closed;
+  ET_EXEC-легаси как StaticFixed). `rogue` линкуется static-pie
+  (ET_DYN + релоки под выбранную базу).
+- init спавнит ОДИН образ на ДВУХ базах (0x40000000/0x50000000):
+  накат релокаций с контрольным readback, PIE_PTR-сверка статического
+  указателя ребёнка в READY.
+- IOAPIC-драйвер: MADT тип 1/2 + ISO-флаги; enable_line — обычный
+  RTE либо IRQ-ремаппинг (Intel: remapped-RTE по IRTE-слоту 0x10+pin;
+  AMD-Vi: IntTab IOAPIC-устройства, IRTE-индекс = вектор); вход по
+  линии — asm-стаб кладёт GSI → EOI → IrqRouter → signal в endpoint,
+  без переключения контекста; `IrqLineOps` + `install_irq_line_service`.
+- Фикс release-бага дерева деривации: debug_assert не отвязывал узел
+  из children → «призрак» → KERNEL FAULT при переиспользовании слота
+  (репродукция: два spawn→reap→revoke_all подряд).
+- Репо-хигиена: .gitignore (target/, kernel.bin, OVMF_VARS.fd);
+  [patch]-секция iommu-rs удалена — фиксы влиты в апстрим
+  sergeyvolkovich/iommu-rs, зависимость напрямую из git.
+
 # v0.10 — CPU-квоты GTCB (троттлинг доменов) + ленивые счётчики потоков
 
 ### Сделано

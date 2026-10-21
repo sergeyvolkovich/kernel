@@ -158,7 +158,12 @@ impl SyscallHandler for DeviceClaimHandler {
             Ok(ClaimOutcome::Acquired) => Ok(0),
             // Поток заблокирован: возврат материализуется при release
             // (syscall_ret = 0) или удалении устройства (ENXIO).
-            Ok(ClaimOutcome::Blocked) => Ok(0),
+            // SMP v0.12: защёлка — гейт уходит в диспетчеризацию без
+            // повторного (racy) чтения состояния потока.
+            Ok(ClaimOutcome::Blocked) => {
+                crate::syscall::record_block_latch(ctx.cpu);
+                Ok(0)
+            }
             Err(e) => Err(e.into()),
         }
     }

@@ -26,7 +26,7 @@
 // линейный scan по нескольким записям кэш-линии. Микроядерная простота
 // против менеджерской общности.
 
-use core::cell::RefCell;
+use crate::sync::KSpin;
 
 use alloc::vec::Vec;
 use thiserror::Error;
@@ -78,7 +78,7 @@ struct IrqBinding {
 
 /// Роутер привязок IRQ -> endpoint.
 pub struct IrqRouter {
-    bindings: RefCell<Vec<IrqBinding>>,
+    bindings: KSpin<Vec<IrqBinding>>,
 }
 
 impl Default for IrqRouter {
@@ -91,7 +91,7 @@ impl IrqRouter {
     /// Пустой роутер (аллокаций нет — Vec растёт при первом attach).
     pub fn new() -> Self {
         Self {
-            bindings: RefCell::new(Vec::new()),
+            bindings: KSpin::new(Vec::new()),
         }
     }
 
@@ -117,7 +117,7 @@ impl IrqRouter {
             return Err(IrqError::InvalidGsi(gsi));
         }
 
-        let mut bindings = self.bindings.borrow_mut();
+        let mut bindings = self.bindings.lock();
         if bindings.iter().any(|b| b.gsi == gsi) {
             return Err(IrqError::AlreadyBound);
         }
@@ -133,7 +133,7 @@ impl IrqRouter {
 
     /// Снять привязку линии (только владелец).
     pub fn detach(&self, gsi: u32, owner: TaskId) -> Result<(), IrqError> {
-        let mut bindings = self.bindings.borrow_mut();
+        let mut bindings = self.bindings.lock();
         let idx = bindings
             .iter()
             .position(|b| b.gsi == gsi)
@@ -149,7 +149,7 @@ impl IrqRouter {
     /// Возврат — был ли необработанный pending (ложный ACK — не ошибка:
     /// идемпотентность протокола важнее строгости).
     pub fn ack(&self, gsi: u32, owner: TaskId) -> Result<bool, IrqError> {
-        let mut bindings = self.bindings.borrow_mut();
+        let mut bindings = self.bindings.lock();
         let b = bindings
             .iter_mut()
             .find(|b| b.gsi == gsi)
@@ -179,7 +179,7 @@ impl IrqRouter {
         // Захват привязки-копии ДО отпуска borrow: доставка заходит в
         // менеджеры (RefCell-реентери недопустимы).
         let (gate, was_pending) = {
-            let bindings = self.bindings.borrow();
+            let bindings = self.bindings.lock();
             let Some(b) = bindings.iter().find(|b| b.gsi == gsi) else {
                 return Ok(false);
             };
@@ -195,7 +195,7 @@ impl IrqRouter {
         // Сначала pending (событие учтено при любом исходе доставки)...
         if let Some(b) = self
             .bindings
-            .borrow_mut()
+            .lock()
             .iter_mut()
             .find(|b| b.gsi == gsi && b.gate == gate)
         {
@@ -210,7 +210,7 @@ impl IrqRouter {
     /// Снять все привязки устройства (hot-removal; GCTL::rescan_devices).
     /// Возврат — число снятых.
     pub fn detach_device(&self, path: &DevicePath) -> usize {
-        let mut bindings = self.bindings.borrow_mut();
+        let mut bindings = self.bindings.lock();
         let before = bindings.len();
         bindings.retain(|b| &b.path != path);
         before - bindings.len()
@@ -219,7 +219,7 @@ impl IrqRouter {
     /// Снять все привязки задачи (TASK_EXIT / TASK_KILL каскад).
     /// Возврат — число снятых.
     pub fn detach_all_of(&self, owner: &TaskId) -> usize {
-        let mut bindings = self.bindings.borrow_mut();
+        let mut bindings = self.bindings.lock();
         let before = bindings.len();
         bindings.retain(|b| &b.owner != owner);
         before - bindings.len()
@@ -227,7 +227,7 @@ impl IrqRouter {
 
     /// Число активных привязок (аудит/тесты).
     pub fn len(&self) -> usize {
-        self.bindings.borrow().len()
+        self.bindings.lock().len()
     }
 
     /// Привязок нет.
@@ -238,7 +238,7 @@ impl IrqRouter {
     /// Снимок привязки для отладки: (gsi, owner, gate, pending).
     pub fn binding_of(&self, gsi: u32) -> Option<(u32, TaskId, ObjId, bool)> {
         self.bindings
-            .borrow()
+            .lock()
             .iter()
             .find(|b| b.gsi == gsi)
             .map(|b| (b.gsi, b.owner, b.gate, b.pending))

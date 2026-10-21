@@ -47,7 +47,9 @@ pub mod mem;
 pub mod paged;
 pub mod types;
 
-use core::cell::{Cell, RefCell};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+use crate::sync::{KSpin, RawGate};
 use core::ptr::NonNull;
 
 use intrusive_collections::{LinkedList, LinkedListLink, UnsafeRef, intrusive_adapter};
@@ -197,6 +199,31 @@ const _: () = assert!(core::mem::offset_of!(GateObj, hdr) == 0);
 
 type GateTable = PagedTable<GateObj, GATE_PAGE_SLOTS, GATE_DIR_LEN>;
 
+// ───────────────────── Пер-gate локи IPC-rendezvous (SMP v0.12) ─────────────────────
+
+/// Статическая таблица локов критсекций rendezvous: ключ — СЛОТ таблицы
+/// гейтов (16×16 = 256). Стабильность ключа снимает проблему времени
+/// жизни лока: destroy_gate и переиспользование слота не инвалидируют
+/// лок (переиспользованный слот — тот же лок, сериализация корректна);
+/// держатели не хранят указателей на объект гейта.
+static GATE_LOCKS: [RawGate; GATE_PAGE_SLOTS * GATE_DIR_LEN] =
+    [const { RawGate::new() }; GATE_PAGE_SLOTS * GATE_DIR_LEN];
+
+/// Лок endpoint'а по идентификатору гейта — для критсекций `crate::ipc`
+/// (ранг GATE — см. `crate::sync`). `debug_assert` вместо паники:
+/// ObjId гейтов рождаются только из таблицы этой ёмкости (битые —
+/// отсеивает generation-проверка `with_endpoint`).
+pub(crate) fn gate_lock(gate: ObjId) -> &'static RawGate {
+    let idx = gate.idx() as usize;
+    debug_assert!(
+        idx < GATE_LOCKS.len(),
+        "gate idx вне таблицы локов (битый ObjId?)"
+    );
+    // Выход за границы невозможен по построению ёмкости; безопасный
+    // кламп вместо паники в release.
+    &GATE_LOCKS[idx.min(GATE_LOCKS.len() - 1)]
+}
+
 struct GateSpace {
     gates: GateTable,
 }
@@ -233,26 +260,26 @@ struct IrqSpace {
 /// Менеджер заимствует реестр задач: хендл-таблица каждой задачи лежит
 /// в её TaskObj, операции идут через `TcbManager::with_caps_mut`.
 pub struct CapabilityManager {
-    gates: RefCell<GateSpace>,
-    irqs: RefCell<IrqSpace>,
-    /// Эпоха отзывов для inline-cache (в SMP-ядре — AtomicU64 с Release).
-    epoch: Cell<u64>,
-    /// Суммарное число живых CTE во всех cspace.
-    live: Cell<usize>,
+    gates: KSpin<GateSpace>,
+    irqs: KSpin<IrqSpace>,
+    /// Эпоха отзывов для inline-cache (SMP v0.12: AtomicU64).
+    epoch: AtomicU64,
+    /// Суммарное число живых CTE во всех cspace (SMP v0.12: атомик).
+    live: AtomicUsize,
 }
 
 impl CapabilityManager {
     /// Пустой менеджер над реестром задач `tasks`.
     pub fn new() -> Result<Self, CapabilityError> {
         Ok(Self {
-            gates: RefCell::new(GateSpace {
+            gates: KSpin::new(GateSpace {
                 gates: PagedTable::new()?,
             }),
-            irqs: RefCell::new(IrqSpace {
+            irqs: KSpin::new(IrqSpace {
                 irqs: PagedTable::new()?,
             }),
-            epoch: Cell::new(0),
-            live: Cell::new(0),
+            epoch: AtomicU64::new(0),
+            live: AtomicUsize::new(0),
         })
     }
 
@@ -294,7 +321,7 @@ impl CapabilityManager {
                 .map_err(CapabilityError::from)
         }) {
             Some(Ok(sr)) => {
-                self.live.set(self.live.get() + 1);
+                self.live.fetch_add(1, Ordering::Relaxed);
                 Ok(CapHandle::new(sr.idx, sr.generation))
             }
             Some(Err(e)) => Err(e),
@@ -385,7 +412,7 @@ impl CapabilityManager {
         });
         debug_assert!(pushed.is_some(), "источник существовал на шаге 1");
 
-        self.live.set(self.live.get() + 1);
+        self.live.fetch_add(1, Ordering::Relaxed);
         Ok(CapHandle::new(child_sr.idx, child_sr.generation))
     }
 
@@ -498,7 +525,7 @@ impl CapabilityManager {
         let freed = tasks.with_caps_mut(&src_task, |t| t.free(src.idx()));
         debug_assert!(freed == Some(true), "старый слот обязан быть живым");
 
-        self.epoch.set(self.epoch.get() + 1); // любой отзыв прав — эпоха
+        self.epoch.fetch_add(1, Ordering::AcqRel); // любой отзыв прав — эпоха
         Ok(CapHandle::new(new_sr.idx, new_sr.generation))
     }
 
@@ -560,8 +587,8 @@ impl CapabilityManager {
         // 3. Слот хендл-таблицы освобождаем (generation вверх → хендл умирает).
         let freed = tasks.with_caps_mut(&task, |t| t.free(id.idx()));
         debug_assert!(freed == Some(true), "слот обязан быть живым");
-        self.live.set(self.live.get() - 1);
-        self.epoch.set(self.epoch.get() + 1);
+        self.live.fetch_sub(1, Ordering::Relaxed);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -585,8 +612,8 @@ impl CapabilityManager {
         };
 
         let revoked = self.revoke_node(tasks, old_ptr, true);
-        self.live.set(self.live.get() - revoked);
-        self.epoch.set(self.epoch.get() + 1);
+        self.live.fetch_sub(revoked, Ordering::Relaxed);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
 
         Ok(RevokeReport {
             revoked_slots: revoked,
@@ -605,7 +632,7 @@ impl CapabilityManager {
             return Err(CapabilityError::TaskNotFound(task));
         }
         let revoked = self.revoke_all_for(tasks, task);
-        self.epoch.set(self.epoch.get() + 1);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         Ok(RevokeReport {
             revoked_slots: revoked,
         })
@@ -632,7 +659,7 @@ impl CapabilityManager {
         // платформ без планировщика); полный endpoint — `create_endpoint`.
         let gr = self
             .gates
-            .borrow_mut()
+            .lock()
             .gates
             .alloc(|_idx, generation| GateObj {
                 hdr: ObjHeader::new(generation),
@@ -651,16 +678,16 @@ impl CapabilityManager {
         });
         match created {
             Some(Ok(sr)) => {
-                self.live.set(self.live.get() + 1);
+                self.live.fetch_add(1, Ordering::Relaxed);
                 Ok(CapHandle::new(sr.idx, sr.generation))
             }
             Some(Err(e)) => {
                 // Откат: объект гейта больше никому не нужен.
-                self.gates.borrow_mut().gates.free(gr.idx);
+                self.gates.lock().gates.free(gr.idx);
                 Err(e)
             }
             None => {
-                self.gates.borrow_mut().gates.free(gr.idx);
+                self.gates.lock().gates.free(gr.idx);
                 Err(CapabilityError::TaskNotFound(owner))
             }
         }
@@ -686,9 +713,9 @@ impl CapabilityManager {
             .flatten()
             .ok_or(CapabilityError::InvalidHandle(handle))?;
 
-        let freed = self.gates.borrow_mut().gates.free(gate_id.idx());
+        let freed = self.gates.lock().gates.free(gate_id.idx());
         debug_assert!(freed, "объект гейта обязан быть живым");
-        self.epoch.set(self.epoch.get() + 1);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -717,7 +744,7 @@ impl CapabilityManager {
         // 1. Объект гейта с реальным состоянием endpoint'а.
         let gr = self
             .gates
-            .borrow_mut()
+            .lock()
             .gates
             .alloc(|_idx, generation| GateObj {
                 hdr: ObjHeader::new(generation),
@@ -736,15 +763,15 @@ impl CapabilityManager {
         });
         match created {
             Some(Ok(sr)) => {
-                self.live.set(self.live.get() + 1);
+                self.live.fetch_add(1, Ordering::Relaxed);
                 Ok(CapHandle::new(sr.idx, sr.generation))
             }
             Some(Err(e)) => {
-                self.gates.borrow_mut().gates.free(gr.idx);
+                self.gates.lock().gates.free(gr.idx);
                 Err(e)
             }
             None => {
-                self.gates.borrow_mut().gates.free(gr.idx);
+                self.gates.lock().gates.free(gr.idx);
                 Err(CapabilityError::TaskNotFound(owner))
             }
         }
@@ -758,9 +785,15 @@ impl CapabilityManager {
         gate: ObjId,
         f: impl FnOnce(&mut EndpointState) -> R,
     ) -> Option<R> {
-        let mut space = self.gates.borrow_mut();
+        let mut space = self.gates.lock();
         let g = space.gates.get_mut(gate.idx(), gate.generation())?;
         Some(f(&mut g.endpoint))
+    }
+
+    /// Пер-gate лок endpoint'а (критсекции rendezvous `crate::ipc`):
+    /// делегирует статической таблице `GATE_LOCKS` по слоту гейта.
+    pub(crate) fn gate_lock(&self, gate: ObjId) -> &'static RawGate {
+        gate_lock(gate)
     }
 
     /// ObjId гейта по хендлу в cspace задачи (маршрутизация IPC-операций:
@@ -801,7 +834,7 @@ impl CapabilityManager {
 
         let or = self
             .irqs
-            .borrow_mut()
+            .lock()
             .irqs
             .alloc(|_idx, generation| IrqObj {
                 hdr: ObjHeader::new(generation),
@@ -819,15 +852,15 @@ impl CapabilityManager {
         });
         match created {
             Some(Ok(sr)) => {
-                self.live.set(self.live.get() + 1);
+                self.live.fetch_add(1, Ordering::Relaxed);
                 Ok(CapHandle::new(sr.idx, sr.generation))
             }
             Some(Err(e)) => {
-                self.irqs.borrow_mut().irqs.free(or.idx);
+                self.irqs.lock().irqs.free(or.idx);
                 Err(e)
             }
             None => {
-                self.irqs.borrow_mut().irqs.free(or.idx);
+                self.irqs.lock().irqs.free(or.idx);
                 Err(CapabilityError::TaskNotFound(owner))
             }
         }
@@ -850,9 +883,9 @@ impl CapabilityManager {
             .flatten()
             .ok_or(CapabilityError::InvalidHandle(handle))?;
 
-        let freed = self.irqs.borrow_mut().irqs.free(obj_id.idx());
+        let freed = self.irqs.lock().irqs.free(obj_id.idx());
         debug_assert!(freed, "объект линии обязан быть живым");
-        self.epoch.set(self.epoch.get() + 1);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -981,7 +1014,7 @@ impl CapabilityManager {
     ) -> Result<CapResolved, CapabilityError> {
         let tag = Self::cache_tag(task, handle);
         let li = ((tag >> 13) as usize) % cache.lines.len();
-        let epoch = self.epoch.get();
+        let epoch = self.epoch.load(Ordering::Acquire);
 
         {
             let line = &cache.lines[li];
@@ -999,7 +1032,7 @@ impl CapabilityManager {
         cache.misses += 1;
         let (res, owner_check) = self.resolve_inner(tasks, task, handle)?;
         let line = &mut cache.lines[li];
-        line.epoch = self.epoch.get();
+        line.epoch = self.epoch.load(Ordering::Acquire);
         line.tag = tag;
         line.res = res;
         line.owner_check = owner_check;
@@ -1021,7 +1054,7 @@ impl CapabilityManager {
     /// живости, о которых менеджер не знает (например, после
     /// `TcbManager::set_state(Dead)`, если кэш важнее перепроверки).
     pub fn invalidate_resolve_cache(&self) {
-        self.epoch.set(self.epoch.get() + 1);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     // ==== Аудит ====
@@ -1042,7 +1075,7 @@ impl CapabilityManager {
 
     /// Общее число живых CTE во всех cspace.
     pub fn total_count(&self) -> usize {
-        self.live.get()
+        self.live.load(Ordering::Relaxed)
     }
 
     /// Обход всех capability задачи. Callback — копии (`CapabilityView`);
@@ -1064,7 +1097,7 @@ impl CapabilityManager {
     /// TargetRef на объект гейта по слот-ссылке.
     fn gate_target(&self, r: SlotRef) -> TargetRef {
         self.gates
-            .borrow()
+            .lock()
             .gates
             .target(r)
             .expect("гейт только что создан")
@@ -1073,7 +1106,7 @@ impl CapabilityManager {
     /// TargetRef на объект линии по слот-ссылке.
     fn irq_target(&self, r: SlotRef) -> TargetRef {
         self.irqs
-            .borrow()
+            .lock()
             .irqs
             .target(r)
             .expect("объект линии только что создан")
@@ -1234,7 +1267,7 @@ impl CapabilityManager {
             };
             revoked += self.revoke_node(tasks, raw, true);
         }
-        self.live.set(self.live.get().saturating_sub(revoked));
+        self.live.fetch_sub(revoked, Ordering::Relaxed);
         revoked
     }
 }
@@ -1267,7 +1300,7 @@ fn remove_from_children(list: &mut LinkedList<CteChildrenAdapter>, target: NonNu
 //             let _ = self.revoke_all_for(uuid);
 //             cur = tasks.next_task_after(&uuid);
 //         }
-//         debug_assert_eq!(self.live.get(), 0);
+//         debug_assert_eq!(self.live.load(Ordering::Relaxed), 0);
 //         // Объекты гейтов/линий гасятся дропом их таблиц (RefCell-поля):
 //         // TargetRef наружу не утекали, deref'ов после дропа не будет.
 //     }

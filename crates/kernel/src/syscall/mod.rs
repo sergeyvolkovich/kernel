@@ -39,7 +39,7 @@
 //   фасад -> менеджеры: только через ctx хендлеров (task.rs — примеры
 //                тонкой маршрутизации без собственной логики).
 
-use core::cell::RefCell;
+use crate::sync::KRwLock;
 use core::fmt;
 
 use spin::Once;
@@ -71,6 +71,41 @@ use crate::hal::device::DeviceManager;
 use crate::ipc::{IpcManager, ShmManager};
 use crate::mem::MemRouter;
 use crate::task::ThreadId;
+
+// ───────────────────── SMP v0.12: защёлка исхода диспетчера ─────────────────────
+
+/// Потолок защёлок (диагностический: MADT-топология демонстрационных
+/// платформ много меньше; переполнение индекса — clamp без паники).
+const BLOCK_LATCH_CPUS: usize = 64;
+
+/// Per-CPU защёлка «ЭТОТ диспетч заблокировал вызывающий поток».
+///
+/// Проблема (бывший BKL закрывал её глобальной сериализацией): хендлер
+/// блокировки возвращает `Ok(0)` — неотличимо от обычного успеха, и гейт
+/// после диспетча решал «парковать или вернуть» повторным чтением TCB.
+/// Между диспетчем и чтением поток мог быть уже разбужен с другого CPU,
+/// снова стать Running — чтение дало бы «не блокирован» и sysret вошёл бы
+/// в поток ПОВТОРНО, пока его исполняет другой CPU (двойной запуск).
+///
+/// Решение: решение гейта — по данным СВОЕГО CPU. Хендлер блокирующей
+/// операции ставит защёлку до возврата; гейт забирает её после диспетча.
+/// Запись и чтение — только с одного и того же CPU (program order);
+/// атомики — от переупорядочивания компилятором, не для cross-CPU.
+static BLOCK_LATCH: [core::sync::atomic::AtomicBool; BLOCK_LATCH_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; BLOCK_LATCH_CPUS];
+
+/// Хендлер заблокировал вызывающий поток (IPC send/recv/call/recv_any,
+/// DEVICE_CLAIM): гейт после диспетча обязан уйти в диспетчеризацию.
+#[inline]
+pub fn record_block_latch(cpu: CpuId) {
+    BLOCK_LATCH[cpu.min(BLOCK_LATCH_CPUS - 1)].store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Забрать защёлку своего CPU (гейт после диспетча; чтение сбрасывает).
+#[inline]
+pub fn take_block_latch(cpu: CpuId) -> bool {
+    BLOCK_LATCH[cpu.min(BLOCK_LATCH_CPUS - 1)].swap(false, core::sync::atomic::Ordering::AcqRel)
+}
 
 // ───────────────────────────── Позиция возврата ─────────────────────────────
 
@@ -348,7 +383,7 @@ pub const SYSCALL_TABLE_SIZE: usize = 256;
 /// хендлера — `ENOSYS`-отказ, а не паника: пользовательский код вправе
 /// звать любое число, ядро обязано отвечать детерминированно.
 pub struct SyscallRegistry {
-    slots: RefCell<[Option<&'static dyn SyscallHandler>; SYSCALL_TABLE_SIZE]>,
+    slots: KRwLock<[Option<&'static dyn SyscallHandler>; SYSCALL_TABLE_SIZE]>,
 }
 
 impl SyscallRegistry {
@@ -356,7 +391,7 @@ impl SyscallRegistry {
     /// `new() -> Result` исчез вместе со slab-кэшем: отказ невозможен).
     pub fn new() -> Self {
         Self {
-            slots: RefCell::new([const { None }; SYSCALL_TABLE_SIZE]),
+            slots: KRwLock::new([const { None }; SYSCALL_TABLE_SIZE]),
         }
     }
 
@@ -377,7 +412,7 @@ impl SyscallRegistry {
         handler: &'static dyn SyscallHandler,
     ) -> Result<(), SyscallError> {
         let idx = Self::slot_index(number)?;
-        let mut slots = self.slots.borrow_mut();
+        let mut slots = self.slots.write();
         if slots[idx].is_some() {
             return Err(SyscallError::AlreadyExists);
         }
@@ -395,14 +430,14 @@ impl SyscallRegistry {
         handler: &'static dyn SyscallHandler,
     ) -> Result<(), SyscallError> {
         let idx = Self::slot_index(number)?;
-        self.slots.borrow_mut()[idx] = Some(handler);
+        self.slots.write()[idx] = Some(handler);
         Ok(())
     }
 
     /// Снять хендлер номера (динамические подсистемы/отладка).
     pub fn unregister(&self, number: SyscallNumber) -> Result<(), SyscallError> {
         let idx = Self::slot_index(number)?;
-        let mut slots = self.slots.borrow_mut();
+        let mut slots = self.slots.write();
         if slots[idx].take().is_some() {
             Ok(())
         } else {
@@ -414,12 +449,12 @@ impl SyscallRegistry {
     /// `&'static` переживает заимствование).
     pub fn handler(&self, number: SyscallNumber) -> Option<&'static dyn SyscallHandler> {
         let idx = Self::slot_index(number).ok()?;
-        self.slots.borrow()[idx]
+        self.slots.read()[idx]
     }
 
     /// Число занятых слотов (аудит).
     pub fn len(&self) -> usize {
-        self.slots.borrow().iter().filter(|s| s.is_some()).count()
+        self.slots.read().iter().filter(|s| s.is_some()).count()
     }
 
     /// Пуст ли реестр.
