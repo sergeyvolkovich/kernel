@@ -13,4 +13,5 @@ description = "C-ABI интероп-библиотека пользовател�
 # staticlib — для C (gcc -nostdlib); rlib — для Rust-приложений крейта
 # (crates/rogue: sandbox-демо), тот же код.
 crate-type = ["staticlib", "rlib"]
+
 name = "userlib"

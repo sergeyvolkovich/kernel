@@ -3,29 +3,6 @@
 version = 4
 
 [[package]]
-name = "acpi"
-version = "6.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b763acdc1d85c36d61acf97a59938f23202d0e8efe45e8759de10c02db242744"
-dependencies = [
- "bit_field",
- "bitflags",
- "byteorder",
- "log",
- "pci_types",
- "spinning_top",
-]
-
-[[package]]
-name = "acpid"
-version = "0.5.0"
-dependencies = [
- "acpi",
- "spin",
- "userlib",
-]
-
-[[package]]
 name = "aligned_box"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -179,13 +156,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "init"
-version = "0.5.0"
-dependencies = [
- "pie",
-]
-
-[[package]]
 name = "intel-iommu"
 version = "0.1.0"
 source = "git+https://github.com/sergeyvolkovich/iommu-rs.git#721606e9f6b66a550b49d07e88fa582ed036c114"
@@ -243,16 +213,6 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
-
-[[package]]
-name = "pci_types"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0c2a105c657261a938ff68ee231c199a3d80eef33976004829de761ef5b1a9b"
-dependencies = [
- "bit_field",
- "bitflags",
-]
 
 [[package]]
 name = "pie"
@@ -362,15 +322,6 @@ checksum = "0134f9043ed38b087ac4f7d4af44c79e2c9e5094421fe3164f435ce585953b10"
 dependencies = [
  "lock_api",
  "portable-atomic",
-]
-
-[[package]]
-name = "spinning_top"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d96d2d1d716fb500937168cc09353ffdc7a012be8475ac7308e1bdf0e3923300"
-dependencies = [
- "lock_api",
 ]
 
 [[package]]

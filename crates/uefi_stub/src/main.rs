@@ -226,6 +226,8 @@ fn main() -> uefi::Status {
 
     // 2. boot_cfg.xml (рядом с kernel.efi).
     let cfg_path: &uefi::CStr16 = uefi::cstr16!("boot_cfg.xml");
+
+
     let cfg_text = match fs.read_to_string(cfg_path) {
         Ok(t) => t,
         Err(_) => {
@@ -233,6 +235,8 @@ fn main() -> uefi::Status {
             return uefi::Status::NOT_FOUND;
         }
     };
+
+    
     let cfg = match bootcfg::parse(&cfg_text) {
         Ok(c) => c,
         Err(e) => {

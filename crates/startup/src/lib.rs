@@ -646,13 +646,17 @@ pub fn kinit<P: Platform + 'static>(bi: &BootInfo, platform: &'static P) -> ! {
     // 4. Куча ядра + slab-пул подсистем (physmap-виртуальные указатели:
     //    валидны и под пользовательским CR3 — см. Platform::physmap_base).
     let mut pools = pools::build(bi, platform);
+
     pkg_generic_interface::mem::gallocator::init_frames(
         pools.take_kernel(),
         pools.kernel_base as usize,
         platform.physmap_base() as usize,
     );
+
     pkg_generic_interface::mem::gallocator::init_slab_pool(4096);
+
     let p_alloc = pkg_generic_interface::mem::install_p_allocator(pools.take_user());
+
     logln(platform, "kinit: pools up (kernel + user), heap ready");
 
     // 5. GCTL (корневой фасад, навсегда).
@@ -665,10 +669,12 @@ pub fn kinit<P: Platform + 'static>(bi: &BootInfo, platform: &'static P) -> ! {
     if let Some(ts) = platform.time_source() {
         syscall::system::install_time_source(ts);
     }
+
     gctl.task_manager().install_scheduler(platform.scheduler());
 
     // 7. KMAP: изоляция + регионы ядра в пользовательских таблицах.
     let mut kmap = pkg_generic_interface::mem::kmap::KMap::new(platform.isolation_policy());
+
     for region in platform.kernel_regions() {
         if let Err(e) = kmap.add(region) {
             fatal(
@@ -682,6 +688,7 @@ pub fn kinit<P: Platform + 'static>(bi: &BootInfo, platform: &'static P) -> ! {
     // 8. init-сервер: задача + адресное пространство.
     let init_task = task_id(INIT_TASK_ID);
     let init_thread = task_id(INIT_THREAD_ID);
+
     if let Err(e) = gctl.task_manager().create(init_task, TaskPriority(120)) {
         fatal(platform, &alloc::format!("kinit: FATAL init task: {e}\r\n"));
     }
