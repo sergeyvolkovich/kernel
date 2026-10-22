@@ -285,9 +285,34 @@ pub trait KernelGlue: Send + Sync {
     fn on_external_irq(&self, _gsi: u32) -> bool {
         false
     }
+
+    /// v0.16, slice-end notifications: the registered advisory gate of
+    /// the thread (`None` — the thread did not opt in). Called by the
+    /// scheduler backend at dispatch time (it decides whether a warning
+    /// deadline can be armed before the preemption boundary).
+    fn slice_warn_gate(&self, _thread: ThreadId) -> Option<pkg_generic_interface::capability::ObjId> {
+        None
+    }
+
+    /// v0.16, slice-end notifications: the thread's time slice is
+    /// nearing its end — deliver the advisory kernel message to the
+    /// registered gate (word 0 = 1 = SLICE_WARN kind, word 1 = cycles
+    /// remaining). STRICTLY best-effort and non-enforcing: full buffer
+    /// drops the event silently, missing thread/gate is a no-op, and
+    /// the preempt itself never depends on any reaction.
+    ///
+    /// Called from the timer path in USER context (locks allowed, same
+    /// discipline as the preempt step); never from a kernel-context
+    /// interrupt (lock holders cannot be preempted for IPC delivery).
+    fn slice_warn_fire(&self, _thread: ThreadId, _remaining_cycles: u64) {}
 }
 
 static GLUE: spin::Once<&'static dyn KernelGlue> = spin::Once::new();
+
+/// v0.16: слово 0 advisory-сообщения «конец временного промежутка
+/// близко» (THREAD_SET_SLICE_NOTIFY): маркер вида события (слово 1 —
+/// остаток слайса в циклах платформенного счётчика).
+pub const SLICE_WARN_KIND: u64 = 1;
 
 // ───────────────────── v0.9: сервисы над GCTL+платформой ─────────────────────
 
@@ -605,6 +630,38 @@ impl<MMAP: MMAPInterface + KMAPInterface + ASIDInterface + 'static> KernelGlue f
             ),
             Ok(true)
         )
+    }
+
+    /// v0.16: advisory-гейт нотификаций конца слайса потока (None —
+    /// поток не регистрировал; см. THREAD_SET_SLICE_NOTIFY).
+    fn slice_warn_gate(
+        &self,
+        thread: ThreadId,
+    ) -> Option<pkg_generic_interface::capability::ObjId> {
+        self.gctl.task_manager().thread_slice_warn_gate(&thread)
+    }
+
+    /// v0.16: конец временного промежутка близко — best-effort доставка
+    /// kernel-сообщения [SLICE_WARN_KIND, остаток_циклов] в гейт потока.
+    /// Полный буфер / отсутствие получателя — молчаливый drop (API
+    /// опционально и ничего не энфорсит).
+    fn slice_warn_fire(&self, thread: ThreadId, remaining_cycles: u64) {
+        use pkg_generic_interface::ipc::IpcMessage;
+        let Some(gate) = self.gctl.task_manager().thread_slice_warn_gate(&thread) else {
+            return;
+        };
+        let mut msg = Box::new(IpcMessage::new(pkg_generic_interface::ipc::IPC_KERNEL_FROM));
+        msg.push_word(SLICE_WARN_KIND);
+        msg.push_word(remaining_cycles);
+        // kernel_send: ждущий получатель — сразу, иначе буфер; ядро не
+        // блокируется. QueueFull (переполнение буфера) — теряем событие
+        // молча: advisory-канал не имеет права ломать доставку.
+        let _ = self.gctl.ipc_manager().kernel_send(
+            self.gctl.task_manager(),
+            self.gctl.capability_manager(),
+            gate,
+            msg,
+        );
     }
 }
 

@@ -43,12 +43,13 @@ use thiserror::Error;
 
 use crate::capability::{
     ActionPermissions, CapHandle, CapabilityBadge, CapabilityError, CapabilityManager,
-    ContainerACCCapability, ObjId,
+    ObjId,
 };
 use crate::mem::MemRouter;
 use crate::task::scheduler::BlockQueueId;
 use crate::task::{
-    RecvAnyPark, SendThreadOffer, TaskError, TaskId, TaskState, TcbManager, ThreadId, ThreadWait,
+    RecvAnyPark, SendThreadOffer, TaskError, TaskId, TaskState, TcbManager, ThreadGateLookup,
+    ThreadId, ThreadWait,
 };
 
 pub mod shm;
@@ -666,14 +667,20 @@ impl IpcManager {
         msg: Box<IpcMessage>,
         mode: BlockMode,
     ) -> Result<SendOutcome, IpcError> {
-        let owner = thread_task(tasks, from_thread)?;
-        let view = caps
-            .get(tasks, owner, ep)
-            .ok_or(CapabilityError::InvalidHandle(ep))?;
-        let ContainerACCCapability::Gate { gate_id } = view.cap_ref else {
-            return Err(IpcError::NotEndpoint);
+        // v0.16: поток -> домен -> хендл -> гейт — ОДНА read-секция
+        // менеджера (было: thread_task + caps.get = две; каждое — атомарная
+        // RMW по глобальной cacheline RW-лока).
+        let gate = match tasks.thread_gate_lookup(&from_thread, ep) {
+            ThreadGateLookup::Gate { gate, .. } => gate,
+            ThreadGateLookup::NoThread => {
+                return Err(IpcError::Task(TaskError::ThreadNotFound(from_thread)))
+            }
+            ThreadGateLookup::BadHandle => {
+                return Err(IpcError::Cap(CapabilityError::InvalidHandle(ep)))
+            }
+            ThreadGateLookup::NotGate => return Err(IpcError::NotEndpoint),
         };
-        self.send_to_gate(tasks, caps, router, from_thread, gate_id, msg, mode, None)
+        self.send_to_gate(tasks, caps, router, from_thread, gate, msg, mode, None)
     }
 
     /// Отправка в гейт (ядро/фасад — без проверки capability).
@@ -704,7 +711,7 @@ impl IpcManager {
             // 1. Ждущий получатель: claim (вывод из recv_q, снятие wait,
             //    материализация ret) — доставка пойдёт ВНЕ лока (map-элементы
             //    — KMEM; ранг GATE→KMEM запрещён).
-            if let Some(waiter) = self.claim_recv_waiter(tasks, caps, gate, from_thread)? {
+            if let Some(waiter) = self.claim_recv_waiter(tasks, caps, gate)? {
                 let msg = slot
                     .take()
                     .expect("claim оставляет сообщение владельцу вызова");
@@ -765,7 +772,7 @@ impl IpcManager {
         // (зеркально send_to_gate; блокировки отправителя-ядра нет).
         let waiter = {
             let _g = caps.gate_lock(gate).acquire_guard();
-            match self.claim_recv_waiter(tasks, caps, gate, IPC_KERNEL_FROM)? {
+            match self.claim_recv_waiter(tasks, caps, gate)? {
                 Some(w) => Some(w),
                 None => {
                     let queued = caps.with_endpoint(gate, |ep| {
@@ -823,34 +830,27 @@ impl IpcManager {
     /// (map-элементы/mailbox/wake) вызывающий делает ВНЕ gate-лока —
     /// claim публикует «поток занят доставкой» самим фактом выхода из
     /// очереди. `Ok(None)` — получателя нет (сообщение не тронуто).
+    ///
+    /// v0.16: pop + проверка + claim — ОДНА write-секция TcbManager
+    /// (`TcbManager::claim_recv_waiter`; было три захвата подряд).
     fn claim_recv_waiter(
         &self,
         tasks: &TcbManager,
         caps: &CapabilityManager,
         gate: ObjId,
-        _from_thread: ThreadId,
     ) -> Result<Option<ThreadId>, IpcError> {
-        // Первый поток из recv-очереди endpoint'а (FIFO планировщика).
-        let Some(waiter) = self.pop_waiter(tasks, caps, gate, WaitSide::Recv)? else {
+        let queue = caps
+            .with_endpoint(gate, |ep| ep.recv_queue())
+            .ok_or(IpcError::OwnerDead)?;
+        if queue == BlockQueueId::default() {
             return Ok(None);
-        };
-        // Защита: поток обязан ждать именно этот гейт.
-        let expects_gate = tasks
-            .with_thread(
-                &waiter,
-                |t| matches!(&t.wait, Some(ThreadWait::RecvEndpoint { gate: g }) if *g == gate),
-            )
-            .unwrap_or(false);
-        if !expects_gate {
-            return Err(IpcError::Internal);
         }
-        // Claim: wait = None + syscall_ret = Some(0) — одна write-секция
-        // TCB (встречный send_thread увидит «не open-receive» и паркуется).
-        tasks.with_thread(&waiter, |t| {
-            t.wait = None;
-            t.syscall_ret = Some(0);
-        });
-        Ok(Some(waiter))
+        match tasks.claim_recv_waiter(queue, gate) {
+            Ok(waiter) => Ok(waiter),
+            // Извлечённый поток ждал не этот гейт — инвариант очередей.
+            Err(TaskError::ThreadWaitState(_)) => Err(IpcError::Internal),
+            Err(e) => Err(IpcError::Task(e)),
+        }
     }
 
     /// Блокировка отправителя: сообщение — в blocked_msg, поток — в send_q.
@@ -901,14 +901,18 @@ impl IpcManager {
         ep: CapHandle,
         mode: BlockMode,
     ) -> Result<RecvOutcome, IpcError> {
-        let owner = thread_task(tasks, thread)?;
-        let view = caps
-            .get(tasks, owner, ep)
-            .ok_or(CapabilityError::InvalidHandle(ep))?;
-        let ContainerACCCapability::Gate { gate_id } = view.cap_ref else {
-            return Err(IpcError::NotEndpoint);
+        // v0.16: та же склейка одной секцией, что и у send.
+        let gate = match tasks.thread_gate_lookup(&thread, ep) {
+            ThreadGateLookup::Gate { gate, .. } => gate,
+            ThreadGateLookup::NoThread => {
+                return Err(IpcError::Task(TaskError::ThreadNotFound(thread)))
+            }
+            ThreadGateLookup::BadHandle => {
+                return Err(IpcError::Cap(CapabilityError::InvalidHandle(ep)))
+            }
+            ThreadGateLookup::NotGate => return Err(IpcError::NotEndpoint),
         };
-        self.recv_from_gate(tasks, caps, thread, gate_id, mode, false)
+        self.recv_from_gate(tasks, caps, thread, gate, mode, false)
     }
 
     /// Приём с гейта (ядро/фасад). `already_blocked` — поток уже Blocked
@@ -920,6 +924,10 @@ impl IpcManager {
     /// Claim отправителя (вывод из send_q + изъятие сообщения) — под
     /// локом; завершение его фазы (`complete_sender`, возможный переход
     /// на reply-гейт) — ВНЕ лока: GATE→GATE запрещён (ABBA call-фаз).
+    ///
+    /// v0.16: try-отказ и самопарк получателя — в ТОЙ ЖЕ критсекции
+    /// (был второй захват gate-лока на блок-пути; окно между секциями
+    /// закрывалось симметричным локом — теперь одной секцией).
     pub fn recv_from_gate(
         &self,
         tasks: &TcbManager,
@@ -929,8 +937,8 @@ impl IpcManager {
         mode: BlockMode,
         already_blocked: bool,
     ) -> Result<RecvOutcome, IpcError> {
-        // 2. Rendezvous-claim отправителя (под локом; None — нет).
-        let claimed = {
+        let mut claimed: Option<(ThreadId, Box<IpcMessage>, Option<ThreadWait>)> = None;
+        {
             let _g = caps.gate_lock(gate).acquire_guard();
 
             // 1. Буфер endpoint'а.
@@ -946,8 +954,20 @@ impl IpcManager {
                 return Ok(RecvOutcome::Message(msg));
             }
 
-            self.claim_send_waiter(tasks, caps, gate)?
-        };
+            // 2. Rendezvous-claim отправителя (под локом; None — нет).
+            match self.claim_send_waiter(tasks, caps, gate)? {
+                Some(c) => claimed = Some(c),
+                None => {
+                    // 3. Принимать нечего: try-отказ или самопарк — в той же
+                    //    критсекции (окно «отправитель проверил recv_q до
+                    //    нашей публикации и ушёл в буфер» закрыто).
+                    if mode == BlockMode::Try {
+                        return Err(IpcError::TryAgain);
+                    }
+                    self.block_receiver(tasks, caps, thread, gate, already_blocked)?;
+                }
+            }
+        }
 
         if let Some((sender, msg, wait)) = claimed {
             // Отправитель доставлен: вернуть его в пользователя или перевести
@@ -957,16 +977,6 @@ impl IpcManager {
             return Ok(RecvOutcome::Message(msg));
         }
 
-        // 3. Принимать нечего: try-отказ или блокировка получателя —
-        //    парк себя в критсекции лока (окно «отправитель проверил
-        //    recv_q до нашей публикации и ушёл в буфер» закрыто).
-        if mode == BlockMode::Try {
-            return Err(IpcError::TryAgain);
-        }
-        {
-            let _g = caps.gate_lock(gate).acquire_guard();
-            self.block_receiver(tasks, caps, thread, gate, already_blocked)?;
-        }
         self.blocked_ops.fetch_add(1, Ordering::Relaxed);
         Ok(RecvOutcome::Blocked)
     }
@@ -974,35 +984,27 @@ impl IpcManager {
     /// Claim заблокированного отправителя (ВЫЗЫВАЮЩИЙ ДЕРЖИТ gate-лок):
     /// вывод из send-очереди, изъятие blocked_msg и причины ожидания,
     /// материализация возврата (0). Завершение фазы — вне лока.
+    ///
+    /// v0.16: pop + проверка + изъятие — ОДНА write-секция TcbManager
+    /// (`TcbManager::claim_send_waiter`).
     fn claim_send_waiter(
         &self,
         tasks: &TcbManager,
         caps: &CapabilityManager,
         gate: ObjId,
     ) -> Result<Option<(ThreadId, Box<IpcMessage>, Option<ThreadWait>)>, IpcError> {
-        let Some(sender) = self.pop_waiter(tasks, caps, gate, WaitSide::Send)? else {
+        let queue = caps
+            .with_endpoint(gate, |ep| ep.send_queue())
+            .ok_or(IpcError::OwnerDead)?;
+        if queue == BlockQueueId::default() {
             return Ok(None);
-        };
-        let expects_gate = tasks
-            .with_thread(
-                &sender,
-                |t| matches!(&t.wait, Some(ThreadWait::SendEndpoint { gate: g, .. }) if *g == gate),
-            )
-            .unwrap_or(false);
-        if !expects_gate {
-            return Err(IpcError::Internal);
         }
-        let taken = tasks
-            .with_thread(&sender, |t| {
-                let msg = t.blocked_msg.take();
-                let wait = t.wait.take();
-                t.syscall_ret = Some(0);
-                msg.map(|m| (m, wait))
-            })
-            .flatten();
-        match taken {
-            Some((msg, wait)) => Ok(Some((sender, msg, wait))),
-            None => Err(IpcError::Internal),
+        match tasks.claim_send_waiter(queue, gate) {
+            Ok(claimed) => Ok(claimed),
+            // Инвариант очередей: извлечённый поток ждал не этот гейт
+            // (или без сообщения) — внутренняя ошибка, как раньше.
+            Err(TaskError::ThreadWaitState(_)) => Err(IpcError::Internal),
+            Err(e) => Err(IpcError::Task(e)),
         }
     }
 
@@ -1011,32 +1013,35 @@ impl IpcManager {
     /// SMP v0.12: вызывается ТОЛЬКО под gate-локом вызывающего (приём из
     /// буфера): pop отправителя и push его сообщения — атомарны против
     /// встречного block_sender (который паркуется под тем же локом).
+    ///
+    /// v0.16: pop + изъятие сообщения — ОДНА write-секция TcbManager
+    /// (`TcbManager::take_sender_for_refill`; было две).
     fn refill_from_senders(
         &self,
         tasks: &TcbManager,
         caps: &CapabilityManager,
         gate: ObjId,
     ) -> Result<(), IpcError> {
-        let Some(sender) = self.pop_waiter(tasks, caps, gate, WaitSide::Send)? else {
+        let queue = caps
+            .with_endpoint(gate, |ep| ep.send_queue())
+            .ok_or(IpcError::OwnerDead)?;
+        if queue == BlockQueueId::default() {
+            return Ok(());
+        }
+        let Some((sender, msg)) = tasks.take_sender_for_refill(queue).map_err(|e| match e {
+            TaskError::ThreadWaitState(_) => IpcError::Internal,
+            other => IpcError::Task(other),
+        })?
+        else {
             return Ok(());
         };
-        let taken = tasks
-            .with_thread(&sender, |t| {
-                let msg = t.blocked_msg.take();
-                t.wait = None;
-                t.syscall_ret = Some(0);
-                msg
-            })
-            .flatten();
-        if let Some(msg) = taken {
-            let queued = enqueue_or_full(caps, gate, msg);
-            debug_assert!(
-                matches!(queued, Ok(SendOutcome::Queued)),
-                "слот освободился только что"
-            );
-            // Отправитель разбужен выше (wait = None, ret = 0): перевести в Ready.
-            tasks.thread_set_state(&sender, TaskState::Ready)?;
-        }
+        let queued = enqueue_or_full(caps, gate, msg);
+        debug_assert!(
+            matches!(queued, Ok(SendOutcome::Queued)),
+            "слот освободился только что"
+        );
+        // Отправитель разбужен выше (wait = None, ret = 0): перевести в Ready.
+        tasks.thread_set_state(&sender, TaskState::Ready)?;
         Ok(())
     }
 
@@ -1194,6 +1199,7 @@ impl IpcManager {
         mut msg: Box<IpcMessage>,
     ) -> Result<(), IpcError> {
         // Flexpage-элементы: кадры окна отправителя -> получателю.
+        // ВНЕ локов менеджера (map — KMEM, свой ранг).
         if !msg.items().is_empty() {
             if let Some(router) = router {
                 let sender_owner = tasks.thread_task(&from_thread);
@@ -1209,18 +1215,12 @@ impl IpcManager {
             }
         }
 
-        let was_blocked = tasks
-            .with_thread(&receiver, |t| {
-                let was = t.state == TaskState::Blocked;
-                t.mailbox = Some(msg);
-                t.wait = None;
-                t.syscall_ret = Some(0);
-                was
-            })
-            .ok_or(TaskError::ThreadNotFound(receiver))?;
-        if was_blocked {
-            tasks.thread_set_state(&receiver, TaskState::Ready)?;
-        }
+        // v0.16: mailbox + снятие wait + материализация возврата + перевод
+        // Blocked -> Ready (+ enqueue-хук планировщика) — ОДНА write-секция
+        // менеджера (`deliver_mailbox_wake`; было две).
+        tasks
+            .deliver_mailbox_wake(&receiver, msg)
+            .map_err(IpcError::Task)?;
         Ok(())
     }
 
@@ -1321,35 +1321,9 @@ impl IpcManager {
 
     // ==== Вспомогательное ====
 
-    /// Достать поток из очереди блокировки endpoint'а (сторона Send/Recv).
-    fn pop_waiter(
-        &self,
-        tasks: &TcbManager,
-        caps: &CapabilityManager,
-        gate: ObjId,
-        side: WaitSide,
-    ) -> Result<Option<ThreadId>, IpcError> {
-        let queue = caps
-            .with_endpoint(gate, |ep| match side {
-                WaitSide::Send => ep.send_queue(),
-                WaitSide::Recv => ep.recv_queue(),
-            })
-            .ok_or(IpcError::OwnerDead)?;
-        if queue == BlockQueueId::default() {
-            return Ok(None);
-        }
-        let sched = tasks.scheduler().ok_or(IpcError::NoBlockQueues)?;
-        sched
-            .block_pop_front(queue)
-            .map_err(TaskError::Scheduler)
-            .map_err(IpcError::Task)
-    }
-}
-
-#[derive(Clone, Copy)]
-enum WaitSide {
-    Send,
-    Recv,
+    // (v0.16: `pop_waiter` удалён — pop+проверка+claim слились в одну
+    // write-секцию TcbManager: `claim_recv_waiter` / `claim_send_waiter`
+    // / `take_sender_for_refill` выше.)
 }
 
 impl Default for IpcManager {
@@ -1358,13 +1332,9 @@ impl Default for IpcManager {
     }
 }
 
-/// Владелец потока (задача). `Err` — потока нет.
-fn thread_task(tasks: &TcbManager, thread: ThreadId) -> Result<TaskId, IpcError> {
-    tasks
-        .thread_task(&thread)
-        .ok_or(TaskError::ThreadNotFound(thread))
-        .map_err(IpcError::Task)
-}
+// (v0.16: helper `thread_task` удалён — вход send/recv пользуется
+// объединённым lookup `TcbManager::thread_gate_lookup` в одной секции;
+// map-элементы доставки зовут метод менеджера напрямую.)
 
 /// Поставить сообщение в буфер endpoint'а или отказать QueueFull.
 fn enqueue_or_full(

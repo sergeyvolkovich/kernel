@@ -1,0 +1,16 @@
+[package]
+name = "eevdf"
+version.workspace = true
+edition.workspace = true
+description = "EEVDF (Earliest Eligible Virtual Deadline First) run-queue policy library: pure data structures + policy math, no locking (caller-owned serialization). Used by the x86_64 scheduler backend."
+
+[lib]
+name = "eevdf"
+path = "src/lib.rs"
+
+# Host unit tests (std) + no_std deployment: the crate carries no platform
+# dependencies, only `alloc` + `core` atomics.
+[features]
+default = []
+
+[dependencies]

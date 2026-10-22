@@ -528,8 +528,8 @@ impl SyscallRegistry {
             CapRevokeHandler, CapSendHandler, TaskCreateHandler, TaskExitExceptionHandler,
             TaskExitHandler, TaskKillHandler, TaskLimitsInfoHandler, TaskSetExitEpHandler,
             TaskSetLimitsHandler, TaskSpawnImageHandler, ThreadCreateHandler, ThreadDestroyHandler,
-            ThreadExRegsHandler, ThreadResumeHandler, ThreadSetPrioHandler, ThreadSuspendHandler,
-            ThreadTerminateHandler, ThreadYieldHandler,
+            ThreadExRegsHandler, ThreadResumeHandler, ThreadSetPrioHandler, ThreadSetSliceNotifyHandler,
+            ThreadSuspendHandler, ThreadTerminateHandler, ThreadYieldHandler,
         };
 
         macro_rules! slot {
@@ -559,6 +559,9 @@ impl SyscallRegistry {
         slot!(nums::TASK_SET_LIMITS, TaskSetLimitsHandler);
         slot!(nums::TASK_LIMITS_INFO, TaskLimitsInfoHandler);
         slot!(nums::TASK_SPAWN_IMAGE, TaskSpawnImageHandler);
+
+        // 0x90: расширения планировщика (advisory, опционально).
+        slot!(nums::THREAD_SET_SLICE_NOTIFY, ThreadSetSliceNotifyHandler);
 
         // 0x20: capability.
         slot!(nums::CAP_MINT, CapMintHandler);
@@ -1058,10 +1061,11 @@ mod tests {
         assert!(reg.handler(nums::TASK_SPAWN).is_none());
 
         // IOMMU-группа 0x80 занята дефолтной таблицей (v0.6);
-        // платформенная зона начинается с 0x90.
+        // v0.16: зона планировщика начинается с 0x90 —
+        // THREAD_SET_SLICE_NOTIFY ставит слот дефолтной таблицей.
         assert!(reg.handler(SyscallNumber(0x80)).is_some());
         assert!(reg.handler(SyscallNumber(0x84)).is_some());
-        assert!(reg.handler(SyscallNumber(0x90)).is_none());
+        assert!(reg.handler(nums::THREAD_SET_SLICE_NOTIFY).is_some());
         assert!(reg.handler(SyscallNumber(0xFE)).is_none());
 
         // Идемпотентность: повторная установка не меняет счётчик.

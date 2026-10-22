@@ -26,6 +26,9 @@ raw-cpuid = { workspace = true }
 llfree = { git = "https://github.com/luhsra/llfree-rs.git" }
 bitflags = { workspace = true }
 spin = { workspace = true }
+# v0.16: EEVDF-политика планировщика (отдельный крейт-библиотека;
+# состояние живёт в бекенде под leaf-ранг KSpin).
+eevdf = { workspace = true }
 uuid = { version = "1.28.0", default-features = false }
 # Intel VT-d: форматы таблиц/регистров (MMIO/последовательности — наши).
 intel-iommu = { workspace = true }

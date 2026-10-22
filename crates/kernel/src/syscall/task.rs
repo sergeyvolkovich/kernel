@@ -1047,6 +1047,42 @@ impl SyscallHandler for ThreadExRegsHandler {
     }
 }
 
+/// Регистрация ОПЦИОНАЛЬНОГО advisory-канала «конец временного
+/// промежутка близко» для ВЫЗЫВАЮЩЕГО потока (v0.16, EEVDF-бекенд).
+/// ABI: arg1 = хендл Gate (0 = снять регистрацию).
+///
+/// Семантика — строго уведомительная, НЕ принуждающая (см. nums.rs):
+/// реакция задачи опциональна, вытеснение от неё не зависит.
+pub struct ThreadSetSliceNotifyHandler;
+
+impl ThreadSetSliceNotifyHandler {
+    pub const SYSCALL: SyscallNumber = nums::THREAD_SET_SLICE_NOTIFY;
+}
+
+impl SyscallHandler for ThreadSetSliceNotifyHandler {
+    fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+        let raw = args.arg(1);
+        if raw == 0 {
+            // Снятие регистрации: уведомления больше не доставляются.
+            ctx.tasks.set_thread_slice_warn(&ctx.thread, None)?;
+            return Ok(0);
+        }
+        // Хендл обязан разрешаться в ЖИВОЙ гейт в cspace вызывающего
+        // (валидность — как у TASK_SET_EXIT_EP: разовая проверка при
+        // регистрации; отзыв гейта позже просто гасит доставку).
+        let handle = CapHandle(raw as u64);
+        let gate = match ctx.caps.get(ctx.tasks, ctx.task, handle) {
+            Some(view) => match view.cap_ref {
+                ContainerACCCapability::Gate { gate_id } => Some(gate_id),
+                _ => return Err(SyscallError::InvalidArgument),
+            },
+            None => return Err(SyscallError::InvalidHandle),
+        };
+        ctx.tasks.set_thread_slice_warn(&ctx.thread, gate)?;
+        Ok(0)
+    }
+}
+
 /// Обход cspace вызывающего (CAP_LIST). Слова по индексу: 0 = число
 /// живых хендлов; далее по 2 слова на слот: (handle_bits, kind).
 /// ABI: arg1 = индекс слова.

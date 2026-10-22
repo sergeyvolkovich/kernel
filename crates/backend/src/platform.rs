@@ -210,6 +210,12 @@ impl startup::Platform for X86Platform {
             // ДО release_aps: дальше значение неизменно, читается без
             // локов на горячем пути заряда.
             glue.set_cpu_time_unit(crate::lapic::tsc_per_tick());
+            // v0.16: базовый слайс EEVDF (тот же источник калибровки,
+            // до release_aps и до первого enqueue — сущности рождаются
+            // с правильной виртуальной шкалой).
+            crate::sched::set_base_slice(
+                crate::lapic::tsc_per_tick().saturating_mul(arch::boot::SCHED_HZ / 10),
+            );
             // APы из парковки в планировщик (resched-IPI будит hlt).
             crate::smp::release_aps();
         }

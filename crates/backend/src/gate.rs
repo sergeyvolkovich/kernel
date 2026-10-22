@@ -143,6 +143,10 @@ extern "C" fn syscall_c(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6
                     .cycles_since_dispatch()
                     .max(sched::min_charge_cycles());
                 let _ = glue.on_cpu_cycles_consumed(cur, cycles);
+                // v0.16: EEVDF-заряд отрезка (vruntime; deschedule-хук
+                // уже мог убрать сущность из running — charge корректен
+                // и в этом случае, сервис обязан быть учтён).
+                sched::scheduler().charge_current(cur, cycles);
             }
         }
         // Поток ещё Blocked — обычный парк (контекст уже сохранён
@@ -277,9 +281,29 @@ extern "C" fn timer_c(frame: *mut TickFrame) {
     // Вытеснение по таймеру:
     //   * периодический фолбэк — квант СВОЕГО CPU (GS, атомики per-CPU;
     //     ядро-структуры не трогаем);
-    //   * TSC-deadline — срабатывание ЕСТЬ граница (квант RR/бюджет
-    //     домена/период — что ближе): немедленный флаг.
+    //   * TSC-deadline — срабатывание ЕСТЬ граница: либо ПРЕДУПРЕДИТЕЛЬНАЯ
+    //     (v0.16, THREAD_SET_SLICE_NOTIFY: advisory-доставка в гейт потока
+    //     + перевзвод реальной границы; поток ПРОДОЛЖАЕТ исполняться — API
+    //     ничего не энфорсит), либо граница вытеснения (квант/бюджет/
+    //     период — что ближе): немедленный флаг.
     if crate::lapic::using_tsc_deadline() {
+        let cpu = arch::percpu::cpu_id() as usize;
+        let now = crate::lapic::read_tsc();
+        let (warn_at, preempt_at) = sched::slice_boundaries(cpu);
+        if warn_at != 0 && now >= warn_at && preempt_at > now {
+            // Предупредительная граница (контекст ПОЛЬЗОВАТЕЛЯ — локи
+            // менеджеров брать можно, как в preempt-шаге ниже): доставить
+            // best-effort уведомление и перевзвести РЕАЛЬНУЮ границу.
+            // Полный буфер/отсутствие гейта — молчаливый drop внутри glue.
+            sched::clear_slice_warn(cpu);
+            let thread = cpu::current_thread();
+            if let Some(glue) = startup::glue() {
+                glue.slice_warn_fire(thread, preempt_at - now);
+            }
+            crate::lapic::arm_tsc_deadline(preempt_at);
+            // Без need_resched: поток дорабатывает слайс до границы.
+            return;
+        }
         arch::percpu::set_need_resched();
     } else {
         // Тик планировщика: квант СВОЕГО CPU (GS, атомики per-CPU;
@@ -535,31 +559,40 @@ pub fn idle_loop() -> ! {
         "\r\n[kernel] idle: no runnable threads (all blocked) — waiting\r\n"
     };
     crate::console::kprint_str(msg);
+    let cpu = arch::percpu::cpu_id() as usize;
     loop {
-        // v0.13: будка idle в TSC-deadline-режиме — one-shot на границу
-        // CPU-периода: троттл-лист вернётся в готовность ТОЧНО в срок
-        // (v0.10 будил ближайший тик; периодический фолбэк — тик сам
-        // разбудит, взвод не нужен).
-        if crate::lapic::using_tsc_deadline() {
-            sched::arm_idle_deadline();
-        }
-        x86_64::instructions::interrupts::enable_and_hlt();
         // Границу CPU-периода закрывает и idle: его пробуждение —
         // легальный контекст для refill (локов не держим), а preempt-пути
         // в idle нет — троттл-лист разбудим сами, иначе замороженные
         // домены проспали бы до чужого пользовательского входа.
-        if sched::cpu_period_refill_if_due() {
-            if sched::scheduler().has_ready() {
-                sched::schedule_next(); // не возвращается
-            }
-        }
-        // Проснулись (дедлайн/тик/IPI): появились готовые — в диспетчеризацию.
-        // Возврат из schedule_next сюда невозможен: он либо входит в
-        // поток (не возвращается), либо сам возвращается в idle-цикл.
-        if sched::scheduler().has_ready() {
+        if sched::cpu_period_refill_if_due() && sched::scheduler().has_ready() {
+            sched::set_cpu_idle(cpu, false);
             sched::schedule_next(); // не возвращается
         }
-        // Нет готовых: продолжить сон (следующий таймер/IPI разбудит).
+        // v0.13: будка idle в TSC-deadline-режиме — one-shot на границу
+        // CPU-периода: троттл-лист вернётся в готовность ТОЧНО в срок
+        // (v0.10 будил ближайший тик; периодический фолбэк — тик сам
+        // разбудит, взвод не нужен). После refill — граница свежая.
+        if crate::lapic::using_tsc_deadline() {
+            sched::arm_idle_deadline();
+        }
+        // v0.16: бит простоя — СТРОГО ДО проверки готовности: конкурентный
+        // enqueue на другом CPU либо (а) виден нашей проверке ниже, либо
+        // (б) уже после неё — тогда он видит УСТАНОВЛЕННЫЙ бит и будит
+        // нас точечным resched-IPI. Обратный порядок (проверка -> бит)
+        // открывал бы окно потерянного пробуждения: enqueue между ними
+        // не видел бы ни работы в нашей проверке, ни бита в своей.
+        sched::set_cpu_idle(cpu, true);
+        if sched::scheduler().has_ready() {
+            sched::set_cpu_idle(cpu, false);
+            sched::schedule_next(); // не возвращается
+        }
+        x86_64::instructions::interrupts::enable_and_hlt();
+        // Проснулись (дедлайн/тик/IPI): бит снять; цикл перепроверит
+        // refill/готовность сверху. Возврат из schedule_next сюда
+        // невозможен: он либо входит в поток (не возвращается), либо
+        // сам уходит в idle-цикл.
+        sched::set_cpu_idle(cpu, false);
     }
 }
 

@@ -50,12 +50,27 @@ use crate::capability::{
 };
 
 pub use scheduler::{BLOCK_QUEUE_NONE, BlockQueueId, CpuId, SchedulerError, SchedulerInterface};
-use thread::ThreadInner;
+use thread::{ThreadInner, ThreadObj};
 pub use thread::ThreadWait;
 pub use types::{
     TaskError, TaskId, TaskLimits, TaskPriority, TaskSecView, TaskState, TaskUsage, TaskView,
     ThreadId, ThreadView,
 };
+
+/// Исход склейки «поток -> домен-владелец -> хендл -> гейт» (одна
+/// read-секция, [`TcbManager::thread_gate_lookup`]). Различает все
+/// ошибки прежней пары `thread_task` + `caps.get`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadGateLookup {
+    /// Хендл разрешён в гейт: домен-владелец потока + объект гейта.
+    Gate { owner: TaskId, gate: crate::capability::ObjId },
+    /// Хендл жив, но это не Gate-capability.
+    NotGate,
+    /// Потока (или его домена) нет — ThreadNotFound-семантика.
+    NoThread,
+    /// Хендл битый (поколение/индекс) — InvalidHandle-семантика.
+    BadHandle,
+}
 
 /// Слотов на страницу таблицы задач (страница ~600 Б).
 const TASK_PAGE_SLOTS: usize = 8;
@@ -731,6 +746,48 @@ impl TcbManager {
     /// Количество хендлов задачи (аудит/тесты).
     pub fn cap_count(&self, task_id: &TaskId) -> Option<usize> {
         self.with_caps(task_id, |t| t.live_count())
+    }
+
+    /// Склейка «поток -> домен-владелец -> хендл -> гейт» в ОДНОЙ
+    /// read-секции менеджера (v0.16, hot path IPC_SEND/RECV/CALL: было
+    /// `thread_task` + `caps.get` = два захвата RW-лока — каждое атомарная
+    /// RMW по одной глобальной cacheline).
+    ///
+    /// Различает все исходы прежней пары вызовов (errno-совместимо):
+    /// [`ThreadGateLookup::NoThread`] = ThreadNotFound,
+    /// [`ThreadGateLookup::BadHandle`] = InvalidHandle,
+    /// [`ThreadGateLookup::NotGate`] = «capability не гейт».
+    pub fn thread_gate_lookup(
+        &self,
+        thread: &ThreadId,
+        handle: crate::capability::CapHandle,
+    ) -> ThreadGateLookup {
+        let inner = self.inner.read();
+        let Some(node) = thread::find_thread(&inner, thread) else {
+            return ThreadGateLookup::NoThread;
+        };
+        // SAFETY: только чтение под read-гардом.
+        let th: &ThreadObj = unsafe { &*UnsafeRef::into_raw(node) };
+        let owner = th.owner;
+        let Some(owner_node) = find_task(&inner, &owner) else {
+            return ThreadGateLookup::NoThread;
+        };
+        // SAFETY: только чтение под read-гардом.
+        let tcb: &TaskObj = unsafe { &*UnsafeRef::into_raw(owner_node) };
+        match tcb
+            .caps
+            .get(handle.idx(), handle.generation())
+            .map(|cte| cte.cap_ref_copy())
+        {
+            Some(crate::capability::ContainerACCCapability::Gate { gate_id }) => {
+                ThreadGateLookup::Gate {
+                    owner,
+                    gate: gate_id,
+                }
+            }
+            Some(_) => ThreadGateLookup::NotGate,
+            None => ThreadGateLookup::BadHandle,
+        }
     }
 
     /// Доступ к таблице хендлов задачи для чтения. `None` — задачи нет.

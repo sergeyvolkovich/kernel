@@ -93,6 +93,11 @@ pub(crate) struct ThreadObj {
 
     /// Причина ожидания (`None` — поток не блокирован ожиданием).
     pub(crate) wait: Option<ThreadWait>,
+    /// Advisory slice-end notification endpoint (v0.16): gate where the
+    /// scheduler backend delivers a best-effort signal when the thread's
+    /// time slice is nearing its end. `None` — the thread did not opt in
+    /// (API is optional by design; the scheduler never enforces a reply).
+    pub(crate) slice_warn_ep: Option<ObjId>,
     /// Доставленное сообщение (ждёт выгрузки в пользователя словами).
     pub(crate) mailbox: Option<Box<IpcMessage>>,
     /// Сообщение заблокированного отправителя (пока в send-очереди).
@@ -208,6 +213,7 @@ impl TcbManager {
                 entry,
                 stack_top,
                 wait: None,
+                slice_warn_ep: None,
                 mailbox: None,
                 blocked_msg: None,
                 parked: VecDeque::new(),
@@ -226,6 +232,15 @@ impl TcbManager {
         // SAFETY: узел не отдан наружу, реестр — единственный контейнер.
         let node_ref = unsafe { UnsafeRef::from_raw(node_ptr) };
         inner.threads.by_uuid.insert(node_ref);
+
+        // v0.16: seed the backend's per-thread scheduling state with the
+        // INITIAL priority BEFORE the enqueue hook, so the first EEVDF
+        // placement uses the real weight (the hook contract fires
+        // `on_priority_change` for later changes; creation is the one
+        // priority the backend would otherwise never see).
+        if let Some(s) = inner.scheduler {
+            let _ = s.on_priority_change(thread_id, priority);
+        }
 
         // Хук планировщика (отказ — полный откат создания потока).
         if let Some(s) = inner.scheduler {
@@ -458,6 +473,153 @@ impl TcbManager {
         Ok(())
     }
 
+    // ==== Merged IPC transactions (hot path: ONE write section) ====
+    //
+    // v0.16: the rendezvous paths used to take the manager's write lock
+    // 2-4 times per message ([pop waiter] -> [expect check] -> [claim] ->
+    // [deliver] -> [wake]); each acquisition is an atomic RMW on ONE
+    // global cacheline, so IPC-heavy workloads serialized on it. The
+    // merged transactions below fold the whole sequence into a single
+    // write section; the scheduler's block-queue ops (leaf-rank lock)
+    // are taken INSIDE the manager guard, same as `thread_set_state_locked`
+    // has always done — the rank order (TCB -> SCHED) is unchanged.
+
+    /// IPC rendezvous, receiver side (одна write-секция): pop the FIFO
+    /// waiter from the endpoint's recv-queue, verify it is really waiting
+    /// on this gate, claim it (`wait = None`, `syscall_ret = Some(0)`).
+    ///
+    /// `Ok(None)` — очередь пуста. `Err(ThreadWaitState)` — извлечённый
+    /// поток ждал не этот гейт (инвариант очередей; вызывающий отражает
+    /// это как `IpcError::Internal`).
+    pub(crate) fn claim_recv_waiter(
+        &self,
+        queue: BlockQueueId,
+        gate: ObjId,
+    ) -> Result<Option<ThreadId>, TaskError> {
+        let inner = self.inner.write();
+        let Some(s) = inner.scheduler else {
+            return Ok(None);
+        };
+        let Some(t) = sched_block_pop(s, queue)? else {
+            return Ok(None);
+        };
+        let node = find_thread(&inner, &t).ok_or(TaskError::ThreadNotFound(t))?;
+        // SAFETY: эксклюзивный доступ под write-гардом менеджера.
+        let th: &mut ThreadObj = unsafe { &mut *UnsafeRef::into_raw(node) };
+        if !matches!(&th.wait, Some(ThreadWait::RecvEndpoint { gate: g }) if *g == gate) {
+            return Err(TaskError::ThreadWaitState(t));
+        }
+        th.wait = None;
+        th.syscall_ret = Some(0);
+        Ok(Some(t))
+    }
+
+    /// IPC rendezvous, sender side (одна write-секция): pop the FIFO
+    /// waiter from the endpoint's send-queue, verify the gate, take its
+    /// parked `blocked_msg` and wait reason, materialize `syscall_ret`.
+    pub(crate) fn claim_send_waiter(
+        &self,
+        queue: BlockQueueId,
+        gate: ObjId,
+    ) -> Result<Option<(ThreadId, Box<IpcMessage>, Option<ThreadWait>)>, TaskError> {
+        let inner = self.inner.write();
+        let Some(s) = inner.scheduler else {
+            return Ok(None);
+        };
+        let Some(t) = sched_block_pop(s, queue)? else {
+            return Ok(None);
+        };
+        let node = find_thread(&inner, &t).ok_or(TaskError::ThreadNotFound(t))?;
+        // SAFETY: эксклюзивный доступ под write-гардом менеджера.
+        let th: &mut ThreadObj = unsafe { &mut *UnsafeRef::into_raw(node) };
+        if !matches!(&th.wait, Some(ThreadWait::SendEndpoint { gate: g, .. }) if *g == gate) {
+            return Err(TaskError::ThreadWaitState(t));
+        }
+        let msg = th.blocked_msg.take();
+        let wait = th.wait.take();
+        th.syscall_ret = Some(0);
+        match msg {
+            Some(m) => Ok(Some((t, m, wait))),
+            None => Err(TaskError::ThreadWaitState(t)),
+        }
+    }
+
+    /// IPC refill (одна write-секция): pop the FIFO sender whose message
+    /// takes the freed buffer slot — take `blocked_msg`, clear the wait,
+    /// materialize the return. The caller moves the message into the
+    /// endpoint buffer (capability-manager lock) and then transitions the
+    /// sender to `Ready`.
+    pub(crate) fn take_sender_for_refill(
+        &self,
+        queue: BlockQueueId,
+    ) -> Result<Option<(ThreadId, Box<IpcMessage>)>, TaskError> {
+        let inner = self.inner.write();
+        let Some(s) = inner.scheduler else {
+            return Ok(None);
+        };
+        let Some(t) = sched_block_pop(s, queue)? else {
+            return Ok(None);
+        };
+        let node = find_thread(&inner, &t).ok_or(TaskError::ThreadNotFound(t))?;
+        // SAFETY: эксклюзивный доступ под write-гардом менеджера.
+        let th: &mut ThreadObj = unsafe { &mut *UnsafeRef::into_raw(node) };
+        let msg = th.blocked_msg.take();
+        th.wait = None;
+        th.syscall_ret = Some(0);
+        match msg {
+            Some(m) => Ok(Some((t, m))),
+            None => Err(TaskError::ThreadWaitState(t)),
+        }
+    }
+
+    /// IPC delivery (одна write-секция): put the message into the
+    /// receiver's mailbox, clear the wait reason, materialize the return
+    /// value and — if the receiver was Blocked — transition it to Ready
+    /// (the scheduler enqueue hook fires inside the same section).
+    ///
+    /// Возврат — был ли поток разбужен (счётчики IPC).
+    /// `Err(ThreadNotFound)` — получатель исчез (kill-гонка).
+    pub(crate) fn deliver_mailbox_wake(
+        &self,
+        thread: &ThreadId,
+        msg: Box<IpcMessage>,
+    ) -> Result<bool, TaskError> {
+        let inner = self.inner.write();
+        let node = find_thread(&inner, thread).ok_or(TaskError::ThreadNotFound(*thread))?;
+        // SAFETY: эксклюзивный доступ под write-гардом менеджера.
+        let th: &mut ThreadObj = unsafe { &mut *UnsafeRef::into_raw(node) };
+        let was_blocked = th.state == TaskState::Blocked;
+        th.mailbox = Some(msg);
+        th.wait = None;
+        th.syscall_ret = Some(0);
+        if was_blocked {
+            // Переход Blocked -> Ready (+ enqueue-хук) — в ТОЙ ЖЕ секции
+            // (как recv_any_park: атомарность против встречных send'ов).
+            thread_set_state_locked(&inner, thread, TaskState::Ready)?;
+        }
+        Ok(was_blocked)
+    }
+
+    /// Register/clear the advisory slice-end notification gate of a
+    /// thread (THREAD_SET_SLICE_NOTIFY). No capability re-validation on
+    /// delivery — the holder keeps its Gate capability; a revoked gate
+    /// simply makes the best-effort delivery a no-op.
+    pub(crate) fn set_thread_slice_warn(
+        &self,
+        thread: &ThreadId,
+        gate: Option<ObjId>,
+    ) -> Result<(), TaskError> {
+        self.with_thread(thread, |t| t.slice_warn_ep = gate)
+            .ok_or(TaskError::ThreadNotFound(*thread))
+            .map(|_| ())
+    }
+
+    /// The registered slice-end notification gate of a thread (`None` —
+    /// not opted in). Called by the platform glue on the dispatch path.
+    pub fn thread_slice_warn_gate(&self, thread: &ThreadId) -> Option<ObjId> {
+        self.with_thread(thread, |t| t.slice_warn_ep).flatten()
+    }
+
     /// Доступ к объекту потока для изменения (IPC-подсистема: mailbox,
     /// wait, blocked_msg, parked). `None` — потока нет. Реентери — паника.
     pub(crate) fn with_thread<R>(
@@ -586,6 +748,7 @@ pub(crate) fn thread_set_state_locked(
         t.hdr.kill();
         // IPC-состояние потока гасится вместе с ним.
         t.wait = None;
+        t.slice_warn_ep = None;
         t.mailbox = None;
         t.blocked_msg = None;
         t.parked.clear();
@@ -607,6 +770,17 @@ pub(crate) fn thread_set_state_locked(
 }
 
 // ==== Служебные ====
+
+/// Pop the FIFO waiter from a scheduler block queue (merged IPC
+/// transactions run this INSIDE the manager's write guard — leaf-rank
+/// SCHED lock under TCB, same order as `thread_set_state_locked`).
+#[inline]
+fn sched_block_pop(
+    s: &dyn crate::task::scheduler::SchedulerInterface,
+    queue: BlockQueueId,
+) -> Result<Option<ThreadId>, TaskError> {
+    s.block_pop_front(queue).map_err(TaskError::Scheduler)
+}
 
 /// Поиск ThreadObj по Uuid (редкий путь — дерево). Возвращает невладеющую
 /// ссылку: валидность гарантируется менеджером (узел жив, пока в реестре).

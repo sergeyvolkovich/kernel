@@ -172,6 +172,13 @@ impl Cte {
             cap_ref: self.cap_ref.clone(),
         }
     }
+
+    /// Копия стабильного имени цели (v0.16: объединённый lookup
+    /// «поток -> владелец -> хендл -> гейт» в одной read-секции
+    /// менеджера задач — см. `TcbManager::thread_gate_lookup`).
+    pub(crate) fn cap_ref_copy(&self) -> ContainerACCCapability {
+        self.cap_ref.clone()
+    }
 }
 
 // ==== Объекты ядра: гейт и линия прерываний ====

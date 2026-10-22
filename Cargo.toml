@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/boot_info",
     "crates/bootcfg",
+    "crates/eevdf",
     "crates/kernel",
     "crates/kernel-hal",
     "crates/arch",
@@ -27,6 +28,7 @@ members = [
 default-members = [
     "crates/boot_info",
     "crates/bootcfg",
+    "crates/eevdf",
     "crates/kernel",
     "crates/kernel-hal",
     "crates/arch",
@@ -43,6 +45,7 @@ pkg_generic_interface = { path = "crates/kernel" }
 kernel_hal = { path = "crates/kernel-hal", package = "kernel-hal" }
 boot_info = { path = "crates/boot_info" }
 bootcfg = { path = "crates/bootcfg" }
+eevdf = { path = "crates/eevdf" }
 arch = { path = "crates/arch" }
 backend = { path = "crates/backend" }
 

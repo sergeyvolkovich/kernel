@@ -315,6 +315,14 @@ fn ipi_to(lapic: u32, cmd: u32) -> bool {
     true
 }
 
+/// Точечный resched-IPI конкретному CPU (v0.16: побудка idle/laggard —
+/// вместо broadcast-на-каждый-enqueue; см. sched::kick_cpus_after_ready).
+pub fn send_ipi_to(lapic_id: u32, vec: u8) {
+    if !ipi_to(lapic_id, vec as u32) {
+        crate::smp::mark(b'x'); // ICR busy — IPI потерян (редкий отказ)
+    }
+}
+
 /// INIT-SIPI-SIPI (запуск AP; классика Intel SDM 8.4.3): INIT-assert,
 /// 10 мс, SIPI вектор, 200 мкс, повторный SIPI (для надёжности на
 /// старом железе; QEMU хватает одного, второй безвреден).
