@@ -381,7 +381,7 @@ override, тип 2 — базовое; ISO-флаги полярности/тр�
 IF-дисциплину: спины на глубине 0 — с IF=1, вложение внешних линий
 ограничено одним уровнем.
 
-**acpid** (юзерспейс, крейт `crates/acpid`): acpi::Handler поверх
+**acpid** (юзерспейс, крейт `crates/user/acpid (удалён апстримом)`): acpi::Handler поверх
 MMIO_MAP (refcount-кэш перекрывающихся снапшотов) и IOP_IN/OUT;
 namespace-walk (_HID/_CID/_UID/_ADR/_STA/_CRS), FADT (PM1a_EVT/CNT,
 SCI), `\_S5_`; кнопка питания — SCI (GSI 9) через IRQ_ATTACH +

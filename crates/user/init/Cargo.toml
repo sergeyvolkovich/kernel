@@ -1,0 +1,13 @@
+[package]
+name = "init"
+version.workspace = true
+edition.workspace = true
+description = "First user server (boot-chain smoke test, v0.20): receives start-IPC (argc/argv + boot_state), prints configuration, runs a two-thread IPC ping-pong across gates (exercises EEVDF wake/preempt and idle-IPI paths on SMP), exits via TASK_EXIT(0)"
+
+[[bin]]
+name = "init"
+path = "src/main.rs"
+
+[dependencies]
+# rlib-поверхность userlib: _start (стартовый IPC -> main) + l4_* ABI.
+userlib = { path = "../userlib" }

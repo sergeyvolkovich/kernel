@@ -1,8 +1,0 @@
-[package]
-name = "arch"
-version.workspace = true
-edition.workspace = true
-description = "x86_64 architectural primitives: COM1 serial, GS-based per-CPU, boot/SIPI ABI constants (no policy, thin ISA mechanics)"
-
-[dependencies]
-x86_64 = { workspace = true }

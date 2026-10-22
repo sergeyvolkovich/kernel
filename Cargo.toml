@@ -1,19 +1,30 @@
 [workspace]
 resolver = "2"
+# Структура «по признакам» (v0.20): каждый каталог — один слой
+# ответственности, внутри — крейты этого слоя.
+#   core/     — архитектурно-нейтральное ядро: политика и алгоритмы
+#   hal/      — контракты платформы (трейты HAL), без зависимостей
+#   platform/ — конкретная платформа x86_64: ISA-примитивы (arch_x86)
+#               и машинная реализация контрактов (backend)
+#   boot/     — загрузочная цепочка: форматы (boot_info/bootcfg) + прошивка
+#   startup/  — композиционный корень: arch-независимая последовательность
+#               запуска над трейтом Platform (реализация — platform/)
+#   user/     — юзерспейс: userlib, init (первый сервер), rogue, pie
 members = [
-    "crates/boot_info",
-    "crates/bootcfg",
-    "crates/eevdf",
-    "crates/sched_lb",
-    "crates/kernel",
-    "crates/kernel-hal",
-    "crates/arch",
-    "crates/backend",
+    "crates/core/kernel",
+    "crates/core/eevdf",
+    "crates/core/sched_lb",
+    "crates/hal/kernel-hal",
+    "crates/platform/arch_x86",
+    "crates/platform/backend",
+    "crates/boot/boot_info",
+    "crates/boot/bootcfg",
+    "crates/boot/uefi_stub",
     "crates/startup",
-    "crates/uefi_stub",
-    "crates/userlib",
-    "crates/rogue",
-    "crates/pie",
+    "crates/user/userlib",
+    "crates/user/init",
+    "crates/user/rogue",
+    "crates/user/pie",
 ]
 
 # Хост-сборка (cargo build / cargo test без --target) — только
@@ -27,14 +38,14 @@ members = [
 # рантайм падает до входа в тесты. startup проверяется сборкой
 # образа (build_image.sh) и будущими интеграционными тестами.
 default-members = [
-    "crates/boot_info",
-    "crates/bootcfg",
-    "crates/eevdf",
-    "crates/sched_lb",
-    "crates/kernel",
-    "crates/kernel-hal",
-    "crates/arch",
-    "crates/pie",
+    "crates/core/kernel",
+    "crates/core/eevdf",
+    "crates/core/sched_lb",
+    "crates/hal/kernel-hal",
+    "crates/boot/boot_info",
+    "crates/boot/bootcfg",
+    "crates/platform/arch_x86",
+    "crates/user/pie",
 ]
 
 # Общие настройки зависимостей для крейтов платформы.
@@ -43,14 +54,14 @@ version = "0.5.0"
 edition = "2024"
 
 [workspace.dependencies]
-pkg_generic_interface = { path = "crates/kernel" }
-kernel_hal = { path = "crates/kernel-hal", package = "kernel-hal" }
-boot_info = { path = "crates/boot_info" }
-bootcfg = { path = "crates/bootcfg" }
-eevdf = { path = "crates/eevdf" }
-sched_lb = { path = "crates/sched_lb" }
-arch = { path = "crates/arch" }
-backend = { path = "crates/backend" }
+pkg_generic_interface = { path = "crates/core/kernel" }
+kernel_hal = { path = "crates/hal/kernel-hal", package = "kernel-hal" }
+boot_info = { path = "crates/boot/boot_info" }
+bootcfg = { path = "crates/boot/bootcfg" }
+eevdf = { path = "crates/core/eevdf" }
+sched_lb = { path = "crates/core/sched_lb" }
+arch_x86 = { path = "crates/platform/arch_x86" }
+backend = { path = "crates/platform/backend" }
 
 # Готовые крейты «по краям» (прошивка/форматы/железо): политика ядра — наша.
 # xmas-elf: zero-copy ELF64 (загрузчик init в startup).

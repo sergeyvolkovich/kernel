@@ -9,7 +9,7 @@
 Руководство по написанию пользовательских программ для rust-l4: стартовый
 протокол L4, полный syscall-интерфейс, библиотека interop `userlib`
 (C-ABI: `_start` + `l4_*`), сборка и загрузка через `boot_cfg.xml`.
-Референсы: `crates/init` (Rust-сервер) и `examples/capp.c` (C-сервер).
+Референсы: `crates/user/init` (Rust-сервер) и `examples/capp.c` (C-сервер).
 
 Оглавление:
 
@@ -56,7 +56,7 @@ OVMF -> uefi_stub (BOOTX64.EFI, ядро встроено)
 
 - **Статические ELF по фиксированным адресам** — для сервера [0]
   (загрузочная цепочка; юзерский линк-базис `0x40000000`, линк-скрипт
-  `crates/init/init.ld`, entry `_start`); BSS обнуляет ядро. Для
+  `crates/user/init/init.ld`, entry `_start`); BSS обнуляет ядро. Для
   доменов, спавниемых через TASK_SPAWN_IMAGE, с v0.11 поддержаны
   PIE-образы (ET_DYN + R_X86_64_RELATIVE, крейт `pie`) — релокации
   накатывает родитель (раздел 10.6).
@@ -229,9 +229,9 @@ CAP_INFO слова 4..5 = [base, len|count]). Перечисление ACPI/AML
 
 ## 4. userlib: C-интероп (`l4_*` / `_start`)
 
-`crates/userlib` — статическая C-библиотека (staticlib, сборка под
+`crates/user/userlib` — статическая C-библиотека (staticlib, сборка под
 `x86_64-unknown-none`): экспортирует точку входа `_start` и обёртки
-всей syscall-таблицы с префиксом `l4_`. Заголовок: `crates/userlib/
+всей syscall-таблицы с префиксом `l4_`. Заголовок: `crates/user/userlib/
 include/l4.h`. Линкуется в прикладной образ без libc.
 
 Состав:
@@ -252,8 +252,8 @@ include/l4.h`. Линкуется в прикладной образ без libc
 
 ```bash
 gcc -O2 -Wall -Wextra -ffreestanding -fno-stack-protector -fno-pie \
-    -I crates/userlib/include -c app.c -o app.o
-gcc -nostdlib -static -no-pie -Wl,-T,crates/init/init.ld \
+    -I crates/user/userlib/include -c app.c -o app.o
+gcc -nostdlib -static -no-pie -Wl,-T,crates/user/init/init.ld \
     -Wl,--build-id=none -o app app.o \
     target/x86_64-unknown-none/release/libuserlib.a
 ```
@@ -279,8 +279,10 @@ FPU между потоками не переключается; сегмент�
 
 ## 5. Сервер на C: пример capp
 
-`examples/capp.c` — полный референс (собирается scripts/build.sh,
-грузится `scripts/boot_cfg_c.xml`). Скелет:
+`examples/capp.c` — полный референс C-ABI. В `build_image.sh` он не
+входит (образ собирает только init): соберите вручную по рецепту
+раздела 4, положите в ESP как `capp.elf` и подмените конфиг
+(`scripts/boot_cfg_c.xml` — референс). Скелет:
 
 ```c
 #include "l4.h"
@@ -318,7 +320,7 @@ int main(int argc, char **argv)
 
 ## 6. Сервер на Rust: пример init
 
-`crates/init` — эталон без userlib (сырые сисколы, `#[no_main]`,
+`crates/user/init` — эталон без userlib (сырые сисколы, `#[no_main]`,
 свой `_start`). Скелет:
 
 ```rust
@@ -341,11 +343,11 @@ userlib: он снимает бойлерплейт протокола и оди
 
 ## 7. Сборка и загрузка (build.sh / boot_cfg.xml)
 
-Сборка всей цепочки (ядро+init+userlib+capp+ESP-образ):
+Сборка всей цепочки (ядро → init → заглушка → ESP-образ):
 
 ```bash
-bash scripts/build.sh                  # ESP с boot_cfg.xml (init)
-BOOT_CFG=scripts/boot_cfg_c.xml bash scripts/build.sh   # capp первым
+bash scripts/build_image.sh           # boot/esp.img (boot_cfg.xml, init)
+bash scripts/build.sh                 # то же + kernel.sym/kernel.bin
 ```
 
 Формат `boot_cfg.xml` (первый сервер = сервер [0], его стартует ядро;
@@ -354,8 +356,9 @@ BOOT_CFG=scripts/boot_cfg_c.xml bash scripts/build.sh   # capp первым
 ```xml
 <boot cmdline="arch=x86_64 console=com1 meltdown=allow">
   <servers>
-    <server name="init" path="init">
-      <arg>--demo</arg>
+    <server name="init" path="init.elf">
+      <arg>stage=boot-chain</arg>
+      <arg>log=full</arg>
     </server>
     <server name="fs" path="servers/fs.elf"/>   <!-- грузится модулем -->
   </servers>
@@ -509,7 +512,7 @@ TASK_SPAWN_IMAGE (0x1F). ABI:
 потока (как kinit для init). Отказ любого шага — полный откат
 домена.
 
-Референс спавн-сервера — crates/init/src/main.rs (S4): парсер ELF64
+Референс спавн-сервера — crates/user/init/src/main.rs (S4): парсер ELF64
 (~60 строк, без библиотек), стейджинг, дескриптор, вызов.
 
 Низкоуровневый путь (если нужен полный контроль): TASK_CREATE
@@ -557,7 +560,7 @@ TASK_SET_EXIT_EP(gate) регистрирует endpoint ДОБРОВОЛЬНО;
 CPU-вердикт песочницы без гонок с reaper'ом), 2 = Exception
 (фолт), 3 = Killed (кем).
 
-### 10.4 Демо-сценарий «rogue» (crates/rogue)
+### 10.4 Демо-сценарий «rogue» (crates/user/rogue)
 
 Полный сценарий из требований: init создаёт дочернюю задачу из
 юзерспейса (ELF вшит байтами в исходник), открывает порты и

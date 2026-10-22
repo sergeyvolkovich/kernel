@@ -111,40 +111,57 @@ arch + x86_64 (крейты)            механика ISA: per-CPU (GS), COM1
 
 ## Состав репозитория
 
+Структура «по признакам» (v0.20): каждый каталог — один слой
+ответственности; внутри — крейты этого слоя.
+
 ```
 crates/
-  boot_info/    ABI страница BootInfo (заглушка -> ядро): память, модули, RSDP
-  bootcfg/      mini-XML парсер boot_cfg.xml (+ host-тесты)
-  kernel-hal/   HAL-КОНТРАКТЫ (v0.15): типы (PhysAddr, Bdf, DevicePath)
-                + трейты ASID/KMAP/MMAP/DMA/IOMMU/IRQ/IOPORT — не зависит
-                ни от одного крейта workspace (изоляция архитектуры)
-  kernel/       ядро-крейт pkg_generic_interface: GCTL, менеджеры,
-                сисколы, sync-примитивы + IrqRouter (hal = re-export
-                kernel-hal); 136 host-тестов
-  arch/         механика x86_64: per-CPU (GS), COM1 16550, константы ABI
-  backend/      платформенный крейт: гейт, планировщик, SMP, LAPIC/IOAPIC,
-                память, VT-d (vtd.rs), AMD-Vi (amd.rs), IOMMU-агрегатор;
-                реализует контракты kernel-hal (единственное место
-                экспозиции архитектуры)
-  startup/      kinit: политика запуска (Platform/KernelGlue), elfload, пулы
-  uefi_stub/    BOOTX64.EFI: boot_cfg, модули, ExitBootServices, прыжок в ядро
-  init/         первый сервер (Rust, сырые сисколы): топология, IOMMU smoke,
-                SMP-стресс, песочница (спавн rogue + вердикт), спавн acpid
-                (IoResource-гранты + argv-транзит rsdp=; Irq-грант acpid —
-                суженный 9..10 через CAP_MINT_RANGE, v0.15)
-  rogue/        дочерний образ песочницы (static-PIE, ET_DYN + RELA)
-  acpid/        ACPI-менеджер ЮЗЕРСПЕЙСА (v0.14, static-PIE): AML-
-                интерпретатор (крейт acpi) вне ядра, namespace-walk,
-                кнопка питания (SCI) и выключение ПК (S5, PM1a_CNT)
-  pie/          юзерспейс-парсер PIE-образов: PT_LOAD W^X, R_X86_64_RELATIVE
-  userlib/      C-ABI: _start + l4_* (статическая бибилиотека, заголовок l4.h;
-                l4_cap_mint_range — v0.15)
-scripts/        build.sh (полная цепочка), run_qemu.sh (OVMF+q35),
-                fetch_qemu.sh (user-space префикс QEMU/OVMF/mtools), esp_mbr.py
+  core/                    архитектурно-НЕЙТРАЛЬНОЕ ядро (политика):
+    kernel/                pkg_generic_interface: GCTL, менеджеры, сисколы,
+                           sync-примитивы + IrqRouter (hal = re-export
+                           kernel-hal); 136+ host-тестов
+    eevdf/                 политика EEVDF (vruntime/веса, eligibility,
+                           lag-clamp, pressure, миграционные хуки)
+    sched_lb/              политика pull-балансировки: витрина офферов
+                           (word-протокол gen|thief|state), admission,
+                           скоринг, гистерезис, kick-решения
+  hal/
+    kernel-hal/            HAL-КОНТРАКТЫ (v0.15): типы (PhysAddr, Bdf,
+                           DevicePath) + трейты ASID/KMAP/MMAP/DMA/IOMMU/
+                           IRQ/IOPORT/CPU — не зависит ни от одного крейта
+                           workspace (изоляция архитектуры)
+  platform/                конкретная платформа x86_64:
+    arch_x86/              механика ISA: per-CPU (GS), COM1 16550,
+                           константы загрузочного ABI
+    backend/               машинная реализация контрактов kernel-hal
+                           (единственное место экспозиции архитектуры):
+                           гейт, планировщик (per-CPU EEVDF + pull-LB),
+                           SMP, LAPIC/IOAPIC, топология SMT/LLC/NUMA,
+                           perf-счётчики (IPC/cap), память, VT-d (vtd.rs),
+                           AMD-Vi (amd.rs), IOMMU-агрегатор
+  boot/                    загрузочная цепочка (форматы + прошивка):
+    boot_info/             ABI-страница BootInfo (заглушка -> ядро):
+                           память, модули, RSDP
+    bootcfg/               mini-XML парсер boot_cfg.xml (+ host-тесты)
+    uefi_stub/             BOOTX64.EFI: boot_cfg, модули,
+                           ExitBootServices, прыжок в ядро
+  startup/                 kinit: композиционный корень (arch-независимая
+                           политика запуска над трейтом Platform, реализация
+                           — platform/backend), elfload, пулы
+  user/                    юзерспейс:
+    userlib/               C-ABI: _start + l4_* (статическая библиотека,
+                           заголовок l4.h)
+    init/                  первый сервер (v0.20, boot-chain smoke):
+                           стартовое IPC, ping-pong двух потоков через
+                           гейты, TASK_EXIT
+    rogue/                 дочерний образ песочницы (static-PIE, ET_DYN+RELA)
+    pie/                   юзерспейс-парсер PIE-образов: PT_LOAD W^X,
+                           R_X86_64_RELATIVE
+scripts/        build_image.sh (полная цепочка: kernel -> init -> заглушка ->
+                ESP), build.sh (то же + отладочные артефакты),
+                run_qemu.sh (OVMF+q35), fetch_qemu.sh (user-space префикс
+                QEMU/OVMF/mtools), esp_mbr.py
 boot/           эталонный boot_cfg.xml
-examples/       capp.c — сервер на чистом C
-docs/           документация (см. ниже)
-CHANGES.md      история версий v0.6..v0.15 (подробно)
 ```
 
 ## Требования

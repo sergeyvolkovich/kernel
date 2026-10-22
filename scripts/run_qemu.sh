@@ -65,14 +65,14 @@ esac
 # проблемы нет.
 exec timeout -k 5 "$TIMEOUT" "$QEMU_USR/usr/bin/qemu-system-x86_64" \
   -accel tcg,thread=single \
-  -L "$QEMU_USR/usr/share/seabios" \
+  -L "$QEMU_USR/usr/share/qemu" -L "$QEMU_USR/usr/share/seabios" \
   -m ${RAM}M \
   -cpu ${QEMU_CPU:-Cascadelake-Server} \
   -smp ${SMP} \
   "${EXTRA_ARGS[@]}" \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
   -drive if=pflash,format=raw,file="$WS/boot/OVMF_VARS.fd" \
-  -drive format=raw,file="$WS/target/esp.img" \
+  -drive format=raw,file="$WS/boot/esp.img" \
   -serial stdio \
   -display none \
   -no-reboot \

@@ -1,4 +1,6 @@
-# Сборочные артефакты (scripts/build.sh, scripts/run_qemu.sh)
+# Сборочные артефакты (scripts/build_image.sh, scripts/run_qemu.sh)
 /target/
-crates/uefi_stub/kernel.bin
+crates/boot/uefi_stub/kernel.bin
 boot/OVMF_VARS.fd
+boot/esp.img
+boot/esp_fs.img

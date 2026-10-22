@@ -1,5 +1,121 @@
 # rust-l4: изменения по версиям (workspace)
 
+# v0.20 — IPI-kick idle-ядер + структура «по признакам» + boot-chain smoke (QEMU)
+
+> Три запроса одной линией: (1) publisher-side IPI-kick — при жёстком
+> давлении/живой витрине и отсутствии активных разгрузчиков перегруженное
+> ядро будит idle-ядро IPI, чтобы pull случился немедленно, а не на
+> будущем тике; (2) репозиторий перекомпонован «по признакам»:
+> core/ (политика) — hal/ (контракты) — platform/ (x86_64: arch_x86 +
+> backend) — boot/ — user/, `arch` переименован в `arch_x86`;
+> (3) после апстрим-зачистки демо-серверов заново создан минимальный
+> `init` (модуль [0]) и построен полный smoke-прогон в QEMU (OVMF,
+> TCG single-thread, SMP=2) до маркера «all user threads gone».
+
+### Сделано
+
+**IPI-kick (архитектурное разделение решение/транспорт):**
+- kernel-hal: новый контракт `IdleWakeInterface` (traits/cpu.rs):
+  `idle_wake_class(cpu)` (монотонная по цене пробуждения: 0 = ядро
+  исполняется, 1 = C1/hlt-парковка, глубже — с mwait-эскалацией) +
+  `kick_cpu(cpu)` (транспорт заархитектурён: IPI/SGI). Политика
+  видит ТОЛЬКО контракт — порт на другую ISA не трогает sched_lb.
+- sched_lb (политика, host-тесты): `KickView` (pressure, idle-маска,
+  флаг active-relief, счётчик опубликованных офферов) +
+  `kick_idle_needed` — два режима огня: hard starvation
+  (pressure ≥ PRESSURE_HARD_Q8) и live shelf (устойчивый оверлоад +
+  офферы реально на витрине; без кика витрина просто лежит — idle
+  спит в hlt, а каждый активный уже past steal-epsilon); оба требуют
+  «нет активного разгрузчика» и наличия idle-цели. `select_kick_target`
+  ранжирует цели: класс пробуждения → топологический тир относительно
+  publisher'а (SMT → LLC → прочие) → недавность сна (тёплые кэши =
+  мельче резиденция). +6 юнит-тестов (границы порогов, режимы,
+  выбор цели по классам/тирам).
+- backend (транспорт x86_64): `IdleWakeX86` — единственная реализация
+  контракта: класс = idle-бит планировщика (hlt = C1), кик =
+  LAPIC resched-IPI (`ipi_resched`). Интеграция в `on_preempt`:
+  после republish витрины собирает KickView (online/idle-маски,
+  active-relief = есть активный недогруженный сосед) и при решении
+  политики кикает выбранную цель.
+
+**Структура «по признакам» (v0.20, git-mv — история сохранена):**
+```
+core/     kernel, eevdf, sched_lb      — политика, арх-нейтрально
+hal/      kernel-hal                   — контракты, ноль зависимостей
+platform/ arch_x86 (бывш. arch), backend — ISA + машинная реализация
+boot/     boot_info, bootcfg, uefi_stub — форматы + прошивка
+user/     userlib, init (НОВЫЙ), rogue, pie
+```
+- `arch` → `platform/arch_x86` (имя пакета `arch_x86`): все `use`
+  обновлены; default-members = переносимые библиотеки (host `cargo
+  test` без --target), образы собирает build_image.sh явно.
+- НОВЫЙ `crates/user/init` (335 стр): стартовое IPC → SELF_INFO →
+  IPC ping-pong двух потоков через пару гейтов (200 раундов;
+  упражняет парковку/пробуждение = resched-IPI в hlt) → фаза
+  переподписки 3:1 (спин 3 готовых потоков на одном CPU —
+  pressure → витрина → кража/миграция) → THREAD_TERMINATE воркеров
+  → TASK_EXIT(0). Ядро печатает «all user threads gone — halting».
+
+**QEMU-инфраструктура:**
+- `scripts/fetch_qemu.sh/.py` — user-space префикс QEMU 10.0 + OVMF
+  4M + mtools (БЕЗ root: dpkg -x в tools/qemu-usr).
+- `scripts/build_image.sh` — единая точка правды образа:
+  kernel → init → встраивание в заглушку → uefi_stub → ESP (FAT16
+  + MBR через `scripts/esp_mbr.py`). `scripts/build.sh` теперь
+  только добавляет отладочные артефакты (kernel.sym/kernel.bin).
+- `scripts/smoke.sh` — полный прогон: пересборка, QEMU (OVMF, TCG
+  single-thread — MTTCG теряет IPI остановленному vCPU), пулл serial
+  до маркера успеха/беды, досрочное гашение.
+
+### Числа
+
+- 237 host-тестов зелёные (kernel 143, eevdf 23, sched_lb 21,
+  backend 24, bootcfg 5, boot_info 9, kernel-hal 2+2 host-hooks,
+  arch_x86 8) + образ собирается чисто (kernel/init/uefi_stub).
+- Smoke-прогон SMP=2: ping-pong 200 раундов, переподписка 3:1 —
+  в serial видны `lb: cpu0 OVERLOAD p=111` → `lb: cpu0 kick cpu1`
+  → steal-путь → «all user threads gone» (result: ok).
+
+# v0.19 — LB без кучи: топология SMT/LLC/NUMA + perf-классы CPU
+
+> Три улучшения балансировщика: (1) НИ ОДНОЙ аллокации под SCHED-
+> локами (HOME — slab-hash 1024 слота, инбоксы — lock-free MPMC
+  кольца, per-CPU SCRATCH-буферы); (2) честная топология из CPUID
+  0xB + leaf 4 + SRAT/MADT с независимой деградацией источников;
+  (3) perf-классы CPU (RDPMC fixed-счётчики с self-validation,
+  TSC-fallback для TCG) → speedup_q8 в сущности EEVDF, admission и
+  скоринг против измеренной производительности, ΔE с same-LLC.
+
+# v0.18 — pull-балансировка: витрина офферов + кража (per-CPU очереди)
+
+> Демонтаж глобальной EEVDF-очереди: per-CPU run-очереди + home-cpu
+> прилипание; перегруженные ПУБЛИКУЮТ жертв на витрину (word-протокол
+> gen:32|thief:8|state:2, payload только после успешного CAS-claim),
+> недогруженные ТЯНУТ (steal по триггерам idle-входа/периодика/кик,
+> вариант A try_lock + вариант B REQ→HANDOFF с таймаутом). Admission
+> Q8 с асимметрией, скоринг urgency/fit/ΔE/migcost, кулдауны и
+> backoff, гистерезис hi/lo. Инвариант: SCHED-локи никогда не
+> вкладываются и не берут KMEM.
+
+# v0.17 — TLS + футеки + MEM_PROTECT (архитектура не утекает в ABI)
+
+> `THREAD_SET_TLS` (0x91): непрозрачное слово в TCB, загрузка
+> MSR_FS_BASE только в `finalize_and_enter` (единственная точка
+> входа в пользователя). Футеки (0x3B/0x3C): ключ = ФИЗИЧЕСКИЙ адрес
+> (кросс-доменные футеки = разделяемые кадры SHM), recheck после
+> парка против lost-wake. `MEM_PROTECT` (0x56): in-place PTE-флаги +
+> TLB-инвалидация, W^X действует. ARM-порт = смена одной точки
+> (load_thread_pointer).
+
+# v0.16 — EEVDF вместо FIFO: пропорциональная справедливость + preempt-хинты
+
+> Крейт `eevdf` (политика, 23 host-теста): vruntime с весами
+> nice-таблицы, avg_vruntime eligibility, виртуальные дедлайны,
+> lag-clamp 2 слайса, throttle-флаги в сущности (O(1) вместо O(n)
+> скана). Троттлинг-лист без скана, slice-notify (0x90) с two-phase
+> arming, объединённые транзакции TCB в IPC (2-4 захвата лока → 1),
+> IPI-шторм enqueue → unicast idle + urgent по дедлайнам.
+
 # v0.15 — kernel-hal: контракты в отдельном крейте + сужение поддиапазонов IoResource (CAP_MINT_RANGE)
 
 > Завершение запроса «экспозиция архитектуры не проникает между
