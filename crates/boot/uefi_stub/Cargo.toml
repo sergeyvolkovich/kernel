@@ -8,6 +8,7 @@ description = "UEFI boot stub (kernel.efi): reads ./boot_cfg.xml next to the ima
 uefi = { workspace = true, features = ["alloc", "global_allocator"] }
 boot_info = { workspace = true }
 bootcfg = { workspace = true }
+font8x8 = { workspace = true }
 
 [[bin]]
 name = "uefi_stub"

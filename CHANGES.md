@@ -1,5 +1,79 @@
 # rust-l4: изменения по версиям (workspace)
 
+# v0.21 — boot_cfg.xml v2: пейлоады + графическое меню + chainload + cfgtool
+
+> Заглушка становится мини boot-менеджером: конфигурация — СПИСОК
+> пейлоадов (своя цепочка rust-l4 ИЛИ chainload стороннего EFI-образа —
+> Windows bootmgfw / GRUB / произвольный .efi), выбор — графическим
+> меню (GOP, шрифт font8x8, обратный отсчёт до default; headless-режим —
+> то же меню по serial: j/k/цифры/Enter). Редактирование конфигурации —
+> host-тул cfgtool (крейт в новой группе misc/, полноценный std), гоняющий
+> конфиг через ТОТ ЖЕ крейт bootcfg, что и заглушка. Старый формат
+> (одиночный `<boot>` с серверами) парсится наравне — без правки.
+
+### Сделано
+
+- `bootcfg` v2: модель `BootConfig { timeout_s, default_id, payloads }`,
+  `Payload { id, title, kind: RustL4|EfiChainload, path, cmdline,
+  servers, state }`; машина контекста парсера объединяет v2-`<payload>`
+  и легаси-`<boot>` (один код детей); семантическая `validate()`
+  (уникальность id, default существует, init обязателен, boot_state в
+  пределах протокола); сериализация `to_xml()` (канонический вид,
+  экранирование сущностей); `menu::MenuModel` — чистая модель навигации
+  (Up/Down wrap, Digit 1..9, Enter/Esc) с host-тестами. +13 тестов.
+- `uefi_stub/menu.rs`: рендер в линейный кадр GOP (Bgr8888/Rgb8888/
+  Bitmask с байтовыровненными каналами; BltOnly/нет GOP → serial-режим),
+  шрифт font8x8 public domain (LSB=левый столбец, масштаб x2/x3), палитра
+  «холодная сталь»; ввод: UEFI ConIn (стрелки/Enter/Esc/цифры) + COM1
+  поллингом (j/k, цифры, CR/LF); таймаут: отсчёт до default, любая
+  распознанная клавиша снимает; меню дублируется в serial (headless).
+- `uefi_stub/chainload.rs`: LoadImage по ПОЛНОМУ device path (том ESP
+  через LoadedImage.device → DevicePath → locate_device_path(SFS) +
+  самодельный узел MEDIA_FILE_PATH UCS-2 + END) + StartImage — образ-ребёнок
+  видит свой путь (BCD/prefix находятся сами); BootPolicy::ExactMatch;
+  возврат из образа/ошибка — назад в меню, после chainload отсчёт
+  отключается (неудачный default не пинг-понгует машину).
+- `uefi_stub/main.rs`: поток = parse → validate → выбор (единственный
+  пейлоад/timeout=0 → сразу; иначе меню) → ветвление rust-l4 (прежняя
+  цепочка вынесена в `boot_rust_l4(payload)`) / efi (chainload, цикл).
+- `misc/cfgtool` (НОВЫЙ, std): show/validate/init/default/timeout/
+  add efi|rust/remove/set/arg add|rm|clear/state set|rm; атомарная
+  запись (tmp+rename), отказ записи невалидной конфигурации, type-гарды
+  полей (path только efi, cmdline только rust-l4), идемпотентный
+  канонический формат. +11 тестов.
+- Конфиги: `boot/boot_cfg.xml` и `scripts/boot_cfg*.xml` переведены на
+  v2 (пейлоад rust-l4; smoke-конфиг — timeout 2, меню с единственным
+  пейлоадом пропускается).
+- Workspace: группа `crates/misc/` (host-инструменты std); cfgtool в
+  members И default-members (его тесты бегут в общем `cargo test`).
+
+### Почему так
+
+- Chainload обязательно по device path (а не LoadImage из буфера):
+  загрузчики находят свои данные (BCD, grub prefix) по СОБСТВЕННОМУ
+  device path — буфер оставил бы их без пути.
+- Модель/валидация/сериализация живут в no_std-крейте bootcfg, а не в
+  тулзе: один источник правды для прошивки и хоста, тесты модели —
+  обычные host-тесты.
+- Легаси-<boot> поддерживается наравне: конфиги v0.x грузятся без
+  правки (машина контекста просто заворачивает корень в неявный пейлоад).
+- После возврата из chainload меню не заводит отсчёт заново: сбойный
+  default (нет файла/битый PE) не должен циклически перезапускать себя.
+
+### Проверено
+
+- cargo test (default-members, host): 235 PASSED, 0 failed
+  (база v0.20 211 + bootcfg v2 22 [было 9] + cfgtool 11).
+- Сборка образов: kernel ELF + init + uefi_stub.efi — чисто; clippy —
+  паритет с базой; rustfmt — без дрейфа.
+- QEMU smoke (OVMF, SMP=2): конфиг v2, единственный пейлоад → без меню,
+  цепочка до «all user threads gone» — OK.
+- QEMU chainload: конфиг с 2 пейлоадами (rust-l4 default + efi-копия
+  самой заглушки): по serial-цифре заглушка грузит копию через
+  LoadImage/StartImage, копия печатает баннер, грузит default —
+  рекурсивная цепочка работает; таймаут меню и пауза по клавише видны
+  в serial.
+
 # v0.20 — IPI-kick idle-ядер + структура «по признакам» + boot-chain smoke (QEMU)
 
 > Три запроса одной линией: (1) publisher-side IPI-kick — при жёстком

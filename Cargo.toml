@@ -10,6 +10,7 @@ resolver = "2"
 #   startup/  — композиционный корень: arch-независимая последовательность
 #               запуска над трейтом Platform (реализация — platform/)
 #   user/     — юзерспейс: userlib, init (первый сервер), rogue, pie
+#   misc/     — host-инструменты (std): cfgtool и прочие утилиты разработки
 members = [
     "crates/core/kernel",
     "crates/core/eevdf",
@@ -25,6 +26,7 @@ members = [
     "crates/user/init",
     "crates/user/rogue",
     "crates/user/pie",
+    "crates/misc/cfgtool",
 ]
 
 # Хост-сборка (cargo build / cargo test без --target) — только
@@ -46,6 +48,7 @@ default-members = [
     "crates/boot/bootcfg",
     "crates/platform/arch_x86",
     "crates/user/pie",
+    "crates/misc/cfgtool",
 ]
 
 # Общие настройки зависимостей для крейтов платформы.
@@ -72,6 +75,9 @@ x86_64 = "0.15"
 raw-cpuid = "11"
 # uefi: EFI-биндинги заглушки (протоколы, FS, ExitBootServices).
 uefi = "0.41"
+# font8x8: public-domain 8x8 битмап-шрифт (меню выбора пейлоада в
+# заглушке; только legacy-таблицы BASIC — без фич).
+font8x8 = { version = "0.3", default-features = false }
 
 # iommu-rs (VT-d / AMD-Vi): форматы таблиц + карта регистров, no_std.
 # Драйвер (MMIO, последовательности включения, QI) — наш бекенд.

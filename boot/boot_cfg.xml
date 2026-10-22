@@ -1,22 +1,33 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- boot_cfg.xml: конфигурация загрузки rust-l4 (читает UEFI-заглушка).
-     cmdline корня — командная строка ЯДРА (BootInfo.cmdline):
+<!-- boot_cfg.xml v2: конфигурация загрузчика rust-l4 (читает UEFI-заглушка).
+     Схема v2 = список пейлоадов + меню выбора:
+       timeout  — секунды на меню (>0 = отсчёт; 0 = сразу default;
+                  -1 = ждать вечно);
+       default  — id пейлоада по умолчанию (нет → первый);
+       payload type="rust-l4" — своя цепочка: ядро вшито в заглушку,
+                  cmdline — командная строка ЯДРА (BootInfo.cmdline),
+                  серверы грузятся в порядке перечисления, [0] — init,
+                  boot_state транзитом уходит init стартовым IPC;
+       payload type="efi" — chainload стороннего EFI-образа (Windows
+                  bootmgfw/grub/...) по path от корня тома.
      meltdown=allow нужен под QEMU/TCG (эмулятор не сообщает RDCL_NO
      и не имеет спекулятивной утечки); на реальном железе БЕЗ KPTI
      ядро обязано отказывать в загрузке — не ставьте этот флаг.
-     Серверы грузятся в порядке перечисления; [0] — init-сервер.
-     boot_state транзитом уходит init стартовым IPC (argc/argv). -->
-<boot cmdline="arch=x86_64 console=com1 meltdown=allow">
-  <servers>
-    <server name="init" path="init.elf">
-      <arg>stage=boot-chain</arg>
-      <arg>log=full</arg>
-    </server>
-  </servers>
-  <boot_state>
-    <var name="console" value="com1"/>
-    <var name="test_mode" value="qemu"/>
-    <var name="build" value="v0.5"/>
-    <var name="arch" value="x86_64"/>
-  </boot_state>
-</boot>
+     Редактирование: cargo run -p cfgtool -- boot/boot_cfg.xml show. -->
+<bootloader timeout="2" default="rust-l4">
+  <payload id="rust-l4" type="rust-l4" title="rust-l4 (own kernel)"
+           cmdline="arch=x86_64 console=com1 meltdown=allow">
+    <servers>
+      <server name="init" path="init.elf">
+        <arg>stage=boot-chain</arg>
+        <arg>log=full</arg>
+      </server>
+    </servers>
+    <boot_state>
+      <var name="console" value="com1"/>
+      <var name="test_mode" value="qemu"/>
+      <var name="build" value="v0.5"/>
+      <var name="arch" value="x86_64"/>
+    </boot_state>
+  </payload>
+</bootloader>

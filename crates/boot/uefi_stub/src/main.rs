@@ -5,14 +5,20 @@
 //
 // Последовательность:
 //   1. watchdog off; отладка — свой mini-UART COM1 (единый канал с ядром);
-//   2. ESP рядом с kernel.efi: SimpleFileSystem -> boot_cfg.xml (bootcfg);
-//   3. серверы конфигурации: чтение образов, argv-хвост в блоб модуля;
-//   4. ядро из ВСТРОЕННОГО образа: сегменты на KERNEL_PHYS_BASE
-//      (custom MemoryType — виден в карте как Kernel);
-//   5. модули + BootInfo-страница (custom MemoryType);
-//   6. RSDP из configuration tables (ACPI2);
-//   7. ExitBootServices -> финальная карта памяти -> BootInfo.memory;
-//   8. RDI = &BootInfo (физика) -> прыжок на вход ядра (смещение 0).
+//   2. ESP рядом с kernel.efi: SimpleFileSystem -> boot_cfg.xml (bootcfg v2:
+//      СПИСОК пейлоадов + таймаут меню);
+//   3. выбор пейлоада: единственный/timeout=0 — сразу default; иначе
+//      ГРАФИЧЕСКОЕ меню (GOP; дублируется в serial) с обратным отсчётом;
+//   4a. payload type="rust-l4" (своя цепочка):
+//       серверы конфигурации: чтение образов, argv-хвост в блоб модуля;
+//       ядро из ВСТРОЕННОГО образа (custom MemoryType — виден в карте как
+//       Kernel); модули + BootInfo-страница; RSDP из configuration tables
+//       (ACPI2); ExitBootServices -> финальная карта -> RDI = &BootInfo
+//       (физика) -> прыжок на вход ядра (смещение 0);
+//   4b. payload type="efi" (chainload Windows/grub/...): LoadImage по
+//       полному device path (том ESP + файл) + StartImage; возврат из
+//       образа — назад в меню (без отсчёта — явный выбор);
+//   цикл 4a/4b — пока не уйдём в ядро.
 //
 // После EBS — ноль аллокаций (RAII-владение забыто намеренно: память
 // всё равно достаётся ядру).
@@ -42,7 +48,7 @@ fn stub_panic(info: &PanicInfo) -> ! {
     loop {}
 }
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, string::String, vec::Vec};
 use core::arch::asm;
 
 use uefi::CString16;
@@ -55,7 +61,10 @@ use uefi::table::cfg::ConfigTableEntry;
 use boot_info::{
     BootInfo, FirmwareTables, KernelImage, MAX_MEMORY_REGIONS, MemoryKind, MemoryRegion, ModuleInfo,
 };
-use bootcfg;
+use bootcfg::{Payload, PayloadKind};
+
+mod chainload;
+mod menu;
 
 // Образ ядра: встраивается при сборке (build.sh обновляет kernel.bin).
 static KERNEL_ELF: &[u8] = include_bytes!("../kernel.bin");
@@ -121,6 +130,22 @@ pub fn uart_puts(s: &str) {
 fn log(s: &str) {
     uart_puts(s);
     uart_puts("\r\n");
+}
+
+/// Байт из COM1, если пришёл (поллинг LSR bit 0 — data ready).
+/// Ввод меню по serial для headless-машин (j/k/1-9/CR).
+pub(crate) fn uart_read_byte() -> Option<u8> {
+    unsafe {
+        let lsr: u8;
+        asm!("in al, dx", in("dx") 0x3F8u16 + 5, out("al") lsr);
+        if lsr & 0x01 != 0 {
+            let d: u8;
+            asm!("in al, dx", in("dx") 0x3F8u16, out("al") d);
+            Some(d)
+        } else {
+            None
+        }
+    }
 }
 
 // ───────────────────── ELF (минимальный разбор ELF64) ─────────────────────
@@ -227,7 +252,6 @@ fn main() -> uefi::Status {
     // 2. boot_cfg.xml (рядом с kernel.efi).
     let cfg_path: &uefi::CStr16 = uefi::cstr16!("boot_cfg.xml");
 
-
     let cfg_text = match fs.read_to_string(cfg_path) {
         Ok(t) => t,
         Err(_) => {
@@ -235,23 +259,79 @@ fn main() -> uefi::Status {
             return uefi::Status::NOT_FOUND;
         }
     };
+    // Конфиг прочитан: SFS-владение больше не нужно ДО выбора пейлоада —
+    // EXCLUSIVE-открытия не совместимы с chainload-ребёнком (он откроет
+    // том сам через get_image_file_system); для rust-l4 открываем заново.
+    drop(fs);
 
-    
     let cfg = match bootcfg::parse(&cfg_text) {
         Ok(c) => c,
         Err(e) => {
-            log("[stub] FATAL: boot_cfg.xml schema");
-            let _ = e;
+            log(&alloc::format!("[stub] FATAL: boot_cfg.xml: {e}"));
             return uefi::Status::INVALID_PARAMETER;
         }
     };
-    log("[stub] boot_cfg.xml parsed");
-
-    if cfg.servers.is_empty() {
-        log("[stub] FATAL: no servers in boot_cfg.xml (init required)");
+    if let Err(e) = cfg.validate() {
+        log(&alloc::format!("[stub] FATAL: boot_cfg.xml: {e}"));
         return uefi::Status::INVALID_PARAMETER;
     }
+    log(&alloc::format!(
+        "[stub] boot_cfg.xml: {} payload(s), timeout {}s",
+        cfg.payloads.len(),
+        cfg.timeout_s
+    ));
 
+    // 3. Выбор пейлоада: единственный/timeout=0 — сразу default; иначе
+    //    меню. После возврата из chainload — только явный выбор
+    //    (неудачный default не должен пинг-понговать перезагрузку).
+    let mut force_wait = false;
+    loop {
+        let idx = if cfg.payloads.len() == 1 || cfg.timeout_s == 0 {
+            let d = cfg.resolve_default();
+            log(&alloc::format!(
+                "[stub] payload: {} ({})\r\n",
+                cfg.payloads[d].id,
+                cfg.payloads[d].kind.as_str()
+            ));
+            d
+        } else {
+            menu::choose(&cfg, force_wait)
+        };
+        let payload = &cfg.payloads[idx];
+        match payload.kind {
+            PayloadKind::RustL4 => {
+                // Свежее владение томом: читать образы серверов. Открываем
+                // ЗДЕСЬ, а не держим с самого старта: EXCLUSIVE-открытие
+                // SFS не совместимо с chainload-ребёнком (он откроет том
+                // сам через get_image_file_system).
+                let vol = match uefi::boot::get_image_file_system(uefi::boot::image_handle()) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        log("[stub] FATAL: no file system next to image");
+                        return uefi::Status::NOT_FOUND;
+                    }
+                };
+                let fs = FileSystem::new(vol);
+                return boot_rust_l4(payload, fs, cfg_text);
+            }
+            PayloadKind::EfiChainload => {
+                log(&alloc::format!("[stub] chainload: {}", payload.path));
+                match chainload::run(&payload.path) {
+                    Ok(()) => log("[stub] chainload: image exited — back to menu"),
+                    Err(e) => log(&alloc::format!("[stub] chainload failed: {:?}", e.status())),
+                }
+                force_wait = true;
+            }
+        }
+    }
+}
+
+// ───────────────────── Цепочка rust-l4 (payload type="rust-l4") ─────────────────────
+
+/// Собственная цепочка: встроенное ядро + серверы пейлоада + BootInfo
+/// v2 + ExitBootServices + прыжок. Возврат — ТОЛЬКО по фатальной
+/// ошибке (успешный путь уходит в ядро и не возвращается).
+fn boot_rust_l4(payload: &Payload, mut fs: FileSystem, cfg_text: String) -> uefi::Status {
     // Дамп карты памяти (диагностика размещения ядра; всё до 4 GiB).
     if let Ok(mmap) = uefi::boot::memory_map(uefi::mem::memory_map::MemoryType::LOADER_DATA) {
         let mut i = 0;
@@ -328,7 +408,7 @@ fn main() -> uefi::Status {
 
     // 4. Серверы: образ + argv-хвост (модули протокола).
     let mut modules: Vec<(u64, u64, [u8; 32])> = Vec::new(); // (phys, len, name)
-    for srv in &cfg.servers {
+    for srv in &payload.servers {
         let path: CString16 = match CString16::try_from(srv.path.as_str()) {
             Ok(p) => p,
             Err(_) => {
@@ -421,12 +501,12 @@ fn main() -> uefi::Status {
             virt_entry: entry,
             len: big_pages * PAGE,
         };
-        let cmdline = if cfg.kernel_cmdline.is_empty() {
+        let cmdline = if payload.kernel_cmdline.is_empty() {
             "arch=x86_64 console=com1\0"
         } else {
             // Заглушка не интерпретирует cmdline (это политика ядра);
             // только ASCIIZ-обрезка по полю протокола.
-            let owned = alloc::format!("{}\0", cfg.kernel_cmdline);
+            let owned = alloc::format!("{}\0", payload.kernel_cmdline);
             if owned.len() > boot_info::CMDLINE_LEN {
                 log("[stub] FATAL: kernel cmdline exceeds protocol field");
                 return uefi::Status::INVALID_PARAMETER;
@@ -438,7 +518,7 @@ fn main() -> uefi::Status {
         };
         bi.cmdline[..cmdline.len()].copy_from_slice(cmdline.as_bytes());
         // boot_state (транзит init).
-        match cfg.boot_state_vars() {
+        match payload.boot_state_vars() {
             Ok(vars) => {
                 for (i, v) in vars.iter().enumerate() {
                     if i >= boot_info::MAX_BOOT_STATE {
@@ -460,7 +540,6 @@ fn main() -> uefi::Status {
     //    могут; память достаётся ядру).
     core::mem::forget(fs);
     core::mem::forget(cfg_text);
-    core::mem::forget(cfg);
 
     // 7. ExitBootServices -> финальная карта.
     let mmap = unsafe { uefi::boot::exit_boot_services(None) };

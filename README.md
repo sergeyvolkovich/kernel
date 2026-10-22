@@ -21,18 +21,25 @@ v0.14: в ядре НЕТ устройств — как в seL4. Перечис�
 записью S5 в PM1a_CNT за capability.
 
 Загрузка — UEFI (OVMF): самодостаточная заглушка `BOOTX64.EFI` со
-встроенным образом ядра, конфигурация серверов в `boot_cfg.xml`.
-Пользовательский мир — freestanding-серверы без libc: единственный API —
+встроенным образом ядра и СПИСКОМ ПЕЙЛОАДОВ в `boot_cfg.xml` (v2):
+своя цепочка rust-l4 (cmdline + серверы + boot_state) ИЛИ chainload
+стороннего загрузчика (Windows bootmgfw / GRUB / произвольный EFI-образ)
+с ГРАФИЧЕСКИМ меню выбора (GOP; дублируется в serial — headless
+совместимо). Редактор конфигурации — host-тул `cfgtool`. Пользовательский
+мир — freestanding-серверы без libc: единственный API —
 таблица сисколов (обёртки C-ABI — крейт `userlib`). Ядро сознательно не
 содержит драйверов, файловых систем и libc: всё это — серверы
 пользователя, общающиеся IPC (L4-философия).
 
 ```
 OVMF -> BOOTX64.EFI (uefi_stub + встроенный kernel.bin)
-     -> boot_cfg.xml (список серверов, cmdline ядра, boot_state)
-     -> ExitBootServices -> head.S -> kmain -> startup::kinit
-     -> elfload: сервер [0] (init) парсится, мапится, стартует
-     -> планировщик: init — root-сервер (спавнит домены, владеет IommuAdmin)
+     -> boot_cfg.xml v2 (пейлоады; timeout/default)
+     -> меню выбора (GOP + serial, отсчёт до default)
+     -> [rust-l4]: серверы, ExitBootServices, head.S, kinit,
+        startup::kinit -> elfload: сервер [0] (init) мапится, стартует
+        -> планировщик: init — root-сервер (спавнит домены, IommuAdmin)
+     -> [efi]: LoadImage (device path: том + файл) + StartImage
+        (bootmgfw/grub/...; возврат — назад в меню)
 ```
 
 ## Содержание
@@ -64,7 +71,7 @@ OVMF -> BOOTX64.EFI (uefi_stub + встроенный kernel.bin)
 | **Сырые ресурсы + IRQ** | Устройств в ядре НЕТ (v0.14): перечисление ACPI/AML/PCI и драйверы — юзерспейс (acpid); ядро медитирует диапазоны за IoResource-cap: `MMIO_MAP` (физика), `IOP_IN/OUT` (порты, исполнение в ядре, IOPL=0), `IRQ_ATTACH` по Irq-cap (IOAPIC: линия — L4-signal без переключения контекста); `CAP_MINT_RANGE` (v0.15) — сужение поддиапазонов при деривации |
 | **Изоляция крейтов (v0.15)** | HAL-контракты — отдельный крейт `kernel-hal` без зависимостей на workspace: ядро/бекенд видят контракты, контрактный слой не видит никого (граница проверяется cargo); `cargo build -p kernel-hal` — автономный гейт |
 | **IOMMU** | Intel VT-d (DMAR/DRHD, QI-инвалидации) и AMD-Vi (IVRS/IVHD, командный буфер): DMA-ремаппинг, IRQ-ремаппинг (IRTE/IntTab), мульти-IOMMU, 2 МиБ-листья |
-| **Загрузка** | UEFI-заглушка с динамическим размещением ядра, boot_cfg.xml, argv-протокол, SIPI-bring-up AP |
+| **Загрузка** | UEFI-заглушка: boot_cfg.xml v2 (пейлоады rust-l4/efi-chainload), графическое меню выбора (GOP+serial), динамическое размещение ядра, argv-протокол, SIPI-bring-up AP |
 | **Юзерспейс** | `userlib` (C-ABI `_start` + `l4_*` для C и Rust), эталонные серверы: `init` (Rust) и `capp` (C) |
 
 ## Архитектура в двух словах
@@ -142,9 +149,14 @@ crates/
   boot/                    загрузочная цепочка (форматы + прошивка):
     boot_info/             ABI-страница BootInfo (заглушка -> ядро):
                            память, модули, RSDP
-    bootcfg/               mini-XML парсер boot_cfg.xml (+ host-тесты)
-    uefi_stub/             BOOTX64.EFI: boot_cfg, модули,
-                           ExitBootServices, прыжок в ядро
+    bootcfg/               boot_cfg.xml v2 (пейлоады/меню): mini-XML
+                           разбор + сериализация + модель меню (+ тесты)
+    uefi_stub/             BOOTX64.EFI: меню (GOP), rust-l4-цепочка
+                           (модули, BootInfo, EBS), chainload EFI-образов
+  misc/                   host-инструменты (std):
+    cfgtool/               редактор boot_cfg.xml (init/show/add/remove/
+                           arg/state/timeout/default; валидация + атомарная
+                           запись; общий крейт bootcfg)
   startup/                 kinit: композиционный корень (arch-независимая
                            политика запуска над трейтом Platform, реализация
                            — platform/backend), elfload, пулы
@@ -196,11 +208,22 @@ bash scripts/build.sh               # ядро -> userlib -> rogue -> init -> з
 | Переменная | Значение | По умолчанию |
 |------------|----------|--------------|
 | `TOOLS` | префикс qemu-usr (QEMU/OVMF/mtools) | `/home/z/my-project/tools` |
-| `BOOT_CFG` | конфигурация серверов | `scripts/boot_cfg.xml` |
+| `BOOT_CFG` | конфигурация пейлоадов | `scripts/boot_cfg.xml` |
 | `ROGUE_PIE` | `1` — static-PIE rogue; пусто — легаси ET_EXEC (отладка загрузчика) | `1` |
 | `CC` | компилятор C-сервера | `gcc` |
 
 C-демо вместо Rust-ини: `BOOT_CFG=scripts/boot_cfg_c.xml bash scripts/build.sh`.
+
+Редактирование конфигурации пейлоадов — host-тул (общий крейт `bootcfg`
+с заглушкой: что валидно для тула, валидно для прошивки):
+
+```bash
+cargo run -p cfgtool -- boot/boot_cfg.xml show
+cargo run -p cfgtool -- boot/boot_cfg.xml add efi win \
+    --path '\EFI\Microsoft\Boot\bootmgfw.efi' --title 'Windows' --default
+cargo run -p cfgtool -- boot/boot_cfg.xml timeout 10
+cargo run -p cfgtool -- boot/boot_cfg.xml arg rust-l4 add log=full
+```
 
 ## Запуск в QEMU
 

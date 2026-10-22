@@ -1,0 +1,16 @@
+[package]
+name = "cfgtool"
+version.workspace = true
+edition.workspace = true
+description = "Host-side boot_cfg.xml editor (std CLI): payloads, menu timeout, chainload entries, server args, boot_state"
+
+# Host-инструмент (группа misc): полноценный std, вне образов загрузки.
+# Модель/разбор/запись XML — общий крейт bootcfg (no_std библиотека
+# подключается к std-бинарю как есть: ядро логики одно на заглушку и тул).
+
+[[bin]]
+name = "cfgtool"
+path = "src/main.rs"
+
+[dependencies]
+bootcfg = { workspace = true }
