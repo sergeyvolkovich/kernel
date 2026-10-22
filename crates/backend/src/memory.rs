@@ -45,7 +45,9 @@ static GLOBAL_ALLOC: pkg_generic_interface::mem::gallocator::KernelAllocator =
 
 use llfree::Alloc;
 
-use kernel_hal::traits::asid::{ASIDInterface, AddressSpaceMode, AsidPair, FlushMode, TlbOp};
+use kernel_hal::traits::asid::{
+    ASIDInterface, AddressSpaceId, AddressSpaceMode, AsidPair, FlushMode, TlbOp,
+};
 use kernel_hal::traits::kmap::{KMAPInterface, KernelRegion, KernelRegionKind};
 use kernel_hal::traits::mmap::{
     MMAPInterface, MMAPMemoryFlags, MemErrorCode, PAGE_SIZE, PageInfo, PhysADDR, VirtualADDR,
@@ -252,6 +254,66 @@ impl MMAPInterface for UserTables {
                 .unmap(page)
                 .map_err(|_| MemErrorCode::NotMapped)?;
             unsafe { r.1.flush() };
+        }
+        Ok(())
+    }
+
+    /// v0.17 (MEM_PROTECT): rewrite PTE access flags of mapped pages
+    /// in place. The physical frames and virtual addresses stay as
+    /// they are — only rights change (W^X already validated by
+    /// `protect_region_checked`).
+    ///
+    /// Atomicity: all pages are updated FIRST, the TLB is invalidated
+    /// AFTERWARDS — a faulting reader/writer mid-operation observes
+    /// either the old or the new rights, never a mix of updates and
+    /// stale translations (the shootdown is the commit point).
+    ///
+    /// SMP: another CPU may run a thread of THIS address space with
+    /// stale TLB entries — `invalidate_tlb` does local flush +
+    /// shootdown IPIs (see the contract note there). Per-page
+    /// granularity keeps the IPI payload bounded; wide ranges are a
+    /// rare policy operation (JIT toggle, relro), not a hot path.
+    fn protect_region(
+        &mut self,
+        v_base: VirtualADDR,
+        pages: usize,
+        mmap: MMAPMemoryFlags,
+    ) -> Result<(), MemErrorCode> {
+        if pages == 0 || !v_base.is_aligned() {
+            return Err(MemErrorCode::InvalidArgument(
+                "protect_region: zero size or unaligned",
+            ));
+        }
+        let flags = user_pte_flags(mmap);
+        let start_page =
+            Page::<Size4KiB>::containing_address(VirtAddr::new(v_base.as_usize() as u64));
+        // 1. Фаза обновления: переписать права каждого PTE. Локальный
+        //    флаш не нужен: до фазы коммита переводы считаются
+        //    недействительными с точки зрения наблюдателя (см. ниже).
+        //    Дыра в диапазоне — NotMapped: UFacade уже проверил
+        //    принадлежность диапазона живому региону, дыра = баг
+        //    инвариантов фасада (лучше громкий отказ, чем тихая дыра).
+        for off in 0..pages as u64 {
+            let page = start_page + off;
+            // SAFETY: mapper валиден (см. UserTables::mapper); update_flags
+            // не трогает физику записи — только биты прав (кадры
+            // принадлежат региону, отображение проверено фасадом).
+            let r = unsafe { self.mapper().update_flags(page, flags) }
+                .map_err(|_| MemErrorCode::NotMapped)?;
+            // Локальный флаш немедленно: ошибка не копится между
+            // страницами (как в extend_region).
+            unsafe { r.flush() };
+        }
+        // 2. Фаза коммита: инвалидация — локально + shootdown чужим
+        //    CPU (потоки того же домена исполняются где угодно).
+        //    Бекенд нетегированный: поле asid игнорируется (см.
+        //    invalidate_tlb), но тип требует значения — нулевой тег.
+        for off in 0..pages as u64 {
+            let page = start_page + off;
+            self.invalidate_tlb(TlbOp::Page {
+                v: VirtualADDR(page.start_address().as_u64() as usize),
+                asid: AddressSpaceId(0),
+            })?;
         }
         Ok(())
     }

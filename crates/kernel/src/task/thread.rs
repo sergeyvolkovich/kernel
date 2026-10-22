@@ -93,6 +93,13 @@ pub(crate) struct ThreadObj {
 
     /// Причина ожидания (`None` — поток не блокирован ожиданием).
     pub(crate) wait: Option<ThreadWait>,
+    /// Per-thread TLS word (v0.17, THREAD_SET_TLS / THREAD_CREATE arg6):
+    /// an OPAQUE user value the kernel never interprets — the platform
+    /// backend loads it into its thread-pointer register (x86_64: FS
+    /// base) on every dispatch. 0 = no TLS. Keeping it in the TCB (not
+    /// in the saved register file) makes the ABI architecture-neutral:
+    /// the same syscall works on any backend that has a thread pointer.
+    pub(crate) tls: usize,
     /// Advisory slice-end notification endpoint (v0.16): gate where the
     /// scheduler backend delivers a best-effort signal when the thread's
     /// time slice is nearing its end. `None` — the thread did not opt in
@@ -169,6 +176,25 @@ impl TcbManager {
         entry: usize,
         stack_top: usize,
     ) -> Result<(), TaskError> {
+        self.create_thread_with_tls(thread_id, owner, priority, entry, stack_top, 0)
+    }
+
+    /// [`Self::create_thread`] with an initial TLS word (v0.17,
+    /// THREAD_CREATE arg6). Setting the word AT CREATION closes the
+    /// bootstrap race of "create, then set": a freshly created thread
+    /// may be dispatched on another CPU before the creator's follow-up
+    /// syscall arrives, and a runtime thread that reads its thread
+    /// pointer before running its first instruction would fault.
+    /// `tls = 0` is exactly the pre-v0.17 behaviour.
+    pub fn create_thread_with_tls(
+        &self,
+        thread_id: ThreadId,
+        owner: TaskId,
+        priority: TaskPriority,
+        entry: usize,
+        stack_top: usize,
+        tls: usize,
+    ) -> Result<(), TaskError> {
         let mut inner = self.inner.write();
 
         // Владелец существует и жив?
@@ -213,6 +239,7 @@ impl TcbManager {
                 entry,
                 stack_top,
                 wait: None,
+                tls,
                 slice_warn_ep: None,
                 mailbox: None,
                 blocked_msg: None,
@@ -600,6 +627,46 @@ impl TcbManager {
         Ok(was_blocked)
     }
 
+    /// Futex wake transaction (v0.17, FUTEX_WAKE): verify the parked
+    /// wait reason against (queue, tag) and — on match — materialize the
+    /// syscall return value, clear the wait and transition Blocked ->
+    /// Ready, all in ONE write section (mirror of `deliver_mailbox_wake`).
+    ///
+    /// The tag check is what makes a popped thread safe to wake: the
+    /// block queue only guarantees FIFO order, not WHY a thread is
+    /// parked there; a thread suspended or terminated while parked has
+    /// its `wait` cleared by those paths, and a stale queue-id reuse
+    /// after drain-destroy can only produce a tag mismatch. Returns
+    /// `false` when the thread must NOT count as woken (mismatch).
+    pub(crate) fn futex_wake_waiter(
+        &self,
+        thread: &ThreadId,
+        queue: BlockQueueId,
+        tag: u64,
+        ret: usize,
+    ) -> Result<bool, TaskError> {
+        let inner = self.inner.write();
+        let node = find_thread(&inner, thread).ok_or(TaskError::ThreadNotFound(*thread))?;
+        // SAFETY: эксклюзивный доступ под write-гардом менеджера.
+        let th: &mut ThreadObj = unsafe { &mut *UnsafeRef::into_raw(node) };
+        let matches = th.state == TaskState::Blocked
+            && matches!(
+                th.wait,
+                Some(ThreadWait::Queue {
+                    queue: q,
+                    tag: t
+                }) if q == queue && t == tag
+            );
+        if !matches {
+            return Ok(false);
+        }
+        th.wait = None;
+        th.syscall_ret = Some(ret);
+        // Blocked -> Ready (+ enqueue-хук) — в ТОЙ ЖЕ секции.
+        thread_set_state_locked(&inner, thread, TaskState::Ready)?;
+        Ok(true)
+    }
+
     /// Register/clear the advisory slice-end notification gate of a
     /// thread (THREAD_SET_SLICE_NOTIFY). No capability re-validation on
     /// delivery — the holder keeps its Gate capability; a revoked gate
@@ -618,6 +685,34 @@ impl TcbManager {
     /// not opted in). Called by the platform glue on the dispatch path.
     pub fn thread_slice_warn_gate(&self, thread: &ThreadId) -> Option<ObjId> {
         self.with_thread(thread, |t| t.slice_warn_ep).flatten()
+    }
+
+    /// Set the per-thread TLS word (v0.17, THREAD_SET_TLS). Opaque to
+    /// the kernel; authorization (own domain / TaskTCB) is the syscall
+    /// layer's business. Returns the PREVIOUS word so runtimes can
+    /// implement cheap read-modify-write bootstrap without a separate
+    /// SELF_INFO round-trip.
+    pub fn thread_set_tls(
+        &self,
+        thread: &ThreadId,
+        value: usize,
+    ) -> Result<usize, TaskError> {
+        self.with_thread(thread, |t| {
+            if t.state == TaskState::Dead {
+                return None;
+            }
+            let old = t.tls;
+            t.tls = value;
+            Some(old)
+        })
+        .ok_or(TaskError::ThreadNotFound(*thread))
+        .and_then(|r| r.ok_or(TaskError::ThreadNotFound(*thread)))
+    }
+
+    /// The per-thread TLS word (`None` — no such thread). Called by the
+    /// platform glue at dispatch time and by SELF_INFO (word 6).
+    pub fn thread_tls(&self, thread: &ThreadId) -> Option<usize> {
+        self.with_thread(thread, |t| t.tls)
     }
 
     /// Доступ к объекту потока для изменения (IPC-подсистема: mailbox,

@@ -52,6 +52,7 @@ use crate::hal::traits::mmap::PhysADDR;
 use crate::task::{CpuId, TaskId, TcbManager};
 
 pub mod debug;
+pub mod futex;
 pub mod handle_guard;
 pub mod io;
 pub mod iommu;
@@ -517,10 +518,11 @@ impl SyscallRegistry {
             IpcMsgWordHandler, IpcRecvAnyHandler, IpcRecvHandler, IpcSendHandler,
             IpcSendThreadHandler, NotifySignalHandler,
         };
+        use crate::syscall::futex::{FutexWaitHandler, FutexWakeHandler};
         use crate::syscall::mem::{
-            MemAllocHandler, MemFreeHandler, MemInfoHandler, MemMapAtHandler, MemTransferHandler,
-            RingDoorbellHandler, ShmBindDoorbellHandler, ShmCreateHandler, ShmDestroyHandler,
-            ShmInfoHandler, ShmMapHandler, ShmSetupRingHandler,
+            MemAllocHandler, MemFreeHandler, MemInfoHandler, MemMapAtHandler, MemProtectHandler,
+            MemTransferHandler, RingDoorbellHandler, ShmBindDoorbellHandler, ShmCreateHandler,
+            ShmDestroyHandler, ShmInfoHandler, ShmMapHandler, ShmSetupRingHandler,
         };
         use crate::syscall::system::{SelfInfoHandler, SysTimeHandler};
         use crate::syscall::task::{
@@ -529,7 +531,7 @@ impl SyscallRegistry {
             TaskExitHandler, TaskKillHandler, TaskLimitsInfoHandler, TaskSetExitEpHandler,
             TaskSetLimitsHandler, TaskSpawnImageHandler, ThreadCreateHandler, ThreadDestroyHandler,
             ThreadExRegsHandler, ThreadResumeHandler, ThreadSetPrioHandler, ThreadSetSliceNotifyHandler,
-            ThreadSuspendHandler, ThreadTerminateHandler, ThreadYieldHandler,
+            ThreadSetTlsHandler, ThreadSuspendHandler, ThreadTerminateHandler, ThreadYieldHandler,
         };
 
         macro_rules! slot {
@@ -562,6 +564,12 @@ impl SyscallRegistry {
 
         // 0x90: расширения планировщика (advisory, опционально).
         slot!(nums::THREAD_SET_SLICE_NOTIFY, ThreadSetSliceNotifyHandler);
+        // v0.17: TLS-слово потока (opaque; грузит бекенд платформы).
+        slot!(nums::THREAD_SET_TLS, ThreadSetTlsHandler);
+
+        // 0x30: IPC (+ футеки — тот же класс блокировок, v0.17).
+        slot!(nums::FUTEX_WAIT, FutexWaitHandler);
+        slot!(nums::FUTEX_WAKE, FutexWakeHandler);
 
         // 0x20: capability.
         slot!(nums::CAP_MINT, CapMintHandler);
@@ -598,6 +606,8 @@ impl SyscallRegistry {
         slot!(nums::MEM_TRANSFER, MemTransferHandler);
         slot!(nums::MEM_INFO, MemInfoHandler);
         slot!(nums::MEM_MAP_AT, MemMapAtHandler);
+        // v0.17: смена прав отображённых страниц (mprotect-аналог).
+        slot!(nums::MEM_PROTECT, MemProtectHandler);
 
         // 0x60: SHM io_uring.
         slot!(nums::SHM_CREATE, ShmCreateHandler);

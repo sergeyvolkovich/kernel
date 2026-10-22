@@ -116,6 +116,29 @@ fn vslice(base_slice: u64, weight: u32) -> u64 {
     scaled(base_slice, weight)
 }
 
+/// EWMA update with α=1/2 on Q8 values: halfway toward the sample.
+/// (Both directions — a saturating `sample − old` would freeze on the
+/// first decrease, which is exactly what the utilisation/tardiness
+/// trackers need to forget stale history.)
+#[inline]
+fn ewma2(old: u32, sample: u32) -> u32 {
+    if sample >= old {
+        old + ((sample - old) >> 1)
+    } else {
+        old - ((old - sample) >> 1)
+    }
+}
+
+/// EWMA update with α=1/4 on Q8 values (slower tracker — pressure).
+#[inline]
+fn ewma4(old: u32, sample: u32) -> u32 {
+    if sample >= old {
+        old + ((sample - old) >> 2)
+    } else {
+        old - ((old - sample) >> 2)
+    }
+}
+
 // ───────────────────────── Entity ─────────────────────────
 
 /// Scheduling state of one thread, cached by the backend (the kernel TCB
@@ -138,6 +161,39 @@ pub struct Entity {
     pub on_rq: bool,
     /// Parked by the CPU-quota throttle (not ready until period end).
     pub throttled: bool,
+    // ── v0.18 load-balancer bookkeeping (showcase/steal; see sched_lb) ──
+    /// EWMA (Q8, 0..=255) of dispatch-time tardiness `(V − vd)/vslice`
+    /// sampled at every pick. Latency-sensitive tasks that keep missing
+    /// their virtual deadlines converge to a high value — this is the
+    /// "deadline slip" signal that drives offer publication and steal
+    /// scoring.
+    pub tard_q8: u32,
+    /// EWMA (Q8, 0..=255) of the inter-park duty cycle `exec/window`
+    /// (window = time since the previous park). Approximates the task's
+    /// CPU demand for steal admission control. Starts at 255 (assume
+    /// CPU-bound until a park proves otherwise — conservative admission).
+    pub util_q8: u32,
+    /// Heterogeneity hint (Q8 ratio rate_big/rate_little, 256 = 1.0).
+    /// v0.19: maintained from measured per-task dispatch-segment IPC on
+    /// the two capacity classes (see [`RunQueue::note_perf`]) — once both
+    /// sides have samples it tracks the task's own cross-class rate
+    /// ratio; until then it stays at the neutral 256. Carried across
+    /// migrations so the destination scores the task with its history.
+    pub speedup_q8: u32,
+    /// v0.19: EWMA (Q8, IPC×256) of the task's dispatch-segment IPC
+    /// measured on a max-capacity core (cap_q8 >= 256). 0 = no sample.
+    pub ipc_fast_q8: u32,
+    /// v0.19: same, measured on a lower-capacity core. 0 = no sample.
+    pub ipc_slow_q8: u32,
+    /// TSC of the last park (dispatch segment end). Cache-hotness input:
+    /// a task parked long ago is cheap to migrate ("не cache-hot").
+    pub last_ran: u64,
+    /// Completed migrations (steals). Anti-thrash: the minimum-stay
+    /// window grows exponentially with this counter.
+    pub mig_count: u16,
+    /// TSC before which the task must not be offered for stealing again
+    /// (freshly stolen tasks stay put for a few slices).
+    pub cooldown_until: u64,
 }
 
 /// Ordering key of the run queue: earliest deadline first, ties broken
@@ -156,12 +212,65 @@ pub struct RunningEnt {
     pub cpu: usize,
 }
 
+/// A queued (ready, not running) thread as seen by the offer publisher /
+/// steal scorer (v0.18). Plain data snapshot of an [`Entity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueuedCand {
+    pub id: u128,
+    pub weight: u32,
+    /// Full slice length (raw time units).
+    pub slice: u64,
+    /// Virtual deadline of the current slice.
+    pub deadline: u64,
+    /// Deadline-slip EWMA, Q8.
+    pub tard_q8: u32,
+    /// CPU-demand EWMA, Q8.
+    pub util_q8: u32,
+    /// Big/little rate ratio hint, Q8 (256 = 1.0).
+    pub speedup_q8: u32,
+    /// TSC of the last park (cache-hotness).
+    pub last_ran: u64,
+    /// Migration cooldown gate (TSC).
+    pub cooldown_until: u64,
+}
+
+impl QueuedCand {
+    /// v0.19: zeroed placeholder for const-initializing per-CPU scratch
+    /// buffers (the allocation-free publisher snapshot path).
+    pub const ZERO: QueuedCand = QueuedCand {
+        id: 0,
+        weight: 0,
+        slice: 0,
+        deadline: 0,
+        tard_q8: 0,
+        util_q8: 0,
+        speedup_q8: 0,
+        last_ran: 0,
+        cooldown_until: 0,
+    };
+}
+
 // ───────────────────────── Run queue ─────────────────────────
 
 /// How much sleeper credit a waking entity may keep, in virtual slices
 /// (avg - LAG_CAP*vslice is the furthest behind the average a waker may
 /// start; bounds post-wake starvation of the other entities).
 pub const LAG_CAP_SLICES: u64 = 2;
+
+/// v0.19: running-set capacity. Steady state holds ONE entry (a queue
+/// dispatches a single thread at a time); spare slots cover transient
+/// rotate/migration windows. A fixed array keeps the pick/park path off
+/// the heap — the old BTreeMap paid a talc alloc/dealloc pair on every
+/// dispatch segment, under the queue lock (leaf SCHED taking KMEM).
+const MAX_RUNNING: usize = 8;
+
+/// v0.19: one slot of the fixed running set.
+#[derive(Debug, Clone, Copy)]
+struct RunningSlot {
+    in_use: bool,
+    id: u128,
+    ent: RunningEnt,
+}
 
 /// EEVDF run queue: ordered ready entities + per-thread state cache +
 /// running-entity index (for preemption hints).
@@ -180,8 +289,8 @@ pub struct RunQueue {
     queue: BTreeMap<Key, u128>,
     /// Per-thread cached state; persists while blocked (service history).
     entities: BTreeMap<u128, Entity>,
-    /// Dispatched entities: id -> (deadline, cpu).
-    running: BTreeMap<u128, RunningEnt>,
+    /// Dispatched entities: fixed slots (see [`MAX_RUNNING`]).
+    running: [RunningSlot; MAX_RUNNING],
     /// sum of queued weights (W).
     weight_sum: u64,
     /// sum of queued (w_i * v_i) (u128: 512 * 88761 * vruntime).
@@ -192,6 +301,11 @@ pub struct RunQueue {
     base_slice: u64,
     /// Queued entity count — lock-free ready peek (idle loop).
     ready: AtomicUsize,
+    /// v0.18: EWMA (Q8, 0..=255) of the share of LATE dispatches on this
+    /// queue — "pressure". Sampled at every pick (late = V > vd of the
+    /// chosen entity). Drives offer-publication hysteresis and steal
+    /// preconditions in the backend (sched_lb).
+    pressure_q8: u32,
 }
 
 impl RunQueue {
@@ -200,12 +314,19 @@ impl RunQueue {
         Self {
             queue: BTreeMap::new(),
             entities: BTreeMap::new(),
-            running: BTreeMap::new(),
+            running: [const {
+                RunningSlot {
+                    in_use: false,
+                    id: 0,
+                    ent: RunningEnt { deadline: 0, cpu: 0 },
+                }
+            }; MAX_RUNNING],
             weight_sum: 0,
             wv_sum: 0,
             min_vruntime: 0,
             base_slice,
             ready: AtomicUsize::new(0),
+            pressure_q8: 0,
         }
     }
 
@@ -245,12 +366,43 @@ impl RunQueue {
     /// Snapshot of the running entities (id, deadline, cpu) — the caller
     /// decides which CPUs to nudge.
     pub fn running_snapshot(&self) -> impl Iterator<Item = (u128, RunningEnt)> + '_ {
-        self.running.iter().map(|(id, r)| (*id, *r))
+        self.running.iter().filter(|s| s.in_use).map(|s| (s.id, s.ent))
     }
 
     /// Is the entity queued? (backend diagnostics)
     pub fn is_queued(&self, id: u128) -> bool {
         self.entities.get(&id).is_some_and(|e| e.on_rq)
+    }
+
+    /// Is the thread currently dispatched from THIS queue's running set?
+    /// (v0.18 wake-placement guard: a mid-slice rotate requeues on its
+    /// own queue — the entity is cache-hot and the EEVDF ROTATE path
+    /// must preserve its deadline; it is not a push-assist candidate.)
+    pub fn is_running_here(&self, id: u128) -> bool {
+        self.running.iter().any(|s| s.in_use && s.id == id)
+    }
+
+    // ───────────────── v0.19: fixed running-set helpers ─────────────────
+
+    /// Drop a dispatched entity (park/rotate/throttle/migrate/kill);
+    /// returns whether it WAS in the running set (the rotate path).
+    fn running_take(&mut self, id: u128) -> bool {
+        if let Some(slot) = self.running.iter_mut().find(|s| s.in_use && s.id == id) {
+            slot.in_use = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Drop a dispatched entity (park/rotate/throttle/migrate/kill).
+    fn running_remove(&mut self, id: u128) {
+        let _ = self.running_take(id);
+    }
+
+    /// Live running-set size (diagnostics/tests).
+    pub fn running_len(&self) -> usize {
+        self.running.iter().filter(|s| s.in_use).count()
     }
 
     /// Register (or re-register) a thread with a weight. Off-queue; the
@@ -269,6 +421,14 @@ impl RunQueue {
                 slice_left: 0,
                 on_rq: false,
                 throttled: false,
+                tard_q8: 0,
+                util_q8: 255,
+                speedup_q8: 256,
+                ipc_fast_q8: 0,
+                ipc_slow_q8: 0,
+                last_ran: 0,
+                mig_count: 0,
+                cooldown_until: 0,
             },
         );
     }
@@ -282,7 +442,7 @@ impl RunQueue {
         if self.entities.get(&id).is_some_and(|e| e.on_rq) {
             self.queue_remove(id);
         }
-        self.running.remove(&id);
+        self.running_remove(id);
         self.entities.remove(&id);
         if was_queued {
             self.ready.fetch_sub(1, Ordering::Relaxed);
@@ -325,7 +485,7 @@ impl RunQueue {
     /// construction — it was running; remove the running entry).
     /// `enqueue` on a throttled entity (period boundary) clears the flag.
     pub fn mark_throttled(&mut self, id: u128) {
-        self.running.remove(&id);
+        self.running_remove(id);
         if let Some(e) = self.entities.get_mut(&id) {
             e.throttled = true;
         }
@@ -361,7 +521,7 @@ impl RunQueue {
     /// Idempotent: enqueue of an already-queued entity is a no-op.
     pub fn enqueue(&mut self, id: u128) {
         // ROTATE: entity is dispatched right now (preempt-rotate path).
-        if let Some(running) = self.running.remove(&id) {
+        if self.running_take(id) {
             let Some(e) = self.entities.get_mut(&id) else { return };
             if e.slice_left > 0 {
                 // Slice budget remains: keep the deadline, requeue as-is.
@@ -373,7 +533,6 @@ impl RunQueue {
                 self.weight_sum = self.weight_sum.wrapping_add(w);
                 self.wv_sum = self.wv_sum.wrapping_add(v);
                 self.ready.fetch_add(1, Ordering::Relaxed);
-                let _ = running; // deadline already kept in the entity
                 return;
             }
             // Slice exhausted: fresh slice + deadline at current vruntime.
@@ -428,6 +587,14 @@ impl RunQueue {
             slice_left: self.base_slice,
             on_rq: true,
             throttled: false,
+            tard_q8: 0,
+            util_q8: 255,
+            speedup_q8: 256,
+            ipc_fast_q8: 0,
+            ipc_slow_q8: 0,
+            last_ran: 0,
+            mig_count: 0,
+            cooldown_until: 0,
         };
         let k = key_of(&e);
         self.queue.insert(k, id);
@@ -448,7 +615,7 @@ impl RunQueue {
             self.queue_remove(id);
             self.ready.fetch_sub(1, Ordering::Relaxed);
         }
-        self.running.remove(&id);
+        self.running_remove(id);
     }
 
     /// Charge executed time to the (running) entity and advance the
@@ -493,6 +660,14 @@ impl RunQueue {
     /// (avg is a weighted mean), so the scan terminates; the leftmost
     /// fallback is belt-and-braces. The entity moves to the running set
     /// (deadline + cpu recorded for preemption hints).
+    ///
+    /// v0.18: the pick also samples the deadline-slip signal — if the
+    /// chosen entity's virtual deadline is already in the past at pick
+    /// time (`V > vd`), the task was waiting too long. Per-task EWMA of
+    /// `(V − vd)/vslice` lands in `Entity::tard_q8`; the per-queue share
+    /// EWMA lands in `pressure_q8` (see [`RunQueue::pressure_q8`]).
+    /// Short-slice (latency-nice) tasks trip first, so the signal
+    /// naturally isolates latency-sensitive load.
     pub fn pick(&mut self, cpu: usize) -> Option<u128> {
         let avg = self.avg_vruntime();
         let eps = 1; // integer-floor tolerance of the weighted mean
@@ -514,6 +689,15 @@ impl RunQueue {
             .get_mut(&id)
             .expect("queued entity is cached");
         debug_assert!(e.on_rq);
+        // v0.18: deadline-slip sampling (BEFORE the entity leaves the
+        // queued set — `avg` still includes its weight/vruntime).
+        let vd = e.deadline;
+        let vs = vslice(self.base_slice, e.weight).max(1);
+        let slip = avg.saturating_sub(vd); // 0 unless the deadline passed
+        let sample = ((slip as u128 * 256) / vs as u128).min(255) as u32;
+        e.tard_q8 = ewma2(e.tard_q8, sample);
+        let late_x256: u32 = if slip > 0 { 256 } else { 0 };
+        self.pressure_q8 = ewma4(self.pressure_q8, late_x256);
         e.on_rq = false;
         self.weight_sum = self.weight_sum.wrapping_sub(e.weight as u64);
         self.wv_sum = self
@@ -523,13 +707,31 @@ impl RunQueue {
         if e.vruntime > self.min_vruntime {
             self.min_vruntime = e.vruntime;
         }
-        self.running.insert(
-            id,
-            RunningEnt {
-                deadline: e.deadline,
-                cpu,
-            },
-        );
+        // Record the dispatch in the running set. Disjoint-field writes
+        // (`self.running` while the `e` borrow of `self.entities` is
+        // live) keep the borrow checker happy; overflow recycles slot 0
+        // (see `MAX_RUNNING`).
+        match self.running.iter_mut().find(|s| !s.in_use) {
+            Some(slot) => {
+                slot.in_use = true;
+                slot.id = id;
+                slot.ent = RunningEnt {
+                    deadline: e.deadline,
+                    cpu,
+                };
+            }
+            None => {
+                debug_assert!(false, "eevdf: running set overflow");
+                self.running[0] = RunningSlot {
+                    in_use: true,
+                    id,
+                    ent: RunningEnt {
+                        deadline: e.deadline,
+                        cpu,
+                    },
+                };
+            }
+        }
         Some(id)
     }
 
@@ -539,9 +741,246 @@ impl RunQueue {
     /// Excludes `skip_cpu` (its own enqueue path re-evaluates anyway).
     pub fn preempt_cpus(&self, min_deadline: u64, skip_cpu: usize) -> impl Iterator<Item = usize> + '_ {
         self.running
+            .iter()
+            .filter(move |s| s.in_use)
+            .filter(move |s| s.ent.cpu != skip_cpu && s.ent.deadline > min_deadline)
+            .map(|s| s.ent.cpu)
+    }
+
+    // ───────────────── v0.18: steal/migration support (sched_lb) ─────────────────
+
+    /// Current queue pressure (Q8): EWMA of the late-dispatch share.
+    /// Read by the backend's tick path (publish hysteresis) and mirrored
+    /// into a lock-free per-CPU atomic for steal preconditions.
+    pub fn pressure_q8(&self) -> u32 {
+        self.pressure_q8
+    }
+
+    /// Decay pressure toward zero (backend calls this when the CPU goes
+    /// idle: no dispatches happen, so the late share is vacuously 0 and
+    /// the OVERLOADED flag must not stick on a drained core). Values
+    /// below ~1.5% snap to zero — a plain `p − p/4` has a fixed point
+    /// at p < 4 and would never fully drain.
+    pub fn relax_pressure(&mut self) {
+        let p = self.pressure_q8;
+        self.pressure_q8 = if p <= 4 { 0 } else { p - (p >> 2) };
+    }
+
+    /// Is a thread registered in this queue's cache (queued, running or
+    /// blocked-with-history)? The backend consults this when routing a
+    /// first enqueue (fresh registration vs. wake) and when applying a
+    /// priority change (entity present -> reweight here, else park the
+    /// weight until the first enqueue).
+    pub fn has_entity(&self, id: u128) -> bool {
+        self.entities.contains_key(&id)
+    }
+
+    /// Copy of the cached entity (diagnostics / balancer scoring).
+    pub fn entity_of(&self, id: u128) -> Option<Entity> {
+        self.entities.get(&id).copied()
+    }
+
+    /// Queued (pickable, not running) virtual deadline of a thread — the
+    /// backend uses it to decide whether a target CPU should preempt its
+    /// current task for a freshly enqueued one.
+    pub fn deadline_of(&self, id: u128) -> Option<u64> {
+        self.entities.get(&id).filter(|e| e.on_rq).map(|e| e.deadline)
+    }
+
+    /// A queued-thread snapshot for the offer publisher: everything the
+    /// showcase selection and the thief-side scoring need, collected in
+    /// one pass under the caller's lock (returned owned — the publisher
+    /// releases the queue lock before touching the slot array).
+    pub fn queued_snapshot(&self) -> alloc::vec::Vec<QueuedCand> {
+        self.entities
             .values()
-            .filter(move |r| r.cpu != skip_cpu && r.deadline > min_deadline)
-            .map(|r| r.cpu)
+            .filter(|e| e.on_rq)
+            .map(|e| QueuedCand {
+                id: e.id,
+                weight: e.weight,
+                slice: e.slice,
+                deadline: e.deadline,
+                tard_q8: e.tard_q8,
+                util_q8: e.util_q8,
+                speedup_q8: e.speedup_q8,
+                last_ran: e.last_ran,
+                cooldown_until: e.cooldown_until,
+            })
+            .collect()
+    }
+
+    /// v0.19: allocation-free variant of [`RunQueue::queued_snapshot`]
+    /// for the preempt-boundary publisher: fills `out` (truncating at
+    /// its length) and returns how many candidates were copied. The
+    /// caller supplies a per-CPU scratch buffer, so the queue-lock
+    /// section stays free of heap traffic (the Vec-returning snapshot
+    /// allocated under the lock — leaf SCHED taking KMEM, against the
+    /// lock discipline).
+    pub fn collect_queued(&self, out: &mut [QueuedCand]) -> usize {
+        let mut n = 0;
+        for e in self.entities.values() {
+            if n == out.len() {
+                break;
+            }
+            if !e.on_rq {
+                continue;
+            }
+            out[n] = QueuedCand {
+                id: e.id,
+                weight: e.weight,
+                slice: e.slice,
+                deadline: e.deadline,
+                tard_q8: e.tard_q8,
+                util_q8: e.util_q8,
+                speedup_q8: e.speedup_q8,
+                last_ran: e.last_ran,
+                cooldown_until: e.cooldown_until,
+            };
+            n += 1;
+        }
+        n
+    }
+
+    /// v0.19: feed one dispatch-segment IPC sample (Q8, 256 = IPC 1.0)
+    /// for the task, measured on a core whose fleet-normalized capacity
+    /// is `core_cap_q8` (256 = the fastest class). Updates the per-class
+    /// tracker (`ipc_fast_q8` on a max-capacity core, `ipc_slow_q8`
+    /// below); once both classes have samples, `speedup_q8` tracks their
+    /// ratio (clamped to [0.75x, 2x] in Q8) — the per-task big/little
+    /// hint carried into `Offer::speedup_q8` for steal scoring.
+    pub fn note_perf(&mut self, id: u128, core_cap_q8: u32, seg_ipc_q8: u32) {
+        let Some(e) = self.entities.get_mut(&id) else { return };
+        if seg_ipc_q8 == 0 {
+            return;
+        }
+        if core_cap_q8 >= 256 {
+            e.ipc_fast_q8 = match e.ipc_fast_q8 {
+                0 => seg_ipc_q8,
+                old => ewma4(old, seg_ipc_q8),
+            };
+        } else {
+            e.ipc_slow_q8 = match e.ipc_slow_q8 {
+                0 => seg_ipc_q8,
+                old => ewma4(old, seg_ipc_q8),
+            };
+        }
+        if e.ipc_fast_q8 > 0 && e.ipc_slow_q8 > 0 {
+            // This task's own cross-class rate ratio; the clamp bounds
+            // scoring noise from tiny samples.
+            let ratio =
+                ((e.ipc_fast_q8 as u64 * 256) / e.ipc_slow_q8 as u64).clamp(192, 512) as u32;
+            e.speedup_q8 = ewma4(e.speedup_q8.max(1), ratio);
+        }
+    }
+
+    /// v0.19: allocation-free sweep helper — copies up to `out.len()`
+    /// cached entity ids starting at index `skip` (callers loop chunks;
+    /// see backend `sweep_dead`).
+    pub fn entity_ids_into(&self, skip: usize, out: &mut [u128]) -> usize {
+        let mut n = 0;
+        for (i, id) in self.entities.keys().enumerate() {
+            if i < skip {
+                continue;
+            }
+            if n == out.len() {
+                break;
+            }
+            out[n] = *id;
+            n += 1;
+        }
+        n
+    }
+
+    /// Record the end of a dispatch segment (park: block, rotate or
+    /// throttle — the thread leaves the CPU). Updates the per-task
+    /// utilisation EWMA (duty cycle over the inter-park window; the
+    /// first park keeps the conservative "assume CPU-bound" value) and
+    /// the cache-hotness stamp `last_ran`.
+    pub fn note_park(&mut self, id: u128, now: u64, exec_cycles: u64) {
+        let Some(e) = self.entities.get_mut(&id) else { return };
+        if e.last_ran != 0 && now > e.last_ran {
+            let window = now - e.last_ran;
+            let on = exec_cycles.min(window);
+            let sample = (((on as u128) * 256) / (window as u128)).min(255) as u32;
+            e.util_q8 = ewma2(e.util_q8, sample); // α=1/2
+        }
+        e.last_ran = now;
+    }
+
+    /// Signed service imbalance of a queued thread vs. this queue's
+    /// virtual clock: `lag = V − ve` (positive = owed service — the task
+    /// ran less than its fair share). Clamped to ±`LAG_CAP_SLICES`
+    /// virtual slices so a waking thief cannot be flooded by a huge
+    /// sleeper/misfit credit. `None` if the thread is unknown here.
+    pub fn lag_of(&self, id: u128) -> Option<i64> {
+        let e = self.entities.get(&id)?;
+        let vs = vslice(self.base_slice, e.weight).max(1) as i64;
+        let lag = self.avg_vruntime() as i64 - e.vruntime as i64;
+        Some(lag.clamp(-2 * vs, 2 * vs))
+    }
+
+    /// Remove a thread from this queue ENTIRELY (ordered queue, running
+    /// set, cache, weight sums) and hand the cached entity to the caller
+    /// — the migration detach half. The attach half is
+    /// [`RunQueue::attach_entity`] on the destination queue. The caller
+    /// must hold this queue's lock and has typically just validated the
+    /// thread via [`RunQueue::is_queued`] under the same section.
+    pub fn take_entity(&mut self, id: u128) -> Option<Entity> {
+        if self.is_queued(id) {
+            self.queue_remove(id);
+            self.ready.fetch_sub(1, Ordering::Relaxed);
+        }
+        if let Some(e) = self.entities.get_mut(&id) {
+            e.on_rq = false;
+        }
+        self.running_remove(id);
+        self.entities.remove(&id)
+    }
+
+    /// Attach a migrant entity (taken from another queue with
+    /// [`RunQueue::take_entity`]) into THIS queue — the migration attach
+    /// half. Virtual time is re-based on the DESTINATION queue's clock:
+    ///
+    ///   `ve_dst = V_dst − clamp(lag, ±LAG_CAP_SLICES·vslice)`
+    ///
+    /// A positive lag (the usual case for an overdue task) makes the
+    /// migrant immediately eligible with an early deadline — that is the
+    /// point of stealing it — while the clamp bounds how hard it can
+    /// squeeze the locals (no "jump the whole queue" floods; a thief
+    /// cannot be abused as a priority booster). The migration counter
+    /// and the caller-computed cooldown window implement the anti-thrash
+    /// minimum stay (freshly stolen tasks are not re-offered).
+    pub fn attach_entity(&mut self, mut e: Entity, lag: i64, cooldown_until: u64) {
+        // Defensive: an entry with this id here would duplicate the
+        // migrant — replace it wholesale (the steal protocol makes this
+        // impossible in practice; unregister keeps the sums consistent).
+        if self.entities.contains_key(&e.id) {
+            self.unregister(e.id);
+        }
+        let avg = self.avg_vruntime();
+        let vs = vslice(self.base_slice, e.weight).max(1) as i64;
+        let lag = lag.clamp(-2 * vs, 2 * vs);
+        let ve = (avg as i128 - lag as i128).clamp(0, u64::MAX as i128) as u64;
+        e.vruntime = ve;
+        e.deadline = ve + vs.max(1) as u64;
+        e.slice = self.base_slice;
+        e.slice_left = self.base_slice;
+        e.on_rq = true;
+        e.throttled = false;
+        e.mig_count = e.mig_count.saturating_add(1);
+        e.cooldown_until = cooldown_until;
+        let k = key_of(&e);
+        let id = e.id;
+        self.queue.insert(k, id);
+        self.weight_sum = self.weight_sum.wrapping_add(e.weight as u64);
+        self.wv_sum = self
+            .wv_sum
+            .wrapping_add(e.weight as u128 * e.vruntime as u128);
+        self.ready.fetch_add(1, Ordering::Relaxed);
+        if ve > self.min_vruntime {
+            self.min_vruntime = ve;
+        }
+        self.entities.insert(id, e);
     }
 
     // ───────────────────────── Internals ─────────────────────────
@@ -713,7 +1152,7 @@ mod tests {
         rq.enqueue(8);
         assert_eq!(rq.pick(1), Some(8));
         assert!(!rq.unregister(8));
-        assert!(rq.running.is_empty());
+        assert_eq!(rq.running_len(), 0);
     }
 
     #[test]
@@ -778,5 +1217,299 @@ mod tests {
             exec[0],
             exec[1]
         );
+    }
+
+    // ───────── v0.18: steal/migration support ─────────
+
+    #[test]
+    fn pressure_and_tardiness_track_late_dispatches() {
+        // Overload two same-weight entities on one CPU with tiny slices:
+        // every dispatch is late (V ran past the queued deadline), so the
+        // pressure EWMA must climb; the repeatedly-delayed entity keeps a
+        // positive tardiness EWMA.
+        let mut rq = RunQueue::new(SLICE);
+        for id in 1..=4u128 {
+            rq.enqueue(id);
+        }
+        for _ in 0..40 {
+            let id = rq.pick(0).unwrap();
+            // Overshoot: each dispatched entity burns 4 slices, so the
+            // queue's virtual clock runs far past everyone's queued
+            // deadline — every subsequent dispatch is late.
+            rq.charge(id, 4 * SLICE);
+            rq.enqueue(id);
+        }
+        assert!(
+            rq.pressure_q8() >= 128,
+            "sustained late dispatches must raise pressure, got {}",
+            rq.pressure_q8()
+        );
+        let slippers = (1..=4u128)
+            .filter(|&id| rq.entity_of(id).map(|e| e.tard_q8 > 0).unwrap_or(false))
+            .count();
+        assert!(slippers >= 2, "queued entities must record slip");
+        // Idle drain: pressure decays monotonically to zero.
+        let mut prev = rq.pressure_q8();
+        for _ in 0..40 {
+            rq.relax_pressure();
+            let now = rq.pressure_q8();
+            assert!(now <= prev);
+            prev = now;
+        }
+        assert_eq!(rq.pressure_q8(), 0);
+    }
+
+    #[test]
+    fn note_park_duty_cycle_ewma() {
+        let mut rq = RunQueue::new(SLICE);
+        rq.enqueue(7);
+        // First park: keeps the conservative 255, stamps last_ran.
+        rq.note_park(7, 1000, 10);
+        assert_eq!(rq.entity_of(7).unwrap().util_q8, 255);
+        assert_eq!(rq.entity_of(7).unwrap().last_ran, 1000);
+        // 25% duty cycle over the next window: util EWMA halves toward 64.
+        rq.note_park(7, 2000, 250); // on/window = 250/1000
+        let u = rq.entity_of(7).unwrap().util_q8;
+        assert_eq!(u, 255 - (255 - 64) / 2, "α=1/2 step toward the sample");
+        // A CPU-bound pattern converges back up.
+        for _ in 0..20 {
+            rq.note_park(7, 0, 0); // no-op windows keep the stamp fresh
+        }
+        let mut t = 2000;
+        for _ in 0..30 {
+            t += 1000;
+            rq.note_park(7, t, 1000); // 100% duty
+        }
+        assert!(rq.entity_of(7).unwrap().util_q8 > 200);
+    }
+
+    #[test]
+    fn migration_lag_is_clamped_and_rebased() {
+        // src: two entities; one lags far behind (huge positive lag).
+        let mut src = RunQueue::new(SLICE);
+        let mut dst = RunQueue::new(SLICE);
+        src.register(1, NICE0_WEIGHT);
+        src.register(2, NICE0_WEIGHT);
+        src.enqueue(1);
+        src.enqueue(2);
+        // Run only entity 1 for a long time: entity 2 accumulates lag.
+        for _ in 0..30 {
+            let id = src.pick(0).unwrap();
+            src.charge(id, if id == 1 { SLICE } else { 0 });
+            src.enqueue(id);
+        }
+        let lag = src.lag_of(2).expect("entity 2 is queued");
+        let vs = vslice(SLICE, NICE0_WEIGHT) as i64;
+        assert!(
+            lag <= 2 * vs && lag >= -2 * vs,
+            "lag must be clamped to ±2 vslices, got {lag} (vs={vs})"
+        );
+        // Detach + attach with the clamped lag: the migrant must land at
+        // vruntime = V_dst − lag, be queued with a fresh slice, and its
+        // migration counter/cooldown must advance.
+        let e = src.take_entity(2).unwrap();
+        assert!(!src.has_entity(2));
+        assert_eq!(src.ready_len(), 1);
+        let v_dst_before = dst.avg_vruntime();
+        dst.attach_entity(e, lag, 42);
+        let m = dst.entity_of(2).unwrap();
+        assert_eq!(m.on_rq, true);
+        assert_eq!(m.mig_count, 1);
+        assert_eq!(m.cooldown_until, 42);
+        assert_eq!(m.slice_left, SLICE, "migrant gets a fresh slice");
+        let expect = (v_dst_before as i64 - lag).max(0) as u64;
+        assert!(
+            m.vruntime.abs_diff(expect) <= 1,
+            "ve must be rebased on the destination clock"
+        );
+        assert_eq!(dst.ready_len(), 1);
+        // The migrant is immediately pickable (eligible by construction:
+        // ve <= avg of the queue that now contains it).
+        assert_eq!(dst.pick(1), Some(2));
+    }
+
+    #[test]
+    fn migration_preserves_policy_state() {
+        let mut src = RunQueue::new(SLICE);
+        let mut dst = RunQueue::new(SLICE);
+        src.register(3, 8 * NICE0_WEIGHT);
+        src.enqueue(3);
+        // Give the entity some balancer history.
+        src.note_park(3, 500, 128);
+        let e = src.take_entity(3).unwrap();
+        dst.attach_entity(e, 0, 0);
+        let m = dst.entity_of(3).unwrap();
+        assert_eq!(m.weight, 8 * NICE0_WEIGHT, "weight survives migration");
+        assert_eq!(m.last_ran, 500, "cache stamp survives migration");
+        assert_eq!(m.util_q8, 255, "util history survives migration");
+    }
+
+    #[test]
+    fn queued_snapshot_lists_only_queued() {
+        let mut rq = RunQueue::new(SLICE);
+        rq.register(1, NICE0_WEIGHT);
+        rq.register(2, NICE0_WEIGHT);
+        rq.register(3, NICE0_WEIGHT);
+        rq.enqueue(1);
+        rq.enqueue(2);
+        assert_eq!(rq.pick(0), Some(1)); // 1 is running now
+        let snap = rq.queued_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].id, 2);
+        assert_eq!(rq.deadline_of(2), Some(snap[0].deadline));
+        assert_eq!(rq.deadline_of(1), None, "running entity has no queued dl");
+    }
+
+    #[test]
+    fn negative_lag_migrant_does_not_jump_ahead() {
+        // A migrant that ran MORE than its share (negative lag) must not
+        // end up before the destination locals: ve = V_dst − lag > V_dst.
+        let mut dst = RunQueue::new(SLICE);
+        dst.register(1, NICE0_WEIGHT);
+        dst.enqueue(1);
+        let mut src = RunQueue::new(SLICE);
+        src.register(9, NICE0_WEIGHT);
+        src.enqueue(9);
+        let e = src.take_entity(9).unwrap();
+        let v_dst = dst.avg_vruntime();
+        dst.attach_entity(e, -(vslice(SLICE, NICE0_WEIGHT) as i64), 0);
+        let m = dst.entity_of(9).unwrap();
+        assert!(m.vruntime >= v_dst, "negative-lag migrant starts at/behind V");
+        // The local (eligible, at V) must win the next pick.
+        assert_eq!(dst.pick(0), Some(1));
+    }
+
+    // ───────── v0.19: fixed running set + perf/snapshot additions ─────────
+
+    #[test]
+    fn running_set_marks_and_clears_by_id() {
+        let mut rq = RunQueue::new(SLICE);
+        rq.register(1, NICE0_WEIGHT);
+        rq.register(2, NICE0_WEIGHT);
+        rq.enqueue(1);
+        rq.enqueue(2);
+        assert_eq!(rq.pick(3), Some(1)); // dispatched on cpu 3
+        assert!(rq.is_running_here(1));
+        assert!(!rq.is_running_here(2));
+        assert_eq!(rq.running_len(), 1);
+        let snap: alloc::vec::Vec<(u128, RunningEnt)> = rq.running_snapshot().collect();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].0, 1);
+        assert_eq!(snap[0].1.cpu, 3);
+        rq.running_remove(1);
+        assert!(!rq.is_running_here(1));
+        assert_eq!(rq.running_len(), 0);
+        // Re-dispatch reuses the slot array without heap traffic.
+        assert_eq!(rq.pick(4), Some(2));
+        assert!(rq.is_running_here(2));
+        assert_eq!(rq.running_len(), 1);
+    }
+
+    #[test]
+    fn running_survives_queue_removal_paths() {
+        // take_entity / dequeue / mark_throttled all clear the running
+        // mark without leaving stale slots behind.
+        let mut rq = RunQueue::new(SLICE);
+        rq.enqueue(5);
+        assert_eq!(rq.pick(0), Some(5));
+        let e = rq.take_entity(5).unwrap();
+        assert!(!e.on_rq);
+        assert_eq!(rq.running_len(), 0);
+        rq.enqueue(6);
+        assert_eq!(rq.pick(0), Some(6));
+        rq.dequeue(6);
+        assert_eq!(rq.running_len(), 0);
+        rq.enqueue(7);
+        assert_eq!(rq.pick(0), Some(7));
+        rq.mark_throttled(7);
+        assert_eq!(rq.running_len(), 0);
+    }
+
+    #[test]
+    fn note_perf_builds_cross_class_ratio() {
+        let mut rq = RunQueue::new(SLICE);
+        rq.register(1, NICE0_WEIGHT);
+        rq.enqueue(1);
+        let e0 = rq.entity_of(1).unwrap();
+        assert_eq!(e0.speedup_q8, 256);
+        assert_eq!(e0.ipc_fast_q8, 0);
+        // Only fast-class samples: the ratio stays neutral.
+        for _ in 0..10 {
+            rq.note_perf(1, 256, 400);
+        }
+        let e1 = rq.entity_of(1).unwrap();
+        assert_eq!(e1.ipc_fast_q8, 400);
+        assert_eq!(e1.ipc_slow_q8, 0);
+        assert_eq!(e1.speedup_q8, 256, "one-sided history keeps the neutral hint");
+        // Slow-class samples arrive: ratio 400/200 = 2x -> Q8 512 (clamped).
+        for _ in 0..40 {
+            rq.note_perf(1, 128, 200);
+        }
+        let e2 = rq.entity_of(1).unwrap();
+        assert_eq!(e2.ipc_slow_q8, 200);
+        assert!(
+            e2.speedup_q8 > 256 && e2.speedup_q8 <= 512,
+            "speedup must converge toward 2x, got {}",
+            e2.speedup_q8
+        );
+        // Zero sample and unknown task: no-ops.
+        rq.note_perf(1, 256, 0);
+        rq.note_perf(999, 256, 300);
+        assert!(rq.entity_of(999).is_none());
+    }
+
+    #[test]
+    fn collect_queued_matches_vec_snapshot() {
+        let mut rq = RunQueue::new(SLICE);
+        for id in 1..=5u128 {
+            rq.enqueue(id);
+        }
+        assert_eq!(rq.pick(0), Some(1)); // one running
+        let vec_snap = rq.queued_snapshot();
+        let mut buf = [QueuedCand::ZERO; 64];
+        let n = rq.collect_queued(&mut buf);
+        assert_eq!(n, vec_snap.len());
+        for i in 0..n {
+            assert_eq!(buf[i].id, vec_snap[i].id);
+            assert_eq!(buf[i].tard_q8, vec_snap[i].tard_q8);
+            assert_eq!(buf[i].speedup_q8, vec_snap[i].speedup_q8);
+        }
+        // Truncation: a 2-slot buffer keeps the first queued entities.
+        let mut tiny = [QueuedCand::ZERO; 2];
+        let m = rq.collect_queued(&mut tiny);
+        assert_eq!(m, 2);
+        assert_eq!(tiny[0].id, vec_snap[0].id);
+        assert_eq!(tiny[1].id, vec_snap[1].id);
+    }
+
+    #[test]
+    fn entity_ids_into_paginates() {
+        let mut rq = RunQueue::new(SLICE);
+        for id in 1..=6u128 {
+            rq.register(id, NICE0_WEIGHT);
+        }
+        let total = rq.entity_count();
+        let mut seen: alloc::vec::Vec<u128> = alloc::vec::Vec::new();
+        let mut skip = 0;
+        let mut buf = [0u128; 4];
+        loop {
+            let n = rq.entity_ids_into(skip, &mut buf);
+            if n == 0 {
+                break;
+            }
+            for i in 0..n {
+                seen.push(buf[i]);
+            }
+            skip += n;
+            if seen.len() >= total {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), total);
+        let mut a = seen.clone();
+        let mut b: alloc::vec::Vec<u128> = rq.entity_ids().collect();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b);
     }
 }

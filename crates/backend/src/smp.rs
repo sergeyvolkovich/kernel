@@ -161,7 +161,7 @@ pub enum AcpiError {
 }
 
 /// Заголовок ACPI-таблицы: сигнатура + длина (первые 8 байт формата).
-fn table_len(hdr: &[u8]) -> Result<usize, AcpiError> {
+pub(crate) fn table_len(hdr: &[u8]) -> Result<usize, AcpiError> {
     if hdr.len() < 8 {
         return Err(AcpiError::Truncated);
     }
@@ -592,6 +592,9 @@ extern "C" fn ap_entry64() -> ! {
     }
     // per-CPU привилегированное состояние (аналог bsp_init).
     crate::cpu::ap_init(cpu);
+    // v0.19: per-CPU perf bring-up (mode inherited from the BSP probe;
+    // own TSC-rate calibration — IF still 0, a ~1-3 ms bench).
+    crate::perf::cpu_up(cpu);
     mark(b'B');
     // LAPIC этого CPU: SIVR + собственный ID (сверка с MADT ниже).
     if let Err(e) = crate::lapic::init() {
@@ -635,7 +638,7 @@ extern "C" fn ap_entry64() -> ! {
 // ───────────────────── Bring-up (BSP, до кучи) ─────────────────────
 
 /// Physmap-читалка 8-байтовых окон (цель; тесты подставляют срез).
-fn phys_read8(phys: u64, len: usize) -> [u8; 8] {
+pub(crate) fn phys_read8(phys: u64, len: usize) -> [u8; 8] {
     let mut out = [0u8; 8];
     // SAFETY: physmap покрывает 4 GiB; читаем только прошивочные таблицы.
     let src = unsafe { core::slice::from_raw_parts(phys_ptr::<u8>(phys), len) };
@@ -644,7 +647,7 @@ fn phys_read8(phys: u64, len: usize) -> [u8; 8] {
 }
 
 /// Прочитать физический срез таблицы (после определения длины).
-fn phys_slice(phys: u64, len: usize) -> &'static [u8] {
+pub(crate) fn phys_slice(phys: u64, len: usize) -> &'static [u8] {
     // SAFETY: таблицы прошивки живут всю сессию.
     unsafe { core::slice::from_raw_parts(phys_ptr::<u8>(phys), len) }
 }
@@ -725,6 +728,10 @@ pub fn bring_up(bi: &boot_info::BootInfo) {
         topo.present,
         percpu::lapic_id()
     );
+    // v0.19: real SMT/LLC/NUMA domains for the load balancer — built
+    // from the FINAL cpu set (holes from AP timeouts included), before
+    // anything else in the system can read them.
+    crate::topology::build(topo);
     if topo.present <= 1 {
         crate::kprintln!("smp: single CPU system (BSP only)");
         return;

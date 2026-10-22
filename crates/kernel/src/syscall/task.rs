@@ -342,12 +342,20 @@ impl SyscallHandler for ThreadCreateHandler {
         };
         // 2. Менеджер: создание потока (валидация владельца/коллизий там).
         let thread_id = task_id_from_args(args.arg(4), args.arg(5));
-        ctx.tasks.create_thread(
+        // v0.17: arg6 — начальное TLS-слово (0 = без TLS, до-v0.17
+        // поведение; старые вызывающие не передают шестой аргумент —
+        // SyscallArgs::arg(6) детерминированно 0, ABI не меняется).
+        // Выставка НА создании закрывает гонку «создал -> выставил»:
+        // свежий поток может быть диспетчеризован другим CPU раньше,
+        // чем создатель дойдёт до THREAD_SET_TLS.
+        let tls = args.arg(6);
+        ctx.tasks.create_thread_with_tls(
             thread_id,
             task_id,
             TaskPriority::DEFAULT,
             args.arg(2),
             args.arg(3),
+            tls,
         )?;
         Ok(0)
     }
@@ -1013,6 +1021,28 @@ impl SyscallHandler for ThreadYieldHandler {
             s.yield_now(ctx.thread)?;
         }
         Ok(0)
+    }
+}
+
+/// TLS-слово потока (v0.17, THREAD_SET_TLS): НЕПРОЗРАЧНОЕ значение,
+/// которое бекенд платформы грузит в регистр указателя потока при
+/// каждой диспетчеризации. Ядро значение не интерпретирует (детали —
+/// в доке `nums::THREAD_SET_TLS`).
+/// ПРАВО: свой домен ИЛИ TaskTCB домена потока (как SUSPEND/RESUME).
+/// ABI: arg1..2 = ThreadId(lo, hi), arg3 = слово.
+/// Возврат: прежнее слово.
+pub struct ThreadSetTlsHandler;
+
+impl ThreadSetTlsHandler {
+    pub const SYSCALL: SyscallNumber = nums::THREAD_SET_TLS;
+}
+
+impl SyscallHandler for ThreadSetTlsHandler {
+    fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+        let id = task_id_from_args(args.arg(1), args.arg(2));
+        require_thread_domain(ctx, &id)?;
+        let old = ctx.tasks.thread_set_tls(&id, args.arg(3))?;
+        Ok(old)
     }
 }
 

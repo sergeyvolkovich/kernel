@@ -56,6 +56,7 @@ dependencies = [
  "llfree",
  "pkg_generic_interface",
  "raw-cpuid",
+ "sched_lb",
  "spin",
  "startup",
  "uuid",
@@ -306,6 +307,13 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "sched_lb"
+version = "0.5.0"
+dependencies = [
+ "eevdf",
+]
 
 [[package]]
 name = "scopeguard"

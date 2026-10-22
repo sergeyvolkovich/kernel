@@ -1,0 +1,17 @@
+[package]
+name = "sched_lb"
+version.workspace = true
+edition.workspace = true
+description = "Scheduler load-balancing policy library (v0.18): per-core offer showcase with two-phase lock-free claims, deadline-pressure hysteresis, steal admission/scoring and anti-thrash math. Pure policy + data structures, no locking (caller-owned serialization)."
+
+[lib]
+name = "sched_lb"
+path = "src/lib.rs"
+
+# Host unit tests (std) + no_std deployment: only `core` atomics and the
+# `eevdf` policy crate (for the entity/handoff types).
+[features]
+default = []
+
+[dependencies]
+eevdf = { workspace = true }

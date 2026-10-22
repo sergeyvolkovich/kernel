@@ -191,121 +191,57 @@ impl UserCtx {
     }
 }
 
-// ───────────────────── Готовность: EEVDF (v0.16) ─────────────────────
+// ───────────────────── Готовность: per-CPU EEVDF + витрина (v0.18) ─────────────────────
 
-/// Готовность — ОДИН упорядоченный EEVDF-набор (крейт `eevdf`: политика
-/// + данные, без локов — сериализация этим KSpin-листом). Замена
-/// v0.12-v0.15 lock-free MPMC-кольца Выюкова (FIFO без приоритетов):
-/// приоритеты L4 (0..255) теперь — ВЕСА EEVDF (таблица nice-весов):
-/// более тяжёлый поток получает меньший виртуальный дедлайн (выбирается
-/// раньше) и большую долю CPU. Выбор — минимальный виртуальный дедлайн
-/// среди ELIGIBLE (см. документацию крейта).
+/// Готовность — по ОДНОЙ очереди EEVDF на CPU (`crates/eevdf`: политика
+/// + данные; сериализация — leaf-KSpin каждой очереди в `crate::lb::RQ`).
+/// Замена единого глобального набора v0.16: поток живёт на своей
+/// «домашней» очереди (cache affinity), размещение на пробуждении —
+/// `lb::place_and_enqueue` (home → idle → push-assist), а
+/// перегруженные ядра публикуют кандидатов-жертв в витрину
+/// (`lb::SHELF`), откуда недогруженные забирают работу двухфазным
+/// claim'ом (CAS по слоту → перенос с сохранением lag).
 ///
-/// Синхронизация: leaf-ранг KSpin (как INNER — под ним чужих локов нет;
-/// хуки из-под TCB-write берут его вложенно, ранг TCB->SCHED прежний).
-/// Критические секции — чистые операции BTreeMap O(log n); память
-/// сущностей ограничена квотой потоков (512).
+/// Синхронизация: RQ[cpu]/HOME/inbox'ы — leaf-ранг KSpin, НИКОГДА не
+/// вкладываются друг в друга (последовательные захваты — ок); хуки из-под
+/// TCB-write берут их вложенно по прежнему рангу TCB→SCHED.
 ///
-/// Eager-deschedule (вместо «ленивого» v0.12): десчедул-хук УДАЛЯЕТ
-/// сущность из набора — фантомные веса в avg_vruntime не копятся, отсев
-/// на pick остаётся только защитой от гонок переходов (поток покинул
-/// Ready между нашим pick и mark_running).
-static EEVDF: pkg_generic_interface::sync::KSpin<eevdf::RunQueue> =
-    pkg_generic_interface::sync::KSpin::new(eevdf::RunQueue::new(0));
+/// Сигналы v0.18: per-task EWMA опозданий (tardiness) и per-core
+/// pressure (доля опоздавших dispatch'ей) считаются в крейте eevdf
+/// на каждом pick; гистерезис публикации/подкрутки — `lb`.
 
-/// Битмап простаивающих CPU (idle_loop ставит бит перед hlt, снимает
-/// после пробуждения). Пробуждение готовности шлёт resched-IPI ТОЛЬКО
-/// простаивающим + urgent-случаю (раньше — broadcast всем на КАЖДЫЙ
-/// enqueue: «шторм IPI на всплесках готовности» был принятой ценой
-/// простоты v0.12-v0.15).
-static IDLE_MASK: AtomicU64 = AtomicU64::new(0);
-
-/// Порог числа адресатов, при котором broadcast дешевле уникастов.
-const IPI_BROADCAST_THRESHOLD: u32 = 3;
+/// Битмап простаивающих CPU — делегирован балансировщику (lb::IDLE_MASK:
+/// та же семантика, плюс штамп входа в idle для «дешёвого» пробуждения).
+/// Пробуждение готовности будит точечным resched-IPI цель размещения
+/// (idle-цель или urgent-случай по CUR_DL) — см. lb::notify_target.
 
 /// Зафиксировать базовый слайс EEVDF (циклы TSC) — один раз после
 /// калибровки TSC, ДО release_aps (рядом с set_cpu_time_unit).
 pub fn set_base_slice(cycles: u64) {
-    EEVDF.lock().set_base_slice(cycles.max(1));
+    crate::lb::init_base_slice(cycles);
 }
 
-/// Отметить свой CPU простаивающим (перед hlt) / активным (после).
+/// Отметить свой CPU простаивающим (перед hlt) / активным (после):
+/// бит в lb::IDLE_MASK + штамп входа в idle (lb выбирает самое
+/// «дешёвое» для пробуждения ядро — недавно уснувшее).
 #[inline]
 pub fn set_cpu_idle(cpu: usize, idle: bool) {
     let bit = 1u64 << (cpu & 63);
     if idle {
-        IDLE_MASK.fetch_or(bit, Ordering::Release);
+        crate::lb::IDLE_MASK.fetch_or(bit, Ordering::Release);
+        crate::lb::IDLE_ENTER[cpu & (crate::smp::MAX_CPUS - 1)]
+            .store(crate::lapic::read_tsc(), Ordering::Relaxed);
     } else {
-        IDLE_MASK.fetch_and(!bit, Ordering::Release);
+        crate::lb::IDLE_MASK.fetch_and(!bit, Ordering::Release);
     }
 }
 
-/// Разбудить CPU, которым есть смысл пересмотреть готовность (после
-/// публикации нового готового потока):
-///
-///   * idle-CPU — обязаны проснуться (иначе работа будет ждать hlt);
-///   * urgent: работающий CPU, чей текущий поток имеет дедлайн ХУЖЕ
-///     (позже) лучшего дедлана очереди — только он реально сменит
-///     поток при перевыпуске; равновесные пробуждения IPC его не
-///     бужут (перевыпуск — на своей границе кванта, как раньше);
-///   * свой CPU — без IPI: локальный флаг need_resched.
-///
-/// Замена broadcast-на-каждый-enqueue (v0.12-v0.15): интенсивный
-/// IPC-пинг-понг равновесных потоков больше не генерирует IPI вовсе.
-fn kick_cpus_after_ready() {
-    let self_cpu = arch::percpu::cpu_id() as usize;
-    let others_online = crate::smp::online_mask() & !(1u64 << (self_cpu & 63));
-    if others_online == 0 {
-        // Единственный CPU: срочность — свой же флаг (без IPI).
-        if urgent_self_preempt(self_cpu) {
-            arch::percpu::set_need_resched();
-        }
-        return;
-    }
-    let idle = IDLE_MASK.load(Ordering::Acquire) & others_online;
-    let mut urgent: u64 = 0;
-    {
-        let rq = EEVDF.lock();
-        if let Some(qmin) = rq.min_queued_deadline() {
-            for (_id, r) in rq.running_snapshot() {
-                if r.deadline > qmin {
-                    if r.cpu == self_cpu {
-                        // Своего — флагом, без IPI.
-                        arch::percpu::set_need_resched();
-                    } else if (others_online >> (r.cpu & 63)) & 1 == 1 {
-                        urgent |= 1u64 << (r.cpu & 63);
-                    }
-                }
-            }
-        }
-    }
-    let targets = idle | urgent;
-    if targets == 0 {
-        return;
-    }
-    if targets.count_ones() >= IPI_BROADCAST_THRESHOLD {
-        crate::lapic::broadcast_others(arch::boot::VEC_IPI_RESCHED);
-        return;
-    }
-    // Точечные IPI (дешевле broadcast при 1-2 адресатах).
-    for cpu in 0..crate::smp::MAX_CPUS as u64 {
-        if (targets >> cpu) & 1 == 1 {
-            crate::lapic::send_ipi_to(crate::smp::lapic_id_of(cpu as usize) as u32, arch::boot::VEC_IPI_RESCHED);
-        }
-    }
-}
-
-/// Лучший дедлайн очереди бьёт дедлайн СВОЕГО текущего потока?
-/// (свой CPU — флаг вместо IPI; см. kick_cpus_after_ready)
-fn urgent_self_preempt(self_cpu: usize) -> bool {
-    let rq = EEVDF.lock();
-    match rq.min_queued_deadline() {
-        Some(qmin) => rq
-            .running_snapshot()
-            .any(|(_id, r)| r.cpu == self_cpu && r.deadline > qmin),
-        None => false,
-    }
-}
+// (v0.18) Разбудить нужные CPU при публикации готовности —
+// точечно для ЦЕЛИ размещения: см. lb::place_and_enqueue →
+// lb::notify_target (idle-цель обязана проснуться; urgent — только если
+// новый дедлайн бьёт дедлайн работающего CUR_DL[target]). Замена
+// глобального kick_cpus_after_ready v0.16 (обход running-набора всей
+// очереди на каждом enqueue).
 
 // ───────────────────── Состояние планировщика (KSpin — лист) ─────────────────────
 
@@ -625,19 +561,20 @@ impl X86Sched {
         arch::percpu::take_need_resched()
     }
 
-    /// Выбрать следующий поток: лучший eligible-кандидат EEVDF
-    /// (минимальный виртуальный дедлайн; атомарный ready-len внутри
-    /// крейта — для дешёвого peek в idle). `None` — пусто. Валидация
-    /// живости — в [`schedule_next`] (нужен glue для чтения состояния
-    /// TCB): с eager-deschedule протухшие записи — только гонки
-    /// переходов (поток покинул Ready между нашим pick и mark_running),
+    /// Выбрать следующий поток: лучший eligible-кандидат СВОЕЙ очереди
+    /// EEVDF (минимальный виртуальный дедлайн; lb::pick публикует
+    /// CUR_DL/pressure-зеркала). `None` — пусто (idle-петля гейта
+    /// попробует украсть работу с витрины до hlt). Валидация живости —
+    /// в [`schedule_next`] (нужен glue для чтения состояния TCB):
+    /// с eager-deschedule протухшие записи — только гонки переходов
+    /// (поток покинул Ready между нашим pick и mark_running),
     /// pick их честно потребляет.
     ///
     /// Квант: периодический фолбэк — тики в GS (как v0.10); TSC-deadline
     /// — квант взводится at finalize (точная граница, тики не нужны).
     pub fn pick_next(&self) -> Option<ThreadId> {
         let cpu = arch::percpu::cpu_id() as usize;
-        let next = EEVDF.lock().pick(cpu)?;
+        let (next, _dl) = crate::lb::pick(cpu)?;
         if !crate::lapic::using_tsc_deadline() {
             arch::percpu::set_quantum(arch::boot::SCHED_HZ / 10);
         }
@@ -658,36 +595,47 @@ impl X86Sched {
     /// Слот экспортируется в карту (парк: pick после unthrottle возьмёт
     /// контекст оттуда).
     pub fn throttle_current(&self) {
+        let cpu = arch::percpu::cpu_id() as usize;
         if let Some(t) = self.current_thread() {
             self.export_slot_if(t);
-            // EEVDF (v0.16): сущность покидает running-набор и
-            // помечается throttled — возврат в готовность только через
-            // unthrottle (граница периода).
-            EEVDF.lock().mark_throttled(t.as_u128());
+            // EEVDF (v0.16): сущность покидает running-набор своей
+            // очереди и помечается throttled — возврат в готовность
+            // только через unthrottle (граница периода).
+            crate::lb::mark_throttled(cpu, t.as_u128());
             INNER.lock().throttled.push_back(t);
         }
     }
 
     /// Граница периода: дренаж троттл-листа в готовность (FIFO-порядок
-    /// сохранён). Возврат — число возвращённых потоков; гейт по >0
-    /// рассылает resched-IPI (будим idle-CPU).
+    /// сохранён; маршрутизация — по домашним очередям в lb). Возврат —
+    /// число возвращённых потоков; notify внутри lb будит цели.
     pub fn unthrottle_all(&self) -> usize {
-        let ids: Vec<ThreadId> = {
-            let mut inner = INNER.lock();
-            inner.throttled.drain(..).collect()
-        };
-        let n = ids.len();
-        if n > 0 {
+        // v0.19: drain the throttle list without heap traffic — fixed
+        // 64-id chunks go straight to the balancer (the v0.18 path built
+        // two Vecs, one of them under the INNER lock).
+        let mut total = 0usize;
+        loop {
+            let mut chunk = [0u128; 64];
+            let mut n = 0usize;
             {
-                let mut rq = EEVDF.lock();
-                for t in &ids {
-                    rq.enqueue(t.as_u128());
+                let mut inner = INNER.lock();
+                while n < chunk.len() {
+                    match inner.throttled.pop_front() {
+                        Some(t) => {
+                            chunk[n] = t.as_u128();
+                            n += 1;
+                        }
+                        None => break,
+                    }
                 }
             }
-            // Будим idle/urgent (как enqueue; замена broadcast).
-            kick_cpus_after_ready();
+            if n == 0 {
+                break;
+            }
+            crate::lb::unthrottle_batch(&chunk[..n]);
+            total += n;
         }
-        n
+        total
     }
 
     /// Число потоков в троттл-листе (диагностика/аудит).
@@ -740,6 +688,8 @@ impl X86Sched {
     /// Забыть контекст мёртвого потока (гейт после reap; слот — свой,
     /// карта — кросс-CPU: kill-пути ядра гасят потоки с любого CPU).
     /// v0.16: заодно — EEVDF-сущность (кэш планировщика не течёт).
+    /// v0.18: сущность живёт на домашней очереди — вычистка через
+    /// lb::drop_thread (маршрутизация + unregister).
     pub fn drop_context(&self, thread: ThreadId) {
         let cpu = arch::percpu::cpu_id() as usize;
         let c = ctx_cpu(cpu);
@@ -750,14 +700,14 @@ impl X86Sched {
                 if let Some(b) = (*c.slot.get()).take() {
                     recycle_ctx(cpu, b);
                 }
-                EEVDF.lock().unregister(thread.as_u128());
+                crate::lb::drop_thread(thread.as_u128());
                 return;
             }
         }
         if let Some(b) = INNER.lock().contexts.remove(&thread.as_u128()) {
             recycle_ctx(cpu, b);
         }
-        EEVDF.lock().unregister(thread.as_u128());
+        crate::lb::drop_thread(thread.as_u128());
     }
 
     /// Подмет записи карты, чей TCB разрушен (ядровые kill-пути без
@@ -766,18 +716,17 @@ impl X86Sched {
     ///
     /// v0.16: сюда же — EEVDF-сущности мёртвых потоков (кэш планировщика
     /// не течёт; drop_context чистит основные пути, этот — страховка).
+    /// v0.18: сущности размазаны по per-CPU очередям + таблица маршрутизации
+    /// lb::HOME — зачистка делегирована lb::sweep_dead (обходит ВСЕ
+    /// очереди: вора могло убить в момент трансфера).
     ///
     /// Локи: ключи копируются под своим локом, БЕЗ glue-вызовов (вкладка
-    /// EEVDF->менеджер запрещена — экспорт-хуки вкладывают наоборот);
+    /// SCHED->менеджер запрещена — экспорт-хуки вкладывают наоборот);
     /// state-запросы — без локов; удаление — повторный короткий захват.
     pub fn sweep_dead_contexts(&self) -> usize {
         let keys: alloc::vec::Vec<u128> = {
             let inner = INNER.lock();
             inner.contexts.keys().copied().collect()
-        };
-        let eevdf_ids: alloc::vec::Vec<u128> = {
-            let rq = EEVDF.lock();
-            rq.entity_ids().collect()
         };
         let mut dead = 0usize;
         for k in keys {
@@ -791,18 +740,23 @@ impl X86Sched {
                 dead += 1;
             }
         }
-        for id in eevdf_ids {
-            let gone = gate::kernel_glue()
-                .thread_state(ThreadId::from_u128(id))
-                .is_none();
-            if gone {
-                // Троттл-лист мог держать ссылку — вычистим симметрично
-                // (запись уже мертва: и очередь готовности, и троттл).
-                let mut rq = EEVDF.lock();
-                rq.unregister(id);
-                drop(rq);
-                let mut inner = INNER.lock();
-                if let Some(pos) = inner.throttled.iter().position(|&t| t.as_u128() == id) {
+        // EEVDF-сущности + маршрутизация: обход всех очередей.
+        dead += crate::lb::sweep_dead(&|id| {
+            gate::kernel_glue().thread_state(ThreadId::from_u128(id)).is_none()
+        });
+        // Троттл-лист: мёртвые ссылки вычистим по пути (редкий случай).
+        {
+            let mut inner = INNER.lock();
+            let stale: Vec<ThreadId> = inner
+                .throttled
+                .iter()
+                .filter(|t| {
+                    gate::kernel_glue().thread_state(**t).is_none()
+                })
+                .copied()
+                .collect();
+            for t in stale {
+                if let Some(pos) = inner.throttled.iter().position(|&x| x == t) {
                     inner.throttled.remove(pos);
                 }
                 dead += 1;
@@ -811,17 +765,18 @@ impl X86Sched {
         dead
     }
 
-    /// Есть ли готовые? (короткий захват EEVDF-лока — чтение счётчика
-    /// очереди; незанятый спин-лок ~десятки циклов, путь idle-цикла не
-    /// горячий; лишние пробуждения idle отсеет schedule_next).
+    /// Есть ли готовые в СВОЕЙ очереди? (зеркало lb::RDY — без локов;
+    /// idle-петля до hlt успеет ещё украсть с витрины — см. gate.rs).
     pub fn has_ready(&self) -> bool {
-        EEVDF.lock().ready_len() != 0
+        let cpu = arch::percpu::cpu_id() as usize;
+        crate::lb::ready(cpu) != 0
     }
 
     // ==== TSC-deadline v0.13/v0.16 (точное вытеснение + advisory-уведомления) ====
 
     /// Зарядить текущему потоку исполненные циклы в EEVDF-сущность
-    /// (vruntime += delta * NICE0 / weight; слайс-остаток уменьшается).
+    /// (vruntime += delta * NICE0 / weight; слайс-остаток уменьшается)
+    /// + записать конец отрезка (v0.18: util-EWMA/last_ran — lb::charge_and_park).
     ///
     /// Вызывается ДО любой публикации состояния (rotate/троттл/блок):
     /// пока сущность числится running, заряд идёт по «горячему» пути;
@@ -831,7 +786,8 @@ impl X86Sched {
         if delta_exec == 0 {
             return;
         }
-        EEVDF.lock().charge(thread.as_u128(), delta_exec);
+        let cpu = arch::percpu::cpu_id() as usize;
+        crate::lb::charge_and_park(cpu, thread.as_u128(), delta_exec);
     }
 
     /// Взвести one-shot вытеснения для входящего потока (finalize; только
@@ -924,12 +880,11 @@ impl SchedulerInterface for X86Sched {
     fn enqueue(&self, task: TaskId) -> Result<(), SchedulerError> {
         // Поток публикуется в Ready: контекст — из слота в карту ДО
         // публикации (write-гард менеджера держится — pick'ер заблокирован на
-        // чтении состояния до коммита; EEVDF-лок и карта локов не вкладывают).
+        // чтении состояния до коммита; локи очередей и карта локов не вкладывают).
         self.export_slot_if(task);
-        EEVDF.lock().enqueue(task.as_u128());
-        // Разбудить нужные CPU: только idle + urgent (см. функцию —
-        // замена broadcast-шторма v0.12-v0.15).
-        kick_cpus_after_ready();
+        // v0.18: размещение на домашнюю очередь (cache affinity; idle-цель
+        // или push-assist при перегрузе) + точечный notify — см. lb.
+        crate::lb::place_and_enqueue(task.as_u128());
         Ok(())
     }
 
@@ -942,12 +897,9 @@ impl SchedulerInterface for X86Sched {
         // Eager-deschedule (v0.16): сущность — ИЗ очереди готовности
         // (вместо «ленивого отсева на pick»: фантомные веса портили бы
         // avg_vruntime EEVDF). Идемпотентно (запись могла быть уже
-        // потреблена pick'ером — тогда это no-op).
-        let was_throttled = {
-            let mut rq = EEVDF.lock();
-            rq.dequeue(task.as_u128());
-            rq.is_throttled(task.as_u128())
-        };
+        // потреблена pick'ером — тогда это no-op). v0.18: сущность — на
+        // ДОМАШНЕЙ очереди потока (lb::dequeue_from_home).
+        let was_throttled = crate::lb::dequeue_from_home(task.as_u128());
         // Троттл-лист — точное удаление, но ТОЛЬКО для троттленных
         // (флаг в EEVDF-сущности): раньше — O(n) scan на КАЖДОЙ
         // блокировке потока (горячий путь IPC), теперь — O(log n)
@@ -964,14 +916,16 @@ impl SchedulerInterface for X86Sched {
     /// v0.16: приоритет = вес EEVDF (таблица nice-весов). Поток в очереди
     /// — перепозиционирование (дедлайн пересчитан под новый вес);
     /// исполняющийся — вес учтётся последующими зарядами. Вызывается и
-    /// при СОЗДАНИИ потока (ядро сеет начальный приоритет до enqueue,
-    /// см. `create_thread` в крейте ядра).
+    /// при СОЗДАНИИ потока (ядро сеет начальный приоритет до enqueue).
+    /// v0.18: сущности может ещё не быть нигде (до первого enqueue) — вес
+    /// паркуется в lb::HOME.pending и потребится при размещении (это
+    /// чинит потерю сеянного приоритета первого слайса в v0.16).
     fn on_priority_change(
         &self,
         task: TaskId,
         priority: TaskPriority,
     ) -> Result<(), SchedulerError> {
-        EEVDF.lock().set_weight(task.as_u128(), eevdf::weight_for_priority(priority.as_u8()));
+        crate::lb::set_thread_weight(task.as_u128(), eevdf::weight_for_priority(priority.as_u8()));
         Ok(())
     }
 
@@ -1228,12 +1182,14 @@ pub fn cpu_period_refill_if_due() -> bool {
 /// дедлайном бюджета каждого входящего потока).
 pub fn preempt_step(ctx: Box<UserCtx>) -> ! {
     cpu_period_refill_if_due();
+    let cpu = arch::percpu::cpu_id() as usize;
     let mut throttled = false;
     let mut exec_cycles = 0;
     if let Some(cur) = SCHED.current_thread() {
         exec_cycles = SCHED.cycles_since_dispatch().max(min_charge_cycles());
         // 2b (v0.16): EEVDF-заряд ДО любой публикации — rotate сохранит
-        // дедлайн только при уже учтённом vruntime.
+        // дедлайн только при уже учтённом vruntime. v0.18: заодно — конец
+        // отрезка (util-EWMA/last_ran) + CUR_DL=0 (уходим с CPU).
         SCHED.charge_current(cur, exec_cycles);
     }
     if let Some(glue) = startup::glue() {
@@ -1252,17 +1208,17 @@ pub fn preempt_step(ctx: Box<UserCtx>) -> ! {
                 // после unthrottle возьмёт его из карты).
                 SCHED.throttle_current();
             } else {
-                // Rotate (EEVDF): Ready + очередь (enqueue-хук экспортирует
-                // слот ДО публикации; rotate-путь в крейте сохранит дедлайн,
-                // пока слайс не исчерпан). Отказ (поток убит в окне
-                // вытеснения) — без ре-очереди: слот в пул, дальше —
-                // «поток уже не наш».
+                // Rotate (EEVDF): Ready + домашняя очередь (enqueue-хук
+                // экспортирует слот ДО публикации; rotate-путь в крейте
+                // сохранит дедлайн, пока слайс не исчерпан). Отказ (поток
+                // убит в окне вытеснения) — без ре-очереди: слот в пул,
+                // дальше — «поток уже не наш».
                 let requeued = glue.requeue_thread(cur);
                 if !requeued {
                     SCHED.release_slot_if(cur);
                     // Публикация не состоялась: сущность обязана покинуть
                     // running-набор (поток больше не диспетчеризован нами).
-                    EEVDF.lock().dequeue(cur.as_u128());
+                    crate::lb::dequeue_from_home(cur.as_u128());
                 }
             }
         } else {
@@ -1270,22 +1226,32 @@ pub fn preempt_step(ctx: Box<UserCtx>) -> ! {
             // слота в карту и прямой rotate (SMP ещё спит — конкуренции
             // нет; слот обязан покинуть CPU: дальше schedule_next).
             SCHED.export_slot_if(cur);
-            EEVDF.lock().enqueue(cur.as_u128());
+            crate::lb::place_and_enqueue(cur.as_u128());
         }
     }
+    // v0.18: сервис границы preempt — публикация витрины (гистерезис
+    // давления + hard-starvation подкрутка idle), обработка вариант-B
+    // заявок воров, редкий периодический steal недогруженного ядра.
+    // Своё состояние уже опубликовано выше — конфликта с enqueue нет.
+    crate::lb::on_preempt(cpu);
     schedule_next()
 }
 
 /// Выбрать следующий поток и уйти в него (не возвращается).
 ///
-/// Порядок: валидация состояния (eager-deschedule v0.16 убрал
-/// протухшие записи из очереди по построению; остаточный отсев —
-/// гонки переходов: поток покинул Ready МЕЖДУ нашим pick и
+/// Порядок: дренаж inbox'а мигрантов (вариант-B доставки — до pick'а:
+/// воры уже в Ready) → валидация состояния (eager-deschedule v0.16
+/// убрал протухшие записи из очередей по построению; остаточный
+/// отсев — гонки переходов: поток покинул Ready МЕЖДУ нашим pick и
 /// mark_running) → activate CR3 владельца → mark_running (финальная
 /// защита Ready→Running) → switch_to(ctx). Нет готовых — idle-цикл
-/// (см. gate::idle_loop): сюда не возвращаемся.
+/// (см. gate::idle_loop: перед hlt — дренаж inbox + попытка кражи
+/// с витрины): сюда не возвращаемся.
 pub fn schedule_next() -> ! {
+    let cpu = arch::percpu::cpu_id() as usize;
     loop {
+        // v0.18: мигранты из inbox (вариант B) — полноправные Ready.
+        crate::lb::drain_handoffs(cpu);
         let next = match SCHED.pick_next() {
             Some(t) => t,
             None => {

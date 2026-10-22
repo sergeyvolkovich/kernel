@@ -44,10 +44,13 @@ pub mod ioapic;
 pub mod iommu;
 pub mod ioport;
 pub mod lapic;
+pub mod lb;
 pub mod memory;
+pub mod perf;
 pub mod platform;
 pub mod sched;
 pub mod smp;
+pub mod topology;
 pub mod vtd;
 
 pub use platform::X86Platform;

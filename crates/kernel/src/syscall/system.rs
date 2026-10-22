@@ -69,7 +69,10 @@ pub fn time_source() -> Option<&'static dyn TimeSource> {
 /// Идентификация себя: TaskId/ThreadId/CPU вызывающего.
 ///
 /// Слова по индексу (arg1): 0 = task_id.lo, 1 = task_id.hi,
-/// 2 = thread_id.lo, 3 = thread_id.hi, 4 = cpu, 5 = cpu_count (v0.6).
+/// 2 = thread_id.lo, 3 = thread_id.hi, 4 = cpu, 5 = cpu_count (v0.6),
+/// 6 = TLS-слово текущего потока (v0.17, THREAD_SET_TLS: echo
+/// непрозрачного значения — единственный «геттер» TLS без нового
+/// сискола).
 pub struct SelfInfoHandler;
 
 impl SelfInfoHandler {
@@ -80,6 +83,9 @@ impl crate::syscall::SyscallHandler for SelfInfoHandler {
     fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
         let task = ctx.task.as_u128();
         let thread = ctx.thread.as_u128();
+        // v0.17: слово 6 — TLS текущего потока (нет потока в TCB —
+        // детерминированный 0, как «без TLS»).
+        let tls = ctx.tasks.thread_tls(&ctx.thread).unwrap_or(0);
         let words = [
             task as u64,
             (task >> 64) as u64,
@@ -87,6 +93,7 @@ impl crate::syscall::SyscallHandler for SelfInfoHandler {
             (thread >> 64) as u64,
             ctx.cpu as u64,
             cpu_count() as u64,
+            tls as u64,
         ];
         let idx = args.arg(1);
         words
@@ -178,10 +185,48 @@ mod tests {
         // Слово 5 — cpu_count (без установки платформы: 1; тесты хоста
         // однопроцессорные, Once глобален — фиксируем через вызов ниже).
         assert_eq!(word(5), crate::syscall::system::cpu_count());
+        // Слово 6 — TLS-слово потока (v0.17): потока нет в TCB — 0.
+        assert_eq!(word(6), 0);
         // Вне диапазона — EINVAL, не паника.
         assert_eq!(
-            SelfInfoHandler.invoke(&mut ctx, &SyscallArgs::new([0, 6, 0, 0, 0, 0, 0])),
+            SelfInfoHandler.invoke(&mut ctx, &SyscallArgs::new([0, 7, 0, 0, 0, 0, 0])),
             Err(SyscallError::InvalidArgument)
+        );
+    }
+
+    /// v0.17: слово 6 отражает TLS, выставленный THREAD_SET_TLS
+    /// (round-trip через хендлеры — как увидит пользователь).
+    #[test]
+    fn self_info_word6_roundtrips_thread_tls() {
+        use crate::syscall::task::ThreadSetTlsHandler;
+        use crate::task::types::TaskPriority;
+
+        let tasks = Box::leak(Box::new(TcbManager::new().unwrap()));
+        let caps = Box::leak(Box::new(CapabilityManager::new().unwrap()));
+        let task = uuid_next();
+        let thread = uuid_next();
+        tasks.create(task, TaskPriority(100)).unwrap();
+        tasks
+            .create_thread_with_tls(thread, task, TaskPriority(100), 0x1000, 0x2000, 0xABCD_0000)
+            .unwrap();
+        let mut ctx = ctx_of(tasks, caps, task, thread);
+
+        // Создан с TLS — SELF_INFO сразу его видит.
+        assert_eq!(
+            SelfInfoHandler.invoke(&mut ctx, &SyscallArgs::new([0, 6, 0, 0, 0, 0, 0])),
+            Ok(0xABCD_0000)
+        );
+        // THREAD_SET_TLS меняет — SELF_INFO отражает; возврат = прежнее.
+        assert_eq!(
+            ThreadSetTlsHandler.invoke(
+                &mut ctx,
+                &SyscallArgs::new([0, thread.as_u128() as usize, 0, 0x1234, 0, 0, 0])
+            ),
+            Ok(0xABCD_0000)
+        );
+        assert_eq!(
+            SelfInfoHandler.invoke(&mut ctx, &SyscallArgs::new([0, 6, 0, 0, 0, 0, 0])),
+            Ok(0x1234)
         );
     }
 

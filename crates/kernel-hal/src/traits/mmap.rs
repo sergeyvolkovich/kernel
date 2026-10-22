@@ -292,6 +292,51 @@ pub trait MMAPInterface {
         self.shrink_region(phys_page_allocator, allocation, pages)
     }
 
+    /// Change access flags of ALREADY MAPPED pages in place (v0.17,
+    /// MEM_PROTECT): no remap, no frame movement — only PTE rights
+    /// are rewritten and the TLB invalidated (the backend decides how:
+    /// per-page flush + SMP shootdown when other CPUs may run threads
+    /// of this address space).
+    ///
+    /// The mapping itself must stay valid: the caller (UFacade) has
+    /// already verified that [v_base, v_base + pages) lies inside one
+    /// region; a backend that cannot update a page in place (e.g. a
+    /// software TLB) returns [`MemErrorCode::NotMapped`]/`InvalidArgument`
+    /// for unmapped holes — partial updates MUST NOT happen silently:
+    /// either the whole range is re-protected or an error is returned.
+    ///
+    /// Default — refusal (same policy as `invalidate_tlb`): a backend
+    /// without in-place flag updates must fail loudly instead of
+    /// pretending the memory got protected.
+    fn protect_region(
+        &mut self,
+        _v_base: VirtualADDR,
+        _pages: usize,
+        _mmap: MMAPMemoryFlags,
+    ) -> Result<(), MemErrorCode> {
+        Err(MemErrorCode::InvalidArgument(
+            "backend: protect_region not implemented",
+        ))
+    }
+
+    /// `protect_region` с предварительной проверкой аргументов
+    /// (размер, выравнивание, флаги — включая W^X-политику `validate`).
+    fn protect_region_checked(
+        &mut self,
+        v_base: VirtualADDR,
+        pages: usize,
+        mmap: MMAPMemoryFlags,
+    ) -> Result<(), MemErrorCode> {
+        if pages == 0 {
+            return Err(MemErrorCode::InvalidArgument("pages must be > 0"));
+        }
+        if !v_base.is_aligned() {
+            return Err(MemErrorCode::Unaligned);
+        }
+        mmap.validate()?;
+        self.protect_region(v_base, pages, mmap)
+    }
+
     /// Точечная инвалидация TLB с учётом тегов ASID/PCID.
     ///
     /// Дефолт — отказ [`MemErrorCode::InvalidArgument`]: бекенд, не

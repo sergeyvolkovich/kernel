@@ -98,6 +98,18 @@ pub trait MemRouter {
         vaddr: VirtualADDR,
     ) -> Option<(VirtualADDR, PhysADDR, usize)>;
 
+    /// Сменить права доступа отображённых страниц задачи (v0.17,
+    /// MEM_PROTECT): окно [vaddr, vaddr+pages*4K) в ОДНОМ регионе
+    /// (правило flexpage-окон); затрагивается только пространство
+    /// САМОЙ задачи (SHM-кадры у других задач — их право).
+    fn protect_region(
+        &self,
+        task: crate::task::TaskId,
+        vaddr: VirtualADDR,
+        pages: usize,
+        flags: MMAPMemoryFlags,
+    ) -> Result<(), MemErrorCode>;
+
     /// Flexpage-перенос (IPC map/grant-элемент): окно `src_vaddr` (страниц)
     /// задачи `src` отобразить в задачу `dst`. `grant = true` — с передачей
     /// владения (у источника окно снимается). Возвращает адрес в `dst`.
@@ -713,6 +725,18 @@ impl<MMAP: MMAPInterface> MemRouter for MemRouterImpl<'_, MMAP> {
         vaddr: VirtualADDR,
     ) -> Option<(VirtualADDR, PhysADDR, usize)> {
         self.region_info(task, vaddr)
+    }
+
+    fn protect_region(
+        &self,
+        task: crate::task::TaskId,
+        vaddr: VirtualADDR,
+        pages: usize,
+        flags: MMAPMemoryFlags,
+    ) -> Result<(), MemErrorCode> {
+        self.mm
+            .with_facade(&task, |f| f.protect_region(vaddr, pages, flags))
+            .unwrap_or(Err(MemErrorCode::NotFound))
     }
 
     fn transfer(

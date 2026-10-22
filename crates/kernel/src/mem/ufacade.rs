@@ -888,6 +888,42 @@ impl<MmapWraper: MMAPInterface, AP: ArcPool<Data = LLFree<'static>>> UFacade<Mma
         }
     }
 
+    /// Change access flags of already-mapped pages in place (v0.17,
+    /// MEM_PROTECT): the window [vaddr, vaddr + pages*4K) must lie
+    /// WHOLLY inside one region record — region boundaries are
+    /// ownership boundaries (a partial crossing is two calls, exactly
+    /// like MEM_TRANSFER's window rule). Frames, virtual addresses and
+    /// the record itself are untouched: only PTE rights change.
+    ///
+    /// SHM/external windows: only THIS facade's mapping is reprotected
+    /// (per-mapping semantics, like mprotect on a shared file mapping
+    /// — other tasks keep their own rights on the same frames).
+    pub fn protect_region(
+        &mut self,
+        vaddr: VirtualADDR,
+        pages: usize,
+        mp: MMAPMemoryFlags,
+    ) -> Result<(), MemErrorCode> {
+        if pages == 0 {
+            return Err(MemErrorCode::InvalidArgument("pages must be > 0"));
+        }
+        // Границы: окно обязано лежать в ОДНОМ регионе (записи не
+        // хранят флаги — истина прав в PTE; проверка только границ).
+        let (v_base, _p_base, region_pages) = self
+            .region_window(vaddr)
+            .ok_or(MemErrorCode::NotFound)?;
+        let off_pages = (vaddr.0 - v_base.0) / FRAME_SIZE;
+        if off_pages.saturating_add(pages) > region_pages {
+            return Err(MemErrorCode::InvalidArgument(
+                "protect window crosses region boundary",
+            ));
+        }
+        // Делегирование бекенду: checked-вариант валидирует флаги
+        // (W^X) и выравнивание; сам бекенд переписывает PTE и делает
+        // TLB-инвалидацию (локально + shootdown).
+        self.mmap_interface.protect_region_checked(vaddr, pages, mp)
+    }
+
     /// Отобразить ВНЕШНИЕ физические кадры (SHM-регион, BAR устройства,
     /// grant от другой задачи): физика не из пула фасада и не возвращается
     /// ему при снятии — владелец источник (запись `external = true`).
@@ -1138,6 +1174,11 @@ pub(crate) mod tests {
             v: VirtualADDR,
             pages: usize,
         },
+        /// v0.17 (MEM_PROTECT): смена прав уже отображённых страниц.
+        Protect {
+            v: VirtualADDR,
+            pages: usize,
+        },
         MapKernel {
             name: &'static str,
             v: VirtualADDR,
@@ -1270,6 +1311,22 @@ pub(crate) mod tests {
             }
             self.log.push(Op::Shrink {
                 v: allocation,
+                pages,
+            });
+            Ok(())
+        }
+
+        /// v0.17: мок protect_region — журнал (без управляемого отказа:
+        /// отказ бекенда и так проверяется дефолтом трейта в других
+        /// бекендах; здесь важен ПУТЬ фасада и границы окна).
+        fn protect_region(
+            &mut self,
+            v_base: VirtualADDR,
+            pages: usize,
+            _mmap: MMAPMemoryFlags,
+        ) -> Result<(), MemErrorCode> {
+            self.log.push(Op::Protect {
+                v: v_base,
                 pages,
             });
             Ok(())
@@ -1414,6 +1471,7 @@ pub(crate) mod tests {
             match self {
                 Op::Extend { pages, .. }
                 | Op::Shrink { pages, .. }
+                | Op::Protect { pages, .. }
                 | Op::MapKernel { pages, .. }
                 | Op::UnmapKernel { pages, .. } => *pages,
             }
@@ -1423,6 +1481,7 @@ pub(crate) mod tests {
             match self {
                 Op::Extend { v, .. }
                 | Op::Shrink { v, .. }
+                | Op::Protect { v, .. }
                 | Op::MapKernel { v, .. }
                 | Op::UnmapKernel { v, .. } => *v,
             }
@@ -2411,6 +2470,83 @@ pub(crate) mod tests {
             facade.shrink_memory_wiev(v).unwrap();
         }
         assert_eq!(facade.records_by_vaddr.iter().count(), 0);
+    }
+
+    /// v0.17 (MEM_PROTECT): границы окна — правила flexpage-окон;
+    /// доставление до бекенда; W^X-отказ ДО бекенда (checked).
+    #[test]
+    fn protect_region_window_rules_and_backend_reach() {
+        let p_alloc = make_p_allocator();
+        let mut facade = UFacade::new(
+            p_alloc.clone(),
+            MockMmap::new(),
+            FRAMES,
+            1,
+            VirtualADDR(BASE),
+        )
+        .unwrap();
+
+        // Регион на 4 страницы (RW).
+        facade
+            .extend_memory_wiev(4, MMAPMemoryFlags::RW)
+            .unwrap();
+        let (v_base, _p, pages) = facade.region_window(VirtualADDR(BASE)).unwrap();
+        assert_eq!(pages, 4);
+
+        // 1. Окно целиком в регионе — доходит до бекенда.
+        facade
+            .protect_region(v_base, 2, MMAPMemoryFlags::READABLE)
+            .unwrap();
+        assert_eq!(
+            facade.mmap_interface.last(),
+            &Op::Protect {
+                v: v_base,
+                pages: 2
+            }
+        );
+
+        // 2. Подокно с внутренней страницы — легально (как flexpage).
+        facade
+            .protect_region(
+                VirtualADDR(v_base.0 + 2 * 4096),
+                2,
+                MMAPMemoryFlags::RX,
+            )
+            .unwrap();
+
+        // 3. Выход за границу региона — InvalidArgument, до бекенда
+        //    НЕ доходит (последняя запись журнала — прежняя).
+        let before = facade.mmap_interface.log.len();
+        assert!(matches!(
+            facade.protect_region(v_base, 5, MMAPMemoryFlags::READABLE),
+            Err(MemErrorCode::InvalidArgument(
+                "protect window crosses region boundary"
+            ))
+        ));
+        assert_eq!(facade.mmap_interface.log.len(), before);
+
+        // 4. Незамапленный адрес — NotFound.
+        assert!(matches!(
+            facade.protect_region(VirtualADDR(BASE + 0x1000 * 100), 1, MMAPMemoryFlags::RW),
+            Err(MemErrorCode::NotFound)
+        ));
+
+        // 5. Нулевой размер — InvalidArgument.
+        assert!(matches!(
+            facade.protect_region(v_base, 0, MMAPMemoryFlags::RW),
+            Err(MemErrorCode::InvalidArgument("pages must be > 0"))
+        ));
+
+        // 6. W^X — checked-обёртка отказывает ДО бекенда (политика
+        //    флагов ядра едина с extend).
+        let before = facade.mmap_interface.log.len();
+        assert!(matches!(
+            facade.protect_region(v_base, 1, MMAPMemoryFlags::RW.union(MMAPMemoryFlags::EXECUTABLE)),
+            Err(MemErrorCode::InvalidArgument(
+                "WRITABLE and EXECUTABLE together violate W^X"
+            ))
+        ));
+        assert_eq!(facade.mmap_interface.log.len(), before);
     }
 
     /// Двойной индекс: устойчивость вставки/снятия записей в обоих деревьях

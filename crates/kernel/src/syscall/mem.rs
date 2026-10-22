@@ -76,6 +76,36 @@ impl SyscallHandler for MemFreeHandler {
     }
 }
 
+// ==== MEM_PROTECT (mprotect-аналог, v0.17) ====
+
+/// Смена прав доступа СВОИХ отображённых страниц (W^X действует:
+/// WRITABLE|EXECUTABLE отклоняется флагами ядра). Окно — в одном
+/// регионе фасада; чужие пространства не затрагиваются (для них —
+/// MEM_MAP_AT-протокол родителя). ABI: arg1 = vaddr (4K-выровнен),
+/// arg2 = страниц, arg3 = MMAPMemoryFlags bits. Возврат: 0.
+pub struct MemProtectHandler;
+
+impl MemProtectHandler {
+    pub const SYSCALL: SyscallNumber = nums::MEM_PROTECT;
+}
+
+impl SyscallHandler for MemProtectHandler {
+    fn invoke(&self, ctx: &mut SyscallCtx<'_>, args: &SyscallArgs) -> SyscallRet {
+        let router = ctx.memory.ok_or(SyscallError::NotSupported)?;
+        let vaddr = args.arg(1);
+        let pages = args.arg(2);
+        let flags = MMAPMemoryFlags::from_bits_retain(args.arg(3) as u8);
+        if pages == 0 || vaddr % crate::hal::traits::mmap::PAGE_SIZE != 0 {
+            return Err(SyscallError::InvalidArgument);
+        }
+        // Права ВЕРНУТЬСЯ пользователю только через флаги ядра:
+        // валидация (включая W^X) — в protect_region_checked фасада.
+        // Квоты не меняются: кадры те же, размер тот же.
+        router.protect_region(ctx.task, VirtualADDR(vaddr), pages, flags)?;
+        Ok(0)
+    }
+}
+
 // ==== MEM_TRANSFER (flexpage map/grant) ====
 
 pub struct MemTransferHandler;

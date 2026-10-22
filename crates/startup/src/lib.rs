@@ -294,6 +294,16 @@ pub trait KernelGlue: Send + Sync {
         None
     }
 
+    /// v0.17, TLS: the OPAQUE per-thread word the platform backend
+    /// loads into its thread-pointer register at every dispatch
+    /// (x86_64: FS base). 0 = no TLS (the backend clears the pointer —
+    /// a stale value from the previous thread must never leak).
+    /// Called on the dispatch path (same discipline as
+    /// `take_syscall_ret`: no manager locks may be held by the caller).
+    fn thread_tls(&self, _thread: ThreadId) -> usize {
+        0
+    }
+
     /// v0.16, slice-end notifications: the thread's time slice is
     /// nearing its end — deliver the advisory kernel message to the
     /// registered gate (word 0 = 1 = SLICE_WARN kind, word 1 = cycles
@@ -460,6 +470,12 @@ impl<MMAP: MMAPInterface + KMAPInterface + ASIDInterface + 'static> KernelGlue f
 
     fn thread_owner(&self, thread: ThreadId) -> Option<TaskId> {
         self.gctl.task_manager().thread_task(&thread)
+    }
+
+    fn thread_tls(&self, thread: ThreadId) -> usize {
+        // v0.17: нет потока в TCB (гонка смерти) — детерминированный 0
+        // (указатель гасится — чужой TLS не протекает в следующий вход).
+        self.gctl.task_manager().thread_tls(&thread).unwrap_or(0)
     }
 
     fn mark_running(&self, thread: ThreadId) -> bool {

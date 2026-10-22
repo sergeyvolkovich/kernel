@@ -27,13 +27,18 @@
 // ───────────────────────── Ранги захвата ( deadlock-дисциплина ) ─────────────
 //
 //   GATE (per-endpoint RawGate) ──▶ { TCB, SCHED, CAP }
+//   FUTEX (таблица футексов, syscall::futex) ──▶ { TCB, SCHED }
 //   CLAIM (DeviceClaimRegistry) ──▶ { TCB, SCHED }
 //   TCB   (TcbManager, KRwLock) ──▶ SCHED (хуки enqueue/deschedule)
 //   SCHED (бекенд: мьютекс контекстов/block-очередей; MPMC — lock-free)
 //   CAP / KMEM / SHM / IrqRouter / Registry — ЛИСТЬЯ (никого не берут)
 //
 // Инварианты: GATE→GATE запрещён (фазы L4 ipc_call покидают лок до
-// повторного входа — «claim-протокол» в crate::ipc); KMEM — единственный
+// повторного входа — «claim-протокол» в crate::ipc); FUTEX ведёт себя
+// как GATE (держит TCB/SCHED внутри транзакций пробуждения, берётся
+// только на верхнем уровне syscall-хендлера, FUTEX→FUTEX невозможен —
+// один захват на вызов; память пользователя под ним НЕ читается —
+// UserCopy/KMEM строго вне, как map-элементы IPC); KMEM — единственный
 // лок, удерживаемый через cross-CPU ожидание (shootdown), и берётся
 // только на глубине 0; любые пары вне таблицы — последовательно,
 // без пересечения критсекций.

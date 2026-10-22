@@ -41,7 +41,8 @@ extern "C" {
 
 /* SELF_INFO(0x03): идентификация себя. Слова по индексу:
  * 0 = task_id.lo, 1 = task_id.hi, 2 = thread_id.lo, 3 = thread_id.hi,
- * 4 = cpu (номер CPU потока), 5 = cpu_count. */
+ * 4 = cpu (номер CPU потока), 5 = cpu_count, 6 = TLS-слово потока
+ * (v0.17; l4_tls_word() — обёртка). */
 int64_t l4_self_info(uint64_t index);
 
 /* SYS_TIME(0x04): монотонные часы ядра, наносекунды. */
@@ -78,6 +79,26 @@ int64_t l4_task_kill(uint64_t tcb);
  * tid назначает вызывающий; entry получает нулевые регистры. */
 int64_t l4_thread_create(uint64_t tcb, uint64_t entry,
                          uint64_t stack_top, uint64_t tid);
+
+/* THREAD_CREATE(0x15) с начальным TLS-словом (v0.17): поток рождается
+ * с готовым указателем потока (на x86_64 — FS base; доступ из C —
+ * __thread-модели на %fs, или читай слово: l4_tls_word()). Без гонки
+ * «создал -> выставил»: свежий поток может уйти на другой CPU раньше
+ * последующего l4_thread_set_tls. */
+int64_t l4_thread_create_tls(uint64_t tcb, uint64_t entry,
+                             uint64_t stack_top, uint64_t tid, uint64_t tls);
+
+/* THREAD_SET_TLS(0x91, v0.17): назначить потоку TLS-слово (непрозрачное
+ * для ядра; грузится в регистр указателя потока при каждой
+ * диспетчеризации). Право: свой домен или TaskTCB домена потока.
+ * Возврат: ПРЕЖНЕЕ слово. */
+int64_t l4_thread_set_tls(uint64_t tid_lo, uint64_t tid_hi, uint64_t value);
+
+/* TLS-слово ТЕКУЩЕГО потока (SELF_INFO, индекс 6; v0.17).
+ * Рекомендуемая конвенция TCB-блока: слово по смещению 0 от базового
+ * указателя = сам указатель (self-relative, как glibc_tcbhead->tcb);
+ * тогда l4_tls_word() == *(uint64_t *)l4_tls_word(). */
+int64_t l4_tls_word(void);
 
 /* THREAD_DESTROY(0x16): разрушить TCB завершённого потока. */
 int64_t l4_thread_destroy(uint64_t tid_lo, uint64_t tid_hi);
@@ -174,6 +195,23 @@ int64_t l4_ipc_msg_clear(void);
  * обязан иметь ёмкость. */
 int64_t l4_notify_signal(uint64_t ep, uint64_t word);
 
+/* ───────── Футеки (v0.17): юзерспейс-мьютексы/condvar/барьеры ───────── */
+
+/* FUTEX_WAIT(0x3B): уснуть на 32-битном слове (uaddr выровнен на 4),
+ * если текущее значение == expected. Ключ — ФИЗИЧЕСКИЙ адрес слова:
+ * футеки одного кадра общие для всех задач, куда он отображён
+ * (SHM/transfer/map_at); приватная память изолирована по построению.
+ * Возвраты: 0 — разбужден (l4_futex_wake); -11 EAGAIN — значение
+ * изменилось (без сна или в окне парка — потерянных пробуждений нет).
+ * Таймаута нет (v1): таймер-сервер юзерспейса будит l4_futex_wake. */
+int64_t l4_futex_wait(uint64_t uaddr, uint32_t expected);
+
+/* FUTEX_WAKE(0x3C): разбудить до count ждущих на слове с тем же
+ * физическим адресом. Возврат — число разбужденных. Дисциплина
+ * «изменил слово -> разбуди» — на приложении (ядро значение не
+ * читает, как в Linux). */
+int64_t l4_futex_wake(uint64_t uaddr, uint32_t count);
+
 /* ───── 0x40: сырые ресурсы (IoResource) и IRQ (v0.14) ───── */
 /* «Устройств в ядре нет» (v0.14): доступ к физике/портам/линиям
  * гейтован IoResource-capability; перечисление (ACPI/AML/PCI) и
@@ -220,6 +258,13 @@ int64_t l4_mem_transfer(uint64_t src_vaddr, uint64_t pages, uint64_t flags,
 int64_t l4_mem_map_at(uint64_t tcb_dst, uint64_t src,
                               uint64_t pages, uint64_t dst, uint64_t flags);
 int64_t l4_mem_info(uint64_t addr, uint64_t index);
+
+/* MEM_PROTECT(0x56, v0.17): сменить права СВОИХ отображённых страниц
+ * (mprotect-аналог; W^X действует: RWX отклоняется). Окно
+ * [addr, addr+pages*4K) — в одном регионе; разделяемые кадры у ДРУГИХ
+ * задач сохраняют их права (per-mapping семантика). flags — как у
+ * l4_mem_alloc (READ|WRITE = 0b011, READ|EXEC = 0b101). */
+int64_t l4_mem_protect(uint64_t addr, uint64_t pages, uint64_t flags);
 
 /* ─────────────── 0x60: SHM / io_uring ─────────────── */
 

@@ -164,6 +164,9 @@ pub fn bsp_init() {
     unsafe { fill_percpu(0, bsp_percpu_block()) };
     // SAFETY: селекторы ABI согласованы (index 0 массивов = BSP).
     unsafe { install_syscall_msrs() };
+    // v0.19: perf bring-up on the BSP — the PMU probe decides the mode
+    // BEFORE smp::bring_up starts the APs (they inherit it).
+    crate::perf::cpu_up(0);
 }
 
 /// Настройка привилегированного состояния AP (из ap_entry64; IF=0).

@@ -181,6 +181,39 @@ pub extern "C" fn l4_thread_create(tcb: u64, entry: u64, stack_top: u64, tid: u6
     unsafe { l4_syscall6(0x15, tcb, entry, stack_top, tid, 0, 0) }
 }
 
+/// THREAD_CREATE(0x15) с начальным TLS-словом (v0.17, arg6): поток
+/// рождается с готовым указателем потока — рантайм без гонки
+/// «создал -> выставил до первого такта» (свежий поток может уйти на
+/// другой CPU раньше, чем создатель дойдёт до l4_thread_set_tls).
+/// Слово непрозрачно для ядра; на x86_64 бекенд кладёт его в FS base
+/// (читай из юзерспейса как %fs:0-относительные данные).
+#[unsafe(no_mangle)]
+pub extern "C" fn l4_thread_create_tls(
+    tcb: u64,
+    entry: u64,
+    stack_top: u64,
+    tid: u64,
+    tls: u64,
+) -> i64 {
+    unsafe { l4_syscall6(0x15, tcb, entry, stack_top, tid, 0, tls) }
+}
+
+/// THREAD_SET_TLS(0x91, v0.17): назначить потоку TLS-слово (непрозрачное
+/// для ядра; грузится в регистр указателя потока при каждой
+/// диспетчеризации). Право: свой домен или TaskTCB домена потока.
+/// Возврат: ПРЕЖНЕЕ слово (read-modify-write без SELF_INFO).
+#[unsafe(no_mangle)]
+pub extern "C" fn l4_thread_set_tls(tid_lo: u64, tid_hi: u64, value: u64) -> i64 {
+    unsafe { l4_syscall6(0x91, tid_lo, tid_hi, value, 0, 0, 0) }
+}
+
+/// TLS-слово ТЕКУЩЕГО потока (SELF_INFO, слово 6 — единственный
+/// «геттер» без нового сискола; v0.17).
+#[unsafe(no_mangle)]
+pub extern "C" fn l4_tls_word() -> i64 {
+    unsafe { l4_syscall6(0x03, 6, 0, 0, 0, 0, 0) }
+}
+
 /// THREAD_DESTROY(0x16): разрушить TCB завершённого потока.
 #[unsafe(no_mangle)]
 pub extern "C" fn l4_thread_destroy(tid_lo: u64, tid_hi: u64) -> i64 {
@@ -366,6 +399,28 @@ pub extern "C" fn l4_notify_signal(ep: u64, word: u64) -> i64 {
     unsafe { l4_syscall6(0x3A, ep, word, 0, 0, 0, 0) }
 }
 
+/// FUTEX_WAIT(0x3B, v0.17): уснуть на 32-битном слове, если его текущее
+/// значение == expected. Ключ — ФИЗИЧЕСКИЙ адрес слова: футеки одного
+/// кадра общие для всех задач, куда он отображён (SHM/transfer/map_at);
+/// приватная память изолирована. Возвраты: 0 — разбужден
+/// (FUTEX_WAKE); -11 (EAGAIN) — значение изменилось (до сна или в
+/// окне парка — потерянных пробуждений нет); отрицательный errno —
+/// ошибка. Таймаута нет (v1) — таймер-сервер юзерспейса будит
+/// FUTEX_WAKE'ом.
+#[unsafe(no_mangle)]
+pub extern "C" fn l4_futex_wait(uaddr: u64, expected: u32) -> i64 {
+    unsafe { l4_syscall6(0x3B, uaddr, expected as u64, 0, 0, 0, 0) }
+}
+
+/// FUTEX_WAKE(0x3C, v0.17): разбудить до `count` ждущих на слове с тем
+/// же физическим адресом. Возврат — число разбужденных (0 — ждущих
+/// нет). Дисциплина «изменил слово -> разбуди» — на приложении (ядро
+/// значение не читает, как в Linux).
+#[unsafe(no_mangle)]
+pub extern "C" fn l4_futex_wake(uaddr: u64, count: u32) -> i64 {
+    unsafe { l4_syscall6(0x3C, uaddr, count as u64, 0, 0, 0, 0) }
+}
+
 // ───────────── 0x40: сырые ресурсы (IoResource) и IRQ (v0.14) ─────────────
 // «Устройств в ядре нет»: доступ к физике/портам/линиям гейтован
 // IoResource-capability; перечисление устройств (ACPI/AML/PCI) и
@@ -447,6 +502,16 @@ pub extern "C" fn l4_mem_map_at(tcb_dst: u64, src: u64, pages: u64, dst: u64, fl
 #[unsafe(no_mangle)]
 pub extern "C" fn l4_mem_info(addr: u64, index: u64) -> i64 {
     unsafe { l4_syscall6(0x54, addr, index, 0, 0, 0, 0) }
+}
+
+/// MEM_PROTECT(0x56, v0.17): сменить права СВОИХ отображённых страниц
+/// (mprotect-аналог; W^X действует: RWX отклоняется). Окно
+/// [addr, addr+pages*4K) — в одном регионе; разделяемые кадры у ДРУГИХ
+/// задач сохраняют их права. Флаги — как у MEM_ALLOC
+/// (READ|WRITE = 0b011, READ|EXEC = 0b101 и т.д.).
+#[unsafe(no_mangle)]
+pub extern "C" fn l4_mem_protect(addr: u64, pages: u64, flags: u64) -> i64 {
+    unsafe { l4_syscall6(0x56, addr, pages, flags, 0, 0, 0) }
 }
 
 // ───────────────────────── 0x60: SHM / io_uring ─────────────────────────

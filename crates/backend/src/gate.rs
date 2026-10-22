@@ -503,6 +503,34 @@ pub fn reap_thread(thread: uuid::Uuid) {
     arch::percpu::set_current_thread(0);
 }
 
+/// v0.17 (THREAD_SET_TLS): архитектурная точка привязки TLS — MSR
+/// FS_BASE (0xC0000100). Вызывается ТОЛЬКО в `finalize_and_enter`:
+/// каждый вход в пользователя идёт через него (первый вход, выход из
+/// блокировки, вытеснение), значит слово потока всегда актуально;
+/// путь sysretq БЕЗ переключения контекста его не трогает — верно,
+/// поток тот же. Пишем ВСЕГДА (и 0): невычищенный указатель предыдущего
+/// потока — межпоточная утечка (чтение чужого TCB через %fs:0).
+///
+/// Это единственное место, где TLS-слово становится архитектурой:
+/// ABI ядра (THREAD_SET_TLS/SELF_INFO-6) остаётся непрозрачным —
+/// ARM-порт подменит эту функцию записью TPIDR, ABI не изменится.
+#[inline]
+fn load_thread_pointer(tls_word: usize) {
+    const MSR_FS_BASE: u32 = 0xC000_0100;
+    // SAFETY: привилегированный код ядра на своём CPU; wrmsr FS_BASE —
+    // обычная операция диспетчеризации (никаких эффектов памяти).
+    unsafe {
+        core::arch::asm!(
+            ".intel_syntax noprefix",
+            "wrmsr",
+            in("ecx") MSR_FS_BASE,
+            in("eax") (tls_word as u64 & 0xFFFF_FFFF) as u32,
+            in("edx") ((tls_word as u64 >> 32) & 0xFFFF_FFFF) as u32,
+            options(nostack),
+        );
+    }
+}
+
 /// Финализировать вход: материализованный возврат блокировки -> rax.
 ///
 /// SMP v0.12: локов НЕ держим (контекст — единоличное владение после
@@ -513,6 +541,9 @@ pub fn reap_thread(thread: uuid::Uuid) {
 /// (min(квант RR, бюджет домена, остаток периода); периодический
 /// фолбэк — квант уже в GS от pick_next).
 ///
+/// v0.17: сюда сходятся ВСЕ входы в пользователя — здесь же грузится
+/// TLS-слово потока в FS base (см. `load_thread_pointer`).
+///
 /// Бокс контекста уходит в Box::leak (enter_user не возвращается);
 /// указатель помечен per-CPU «inflight» — рециклинг в пул на
 /// СЛЕДУЮЩЕЙ диспетчеризации этого CPU (утечка v0.12 демонтирована).
@@ -520,6 +551,9 @@ pub fn finalize_and_enter(thread: uuid::Uuid, mut ctx: Box<UserCtx>) -> ! {
     if let Some(r) = kernel_glue().take_syscall_ret(thread) {
         ctx.rax = r as u64;
     }
+    // v0.17: указатель потока (TLS) — до входа в пользователя; слово
+    // непрозрачно для ядра, интерпретация — право бекенда (FS base).
+    load_thread_pointer(kernel_glue().thread_tls(thread));
     arch::percpu::set_dispatch_tsc(crate::lapic::read_tsc());
     sched::scheduler().arm_preempt_deadline(thread);
     let leaked: &'static mut UserCtx = alloc::boxed::Box::leak(ctx);
@@ -576,6 +610,13 @@ pub fn idle_loop() -> ! {
         if crate::lapic::using_tsc_deadline() {
             sched::arm_idle_deadline();
         }
+        // v0.18: сервис входа в idle — CUR_DL=0, util-сэмпл вниз, затухание
+        // pressure (диспетчеризаций нет) + сброс флага OVERLOADED дренированного
+        // ядра гистерезисом (витрина снимается с публикации).
+        crate::lb::on_idle_entry(cpu);
+        // v0.18: мигранты, доставленные в inbox пока мы спали (вариант-B
+        // трансферы/подкрученные пробуждения) — до проверки готовности.
+        crate::lb::drain_handoffs(cpu);
         // v0.16: бит простоя — СТРОГО ДО проверки готовности: конкурентный
         // enqueue на другом CPU либо (а) виден нашей проверке ниже, либо
         // (б) уже после неё — тогда он видит УСТАНОВЛЕННЫЙ бит и будит
@@ -587,11 +628,19 @@ pub fn idle_loop() -> ! {
             sched::set_cpu_idle(cpu, false);
             sched::schedule_next(); // не возвращается
         }
+        // v0.18 (pull-модель): перед сном — попытка украсть ОДНУ задачу с
+        // витрины перегруженных (idle-триггер: precondition собственного
+        // pressure не применяется — ядру в hlt нечего терять; backoff
+        // уважается). Украдено — диспетчеризация немедленно.
+        if crate::lb::try_steal(cpu, true) == sched_lb::StealOutcome::Stolen {
+            sched::set_cpu_idle(cpu, false);
+            sched::schedule_next(); // не возвращается
+        }
         x86_64::instructions::interrupts::enable_and_hlt();
-        // Проснулись (дедлайн/тик/IPI): бит снять; цикл перепроверит
-        // refill/готовность сверху. Возврат из schedule_next сюда
-        // невозможен: он либо входит в поток (не возвращается), либо
-        // сам уходит в idle-цикл.
+        // Проснулись (дедлайн/тик/IPI/подкрутка от источника): бит снять;
+        // цикл перепроверит refill/inbox/готовность/кражу сверху.
+        // Возврат из schedule_next сюда невозможен: он либо входит в поток
+        // (не возвращается), либо сам уходит в idle-цикл.
         sched::set_cpu_idle(cpu, false);
     }
 }
