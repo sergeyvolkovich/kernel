@@ -744,8 +744,14 @@ impl SyscallHandler for TaskSpawnImageHandler {
             return Err(SyscallError::InvalidArgument);
         }
         let mut desc = [0u8; SPAWN_DESC_MAX_BYTES];
-        copy.read_task_bytes(ctx.task, desc_ptr, &mut desc[..desc_len])
-            .map_err(SyscallError::from)?;
+        if let Err(e) = copy.read_task_bytes(ctx.task, desc_ptr, &mut desc[..desc_len]) {
+            sandbox_audit(&alloc::format!(
+                "spawn-image: desc read failed @ {:#x}+{:#x}: {e:?}",
+                desc_ptr,
+                desc_len
+            ));
+            return Err(SyscallError::from(e));
+        }
         let word = |i: usize| u64::from_le_bytes(desc[i * 8..i * 8 + 8].try_into().unwrap());
         let u32_at = |i: usize| u32::from_le_bytes(desc[i..i + 4].try_into().unwrap());
         let entry = word(0) as usize;
@@ -802,13 +808,18 @@ impl SyscallHandler for TaskSpawnImageHandler {
         };
 
         // 3. Домен + пространство + ПЕСОЧНИЦА (лимиты до первого потока).
-        ctx.tasks.create(new_task, TaskPriority(priority))?;
+        if let Err(e) = ctx.tasks.create(new_task, TaskPriority(priority)) {
+            sandbox_audit(&alloc::format!("spawn-image: task create failed: {e:?}"));
+            return Err(e.into());
+        }
         if let Err(e) = factory.create_space(new_task) {
+            sandbox_audit(&alloc::format!("spawn-image: space create failed: {e:?}"));
             let _ = ctx.tasks.set_state(&new_task, TaskState::Dead);
             let _ = ctx.tasks.destroy(new_task);
             return Err(e.into());
         }
         if let Err(e) = ctx.tasks.set_limits(&new_task, limits) {
+            sandbox_audit(&alloc::format!("spawn-image: set_limits failed: {e:?}"));
             rollback_spawned_domain(ctx, factory, new_task);
             return Err(e.into());
         }
@@ -823,6 +834,7 @@ impl SyscallHandler for TaskSpawnImageHandler {
         let parent_handle = match ctx.caps.grant(ctx.tasks, ctx.task, gate) {
             Ok(h) => h,
             Err(e) => {
+                sandbox_audit(&alloc::format!("spawn-image: grant failed: {e:?}"));
                 rollback_spawned_domain(ctx, factory, new_task);
                 return Err(e.into());
             }

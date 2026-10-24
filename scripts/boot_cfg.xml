@@ -1,21 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Справочная копия boot_cfg.xml (v2): та же схема, что грузит
+<!-- Справочная копия boot_cfg.xml (v3): та же схема, что грузит
      UEFI-заглушка; редактор — cargo run -p cfgtool -- <путь> show.
      Атрибуты корня: timeout (сек меню; 0 = сразу default; -1 = ждать),
      default (id пейлоада). Пейлоады:
-       type="rust-l4" — своя цепочка (cmdline ядра + серверы + state),
-       type="efi"     — chainload EFI-образа по path от корня тома. -->
+       type="rust-l4" — своя цепочка (cmdline ядра + boot-архив RLBA
+                        archive + контрольная archive_crc32 + state),
+       type="efi"     — chainload EFI-образа по path от корня тома.
+     Значение archive_crc32 обновляет scripts/mkarchive.py при сборке
+     образа (здесь — проходная справочная копия, образ ей не грузится). -->
 <bootloader timeout="5">
   <payload id="rust-l4" type="rust-l4" title="rust-l4 (own kernel)"
-           cmdline="arch=x86_64 console=com1 meltdown=allow">
-    <servers>
-      <!-- init: первый сервер (обязателен, модуль [0] протокола). -->
-      <server name="init" path="init.elf">
-        <arg>stage=boot-chain</arg>
-        <arg>log=full</arg>
-      </server>
-    </servers>
-    <!-- Переменные загрузки: транзитом init через стартовый IPC. -->
+           cmdline="arch=x86_64 console=com1 meltdown=allow"
+           archive="boot.cpio">
+    <!-- Переменные загрузки: транзитом бутстрапу → init (стартовый IPC). -->
     <boot_state>
       <var name="console" value="com1"/>
       <var name="test_mode" value="qemu"/>

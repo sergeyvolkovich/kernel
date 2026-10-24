@@ -19,9 +19,12 @@
 //   BootInfo.validate -> физические пулы (2 x LLFree: ядро/пользователь,
 //   AllocAll + избирательное освобождение Available) -> куча (talc) ->
 //   slab-пул -> GCTL -> DebugSink/TimeSource/планировщик -> KMAP
-//   (изоляция + регионы ядра) -> ELF загрузка init (xmas-elf, map_fixed)
-//   -> стек + argv -> задача/поток init -> стартовый IPC (argc/argv +
-//   boot_state транзитом) -> platform.run() (диспетчеризация, навсегда).
+//   (изоляция + регионы ядра) -> разбор RLBA-заголовка (boot_archive;
+//   инварианты + CRC32) -> flat-загрузка бутстрапа + архив RO на
+//   ARCHIVE_BASE (flatload) -> стек + argv -> задача/поток бутстрапа
+//   -> стартовый IPC (argc/argv + boot_state транзитом) ->
+//   platform.run() (диспетчеризация, навсегда). Разбор cpio/ELF и
+//   спавн init — политика юзерспейса-бутстрапа (crate user/bootstrap).
 #![no_std]
 
 extern crate alloc;
@@ -40,7 +43,7 @@ use pkg_generic_interface::syscall::{self};
 use pkg_generic_interface::task::scheduler::SchedulerInterface;
 use pkg_generic_interface::task::{CpuId, TaskId, TaskPriority, TaskState, TcbManager, ThreadId};
 
-pub mod elfload;
+pub mod flatload;
 pub mod pools;
 
 pub use pools::Pools;
@@ -290,7 +293,10 @@ pub trait KernelGlue: Send + Sync {
     /// the thread (`None` — the thread did not opt in). Called by the
     /// scheduler backend at dispatch time (it decides whether a warning
     /// deadline can be armed before the preemption boundary).
-    fn slice_warn_gate(&self, _thread: ThreadId) -> Option<pkg_generic_interface::capability::ObjId> {
+    fn slice_warn_gate(
+        &self,
+        _thread: ThreadId,
+    ) -> Option<pkg_generic_interface::capability::ObjId> {
         None
     }
 
@@ -681,12 +687,13 @@ impl<MMAP: MMAPInterface + KMAPInterface + ASIDInterface + 'static> KernelGlue f
     }
 }
 
-// ───────────────────────────── Идентификаторы init ─────────────────────────────
+// ───────────────── Идентификаторы первой задачи ─────────────────
 
-/// Задача-домен init-сервера (детерминизм для отладки; генератор UUID
-/// в no_std — лишняя сущность, а стартовые ID — часть ABI отладки).
+/// Задача-домен первой задачи — БУТСТРАПА v3 (детерминизм для отладки;
+/// генератор UUID в no_std — лишняя сущность, а стартовые ID — часть
+/// ABI отладки; в v2 здесь жил init-сервер).
 pub const INIT_TASK_ID: u128 = 0x0000_0000_0000_1000;
-/// Главный поток init.
+/// Главный поток бутстрапа.
 pub const INIT_THREAD_ID: u128 = 0x0000_0000_0000_1001;
 
 fn task_id(v: u128) -> TaskId {
@@ -888,10 +895,13 @@ pub fn kinit<P: Platform + 'static>(bi: &BootInfo, platform: &'static P) -> ! {
     // разделяемую ссылку на остаток жизни системы.
     let gctl: &'static GCTL<P::Mmap> = gctl;
 
-    // 9. ELF + стек + argv + стартовый IPC.
+    // 9. Boot-архив RLBA: flat-бутстрап + архив RO + стек + argv +
+    //    стартовый IPC. Модуль [0] — единый образ пейлоада (v3);
+    //    ELF-загрузчика в ядре больше нет: первая задача — бутстрап,
+    //    он разбирает каталог и спавнит init (юзерспейс).
     let module = match bi.init_module() {
         Some(m) => m,
-        None => fatal(platform, "kinit: FATAL no init module in boot_info\r\n"),
+        None => fatal(platform, "kinit: FATAL no boot archive in boot_info\r\n"),
     };
     let blob = platform.phys_slice(module.base, module.len as usize);
     // boot_state — транзитом в argv (протокол старта: ядро НЕ интерпретирует).
@@ -909,19 +919,30 @@ pub fn kinit<P: Platform + 'static>(bi: &BootInfo, platform: &'static P) -> ! {
             alloc::format!("{:#x}", bi.firmware.rsdp),
         ));
     }
-    let loaded = match elfload::load(
+    // v3: геометрия архива — бутстрапу (argv-транзитом, как rsdp):
+    // ядро смапило [ARCHIVE_BASE, +len) RO, но длину знает только
+    // BootInfo — протокол старта не имеет отдельного регистра.
+    state.push((
+        String::from("archive_len"),
+        alloc::format!("{}", module.len),
+    ));
+    let loaded = match flatload::load(
         platform,
         gctl,
         init_task,
         facade,
         blob,
-        module.name_str(),
+        module.base,
         &p_alloc,
         &state,
     ) {
         Ok(l) => l,
-        Err(e) => fatal(platform, &alloc::format!("kinit: FATAL ELF load: {e}\r\n")),
+        Err(e) => fatal(platform, &alloc::format!("kinit: FATAL flat load: {e}\r\n")),
     };
+    logln(
+        platform,
+        "kinit: flat bootstrap mapped, archive RO at ARCHIVE_BASE",
+    );
 
     if let Err(e) = gctl.task_manager().create_thread(
         init_thread,

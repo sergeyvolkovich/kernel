@@ -1,21 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- ==== boot_cfg_c.xml: конфигурация C-сервера (v0.8; схема v2) ====
-     Демонстрация userlib: первый сервер — capp (чистый C через
-     libuserlib.a); init (Rust) загружен вторым модулем — грузится
-     заглушкой, но не стартует (первый = сервер [0] протокола). -->
+<!-- ==== boot_cfg_c.xml: конфигурация C-сервера (схема v3) ====
+     Демонстрация userlib: init-сервером становится capp (чистый C через
+     libuserlib.a). В v3 серверы живут в boot-архиве RLBA — чтобы
+     поднять capp первым, mkarchive.py собирает архив с
+     --init target/.../capp (INIT-запись каталога). -->
 <bootloader timeout="0" default="capp-chain">
   <payload id="capp-chain" type="rust-l4" title="C reference (capp)"
-           cmdline="arch=x86_64 console=com1 meltdown=allow">
-    <servers>
-      <!-- capp: C-референс через userlib (сборка: scripts/build.sh). -->
-      <server name="capp" path="capp">
-        <arg>--demo</arg>
-      </server>
-      <!-- init (Rust): грузится модулем [1] (не стартует в этой конфигурации). -->
-      <server name="init" path="init">
-        <arg>stage0</arg>
-      </server>
-    </servers>
+           cmdline="arch=x86_64 console=com1 meltdown=allow"
+           archive="boot_capp.cpio">
     <boot_state>
       <var name="console" value="com1"/>
       <var name="boot_mode" value="normal"/>

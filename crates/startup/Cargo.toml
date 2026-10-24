@@ -2,13 +2,13 @@
 name = "startup"
 version.workspace = true
 edition.workspace = true
-description = "ARCH-INDEPENDENT kernel startup sequence: pools -> GCTL -> init ELF load -> start-IPC -> dispatch. All arch specifics live behind the Platform trait (implemented by the platform crate, e.g. backend=x86_64)"
+description = "ARCH-INDEPENDENT kernel startup sequence: pools -> GCTL -> flat bootstrap load (RLBA) + archive map -> start-IPC -> dispatch. All arch specifics live behind the Platform trait (implemented by the platform crate, e.g. backend=x86_64)"
 
 [dependencies]
 pkg_generic_interface = { workspace = true }
 kernel_hal = { workspace = true }
 boot_info = { workspace = true }
-xmas-elf = { workspace = true }
+boot_archive = { workspace = true }
 llfree = { git = "https://github.com/luhsra/llfree-rs.git" }
 spin = { workspace = true }
 uuid = { version = "1.28.0", default-features = false }

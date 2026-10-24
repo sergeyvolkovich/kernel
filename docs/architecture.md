@@ -28,13 +28,13 @@ SMP, модель синхронизации (v0.12, без Big Kernel Lock), п
 
 | Слой | Крейт | Ответственность |
 |------|-------|-----------------|
-| Загрузка | `uefi_stub`, `boot_info`, `bootcfg` | UEFI-заглушка (образ ядра встроен), BootInfo-ABI, разбор boot_cfg.xml |
+| Загрузка | `uefi_stub`, `boot_info`, `boot_archive`, `bootcfg` | UEFI-заглушка (образ ядра встроен), BootInfo-ABI v3, формат boot-архива RLBA, разбор boot_cfg.xml |
 | Механика ISA | `arch` (+ крейт `x86_64`) | per-CPU блоки через GS, COM1 16550, константы загрузочного ABI, MSR |
 | **Контракты HAL (v0.15)** | **`kernel-hal`** | типы (PhysAddr, Bdf, DevicePath) + трейты платформы; НЕ зависит ни от одного крейта workspace — экспозиция архитектуры не проникает между крейтами (граница видна cargo) |
 | Ядро | `kernel` (`pkg_generic_interface`) | GCTL — фасад менеджеров; реэкспорт контрактов kernel-hal + IrqRouter (механизм GSI→endpoint); syscall-таблица; sync-примитивы |
 | Исполнитель x86_64 | `backend` | гейт входов, планировщик, LAPIC/IOAPIC, SMP/IPI, память (MMAP/KMAP/ASID), VT-d/AMD-Vi; реализует контракты kernel-hal — единственное место экспозиции архитектуры |
-| Политика запуска | `startup` | kinit: порядок инициализации, elfload, пулы, KernelGlue |
-| Пользователь | `init`, `rogue`, `userlib`, `pie` | серверы, C-ABI-обёртки, PIE-загрузчик спавна |
+| Политика запуска | `startup` | kinit: порядок инициализации, flatload (RLBA/FLAT + маппинг архива), пулы, KernelGlue |
+| Пользователь | `bootstrap`, `init`, `rogue`, `userlib`, `pie` | flat-бутстрап (root task), серверы, C-ABI-обёртки, PIE-загрузчик спавна |
 
 **GCTL** (`kernel/src/lib.rs`) — корневой фасад, владелец менеджеров:
 `TcbManager` (домены + потоки), `CapabilityManager` (cspace,
@@ -61,21 +61,24 @@ SMP, модель синхронизации (v0.12, без Big Kernel Lock), п
 потоков. Реализация моно-морфизирована над GCTL; бекенд зовёт её через
 глобальную установку.
 
-## 2. Загрузочная цепочка
+## 2. Загрузочная цепочка (v3: boot-архив RLBA + flat-бутстрап)
 
 ```
 OVMF (pflash)
-  -> ESP (MBR + FAT): /EFI/BOOT/BOOTX64.EFI, init, capp, boot_cfg.xml
+  -> ESP (MBR + FAT): /EFI/BOOT/BOOTX64.EFI, boot_cfg.xml, boot.cpio
      BOOTX64.EFI = uefi_stub (x86_64-unknown-uefi, kernel.bin ВСТРОЕН)
   1. mini-UART COM1 (единый канал отладки со стартом ядра)
-  2. boot_cfg.xml: cmdline ядра, список серверов (<server>, <arg>),
-     boot_state (транзитом в argv init)
-  3. образы серверов читаются с ESP в память (модули BootInfo)
+  2. boot_cfg.xml (v3): cmdline ядра, ЕДИНЫЙ boot-архив RLBA
+     (<payload archive="boot.cpio" archive_crc32="0x…">),
+     boot_state (транзитом в argv бутстрапа)
+  3. архив читается с ESP ЦЕЛИКОМ; CRC32 сверяется с атрибутом
+     archive_crc32 (битость ловится ДО ExitBootServices) и кладётся
+     как модуль [0] BootInfo v3 (заглушка не знает форматов — только I/O)
   4. сегменты ядра размещаются ДИНАМИЧЕСКИ: любой 2 МиБ-выровненный
      адрес в [16 MiB .. 4 GiB) — внизу OVMF держит декомпрессированный
      DXE-том; аналог Linux EFI stub
   5. BootInfo-страница: память (финальная карта после ExitBootServices),
-     модули, RSDP (ACPI2 из configuration tables), cmdline
+     модуль [0]=архив, RSDP (ACPI2 из configuration tables), cmdline
   6. ExitBootServices; RDI = &BootInfo (физика); прыжок на вход ядра
   -> head.S (identity по физике): строит PML4: high-half
      KERNEL_LINK_BASE = 0xFFFF_FFFF_8100_0000 -> фактическая физика
@@ -84,20 +87,40 @@ OVMF (pflash)
   -> kmain (backend/bin/kernel.rs): консоль, CPUID-детекты (RDCL_NO,
      TSC-deadline), MADT, LAPIC + калибровка TSC (PIT), SMP bring-up
      (APы паркуются до конца kinit), VT-d/AMD-Vi init (ДО release_aps)
-  -> startup::kinit (арх-НЕЗАВИСИМАЯ политика):
+  -> startup::kinit (арх-НЕЗАВИСИМАЯ политика; ELF В ЯДРЕ БОЛЬШЕ НЕТ):
      BootInfo.validate -> 2 x LLFree (ядро: AllocAll, пользователь:
      избирательное освобождение Available) -> куча (talc) -> slab-пул
      -> GCTL -> DebugSink/TimeSource/планировщик -> KMAP (изоляция,
-     регионы ядра) -> elfload init (xmas-elf, map_fixed по PT_LOAD)
-     -> стек USER_STACK_TOP + argv-блок (boot_state транзитом)
-     -> задача/поток init -> стартовое IPC [argc, argv_ptr, argv_bytes]
+     регионы ядра) -> boot_archive::parse_header (инварианты + CRC32;
+     fail-closed до маппинга) -> flatload: FLAT-сегменты бутстрапа
+     (map_fixed по таблице сегментов FLX) + ВЕСЬ архив RO на
+     ARCHIVE_BASE (external: boot-память модуля) -> стек
+     USER_STACK_TOP + argv-блок («bootstrap», boot_state k=v,
+     rsdp/archive_len транзитом) -> задача/поток бутстрапа
+     -> стартовое IPC [argc, argv_ptr, argv_bytes]
+  -> bootstrap (ПЕРВАЯ задача, юзерспейс, flat @0x40000000):
+     S2 каталог RLBA + CRC32 -> S3 INIT-запись: CRC32 данных +
+     pie::Plan (ELF — в юзерспейсе) -> S4 стейджинг (MEM_ALLOC,
+     копия из RO-архива) -> S5 TASK_SPAWN_IMAGE (init @0x60000000,
+     стек+argv как сегменты дескриптора) -> S6 MEM_MAP_AT: архив RO
+     в init (тот же ARCHIVE_BASE — спавн следующих серверов без копий)
+     -> S7 CAP_SEND: init получает гранты root-сервера (IommuAdmin +
+     IoResource Mmio/IoPort/Irq + TaskTCB(себя)) -> S8 парковка
+     навсегда (L4 pager: внешние кадры init принадлежат бутстрапу)
+  -> init (root-сервер): стартовое IPC (argc/argv: имя + args из
+     каталога RLBA + boot_state транзитом) -> спавн доменов из архива
   -> X86Platform::run(): release_aps -> контекстный цикл диспетчеризации
 ```
 
 Ключевые инварианты цепочки: после ExitBootServices заглушка не
 аллоцирует (RAII-владение забыто намеренно); ядро исполняется только по
-high-half адресам, физика доступна через physmap; первый сервер
-(модуль [0]) — init по договорённости протокола, его стартует ядро.
+high-half адресам, физика доступна через physmap; первая задача —
+БУТСТРАП (flat, без ELF в ядре): он разбирает каталог RLBA, верифицирует
+CRC32 и спавнит init (argv init — каталог RLBA, не ARGV-хвост v2);
+бутстрап живёт вечно (модель seL4 root task / L4 pager) — «all user
+threads gone» более не наступает, idle печатает «all blocked —
+waiting». Формат RLBA и карты адресов (FLAT_BASE/ARCHIVE_BASE/
+INIT_BASE) — docs/boot-protocol-v3.md.
 
 `meltdown=allow` в cmdline — Escape- hatch для QEMU/TCG (нет
 `ARCH_CAPABILITIES.RDCL_NO`); без флага на железе без закрытого

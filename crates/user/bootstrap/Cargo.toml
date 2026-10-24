@@ -1,0 +1,17 @@
+[package]
+name = "bootstrap"
+version.workspace = true
+edition.workspace = true
+description = "Flat bootstrap (первая задача v3): верифицирует boot-архив RLBA (CRC32), спавнит init из каталога через pie+TASK_SPAWN_IMAGE, передаёт гранты root-сервера, мапит архив в init и паркуется (L4 pager)"
+
+[[bin]]
+name = "bootstrap"
+path = "src/main.rs"
+
+[dependencies]
+# rlib-поверхность userlib: _start (стартовый IPC -> main) + l4_* ABI.
+userlib = { path = "../userlib" }
+# Формат RLBA (каталог/чексуммы) — тот же крейт, что в ядре и заглушке.
+boot_archive = { workspace = true }
+# Разбор ELF init-образа (StaticFixed v3; PIE — будущая работа).
+pie = { path = "../pie" }

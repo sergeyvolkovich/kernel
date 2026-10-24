@@ -9,7 +9,8 @@
 //     argv_bytes) в очередь потока; _start принимает его, разбирает
 //     argv-блок ([u64 argc][u64 ptr[argc]]..[NULL][pad][asciiz]) и
 //     вызывает прикладной `main(argc, argv)`; возврат из main —
-//     TASK_EXIT(code). BSS/стек/argv-блок готовит ядро (elfload).
+//     TASK_EXIT(code). BSS/стек/argv-блок готовит загрузчик задачи
+//     (v3: kinit::flatload — для бутстрапа, ядро спавна — для доменов).
 //
 //   * `l4_*` — обёртки сисколов (номера — syscall/nums.rs ядра, ABI:
 //     rax = номер; rdi/rsi/rdx/r10/r8/r9 = аргументы; возврат rax).
@@ -27,6 +28,14 @@
 #![allow(clippy::missing_safety_doc)]
 
 use core::arch::asm;
+
+// ───────────────────────── ABI платформы (x86_64) ─────────────────────────
+
+/// Вершина стека пользовательской задачи (USER_ALLOC_BASE − 16 МиБ;
+/// то же значение, что `Platform::user_stack_top()` бекенда).
+pub const USER_STACK_TOP: u64 = 0x0000_0FFF_FF00_0000;
+/// Страниц стека старта (как `Platform::user_stack_pages()` бекенда).
+pub const USER_STACK_PAGES: u64 = 16;
 
 // ───────────────────────── Syscall ABI (x86_64) ─────────────────────────
 

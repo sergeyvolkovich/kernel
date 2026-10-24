@@ -1,0 +1,15 @@
+[package]
+name = "cfgtool"
+edition.workspace = true
+version.workspace = true
+
+[lib]
+name = "cfgtool"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cfgtool"
+path = "src/main.rs"
+
+[dependencies]
+bootcfg = { path = "../bootcfg" }

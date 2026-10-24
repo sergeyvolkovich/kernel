@@ -1,0 +1,12 @@
+[package]
+name = "boot_archive"
+version.workspace = true
+edition.workspace = true
+description = "RLBA boot-архив (протокол загрузки v3): заголовок, FLAT-образ, каталог, CRC32"
+
+[dependencies]
+
+[dev-dependencies]
+
+[lib]
+path = "src/lib.rs"

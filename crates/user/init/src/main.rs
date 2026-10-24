@@ -1,10 +1,11 @@
-// ==== INIT: первый пользовательский сервер (boot-chain smoke, v0.20) ====
+// ==== INIT: init-сервер (boot-chain smoke, v3) ====
 //
-// Минимальный init после апстрим-зачистки серверов (1803dcd): цепочка
-// загрузки обязана иметь модуль [0] — этот крейт и есть модуль [0].
+// Первый СЕРВЕР юзерспейса (спавнится бутстрапом из boot-архива RLBA;
+// модуль [0] BootInfo v3 — сам архив, не этот образ).
 //
 // Сценарий (все шаги печатаются в serial через DEBUG_WRITE):
-//   S1. стартовое IPC от ядра: argc/argv (+ boot_state транзитом);
+//   S1. стартовое IPC (от ядра через TASK_SPAWN_IMAGE): argc/argv
+//       (+ boot_state транзитом, имя = «init» + args из каталога RLBA);
 //   S2. SELF_INFO: task/thread id, CPU, cpu_count;
 //   S3. IPC ping-pong: рабочий поток + main гоняют сообщение через
 //       пару гейтов (EP_CREATE) ROUNDS раз — на SMP это упражняет
@@ -218,10 +219,7 @@ fn find_tcb_handle() -> Option<u64> {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(argc: i32, argv: *const *const i8) -> i32 {
-    putdec(
-        "init: hello from the first user server (v0.20 boot-chain smoke)",
-        0,
-    );
+    putdec("init: hello from init server (v3, spawned by bootstrap)", 0);
     putdec("init: argc = ", argc as u64);
     putdec("init: sys_time = ", l4_sys_time() as u64);
 

@@ -1,5 +1,6 @@
-// Сборка статического init-ELF (@ 0x40000000, init.ld, -no-pie):
-// startup::elfload грузит модуль [0] по фиксированным линк-адресам.
+// Сборка статического init-ELF (@ 0x60000000, init.ld, -no-pie):
+// бутстрап (v3) спавнит образ через pie+TASK_SPAWN_IMAGE по фиксированным
+// линк-адресам (StaticFixed).
 fn main() {
     println!("cargo::rerun-if-changed=init.ld");
     let ld = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("init.ld");

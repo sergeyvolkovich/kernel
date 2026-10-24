@@ -29,7 +29,7 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
-use bootcfg::{BootConfig, DEFAULT_TIMEOUT_SECS, Payload, PayloadKind, ServerSpec};
+use bootcfg::{BootConfig, DEFAULT_TIMEOUT_SECS, Payload, PayloadKind};
 
 const USAGE: &str = "usage: cfgtool <CONFIG> <COMMAND> [args...]
 commands:
@@ -39,10 +39,9 @@ commands:
   default <id>                          set default payload
   timeout <N | none>                    menu timeout (none = wait forever)
   add efi <id> --path P [--title T] [--default]
-  add rust <id> --init P [--arg A]... [--cmdline C] [--title T] [--default]
+  add rust <id> --archive boot.cpio [--cmdline C] [--title T] [--default]
   remove <id>
-  set <id> title|path|cmdline <value>
-  arg <id> add|rm|clear [value...]
+  set <id> title|path|cmdline|archive <value>
   state <id> set|rm <name> [value]";
 
 fn main() -> ExitCode {
@@ -78,8 +77,10 @@ pub fn run(args: &[String]) -> Result<String, String> {
         "add" => mutate(path, rest, cmd_add),
         "remove" => mutate(path, rest, cmd_remove),
         "set" => mutate(path, rest, cmd_set),
-        "arg" => mutate(path, rest, cmd_arg),
         "state" => mutate(path, rest, cmd_state),
+        "arg" => Err(
+            "arg: argv init lives in the RLBA catalog (mkarchive.py --init-args), not XML".into(),
+        ),
         other => Err(format!("unknown command '{other}'")),
     }
 }
@@ -124,23 +125,6 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .map(String::as_str)
 }
 
-/// Повторяющийся флаг: все `--name value`.
-fn flags<'a>(args: &'a [String], name: &str) -> Vec<&'a str> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == name
-            && let Some(v) = args.get(i + 1)
-        {
-            out.push(v.as_str());
-            i += 2;
-            continue;
-        }
-        i += 1;
-    }
-    out
-}
-
 fn payload_mut<'c>(cfg: &'c mut BootConfig, id: &str) -> Result<&'c mut Payload, String> {
     cfg.payloads
         .iter_mut()
@@ -167,16 +151,15 @@ fn cmd_init(path: &str, args: &[String]) -> Result<String, String> {
             kind: PayloadKind::RustL4,
             path: String::new(),
             kernel_cmdline: String::new(),
-            servers: vec![ServerSpec {
-                name: "init".into(),
-                path: "init.elf".into(),
-                argv: Vec::new(),
-            }],
+            archive: "boot.cpio".into(),
+            archive_crc32: None,
             state: Vec::new(),
         }],
     };
     save(path, &cfg)?;
-    Ok(format!("created {path} (1 rust-l4 payload)"))
+    Ok(format!(
+        "created {path} (1 rust-l4 payload, archive=boot.cpio)"
+    ))
 }
 
 fn cmd_default(cfg: &mut BootConfig, args: &[String]) -> Result<String, String> {
@@ -224,7 +207,8 @@ fn cmd_add(cfg: &mut BootConfig, args: &[String]) -> Result<String, String> {
                 .ok_or("add efi: --path required (volume-root path)")?
                 .to_string(),
             kernel_cmdline: String::new(),
-            servers: Vec::new(),
+            archive: String::new(),
+            archive_crc32: None,
             state: Vec::new(),
         },
         PayloadKind::RustL4 => Payload {
@@ -233,13 +217,10 @@ fn cmd_add(cfg: &mut BootConfig, args: &[String]) -> Result<String, String> {
             kind,
             path: String::new(),
             kernel_cmdline: flag(args, "--cmdline").unwrap_or_default().to_string(),
-            servers: vec![ServerSpec {
-                name: "init".into(),
-                path: flag(args, "--init")
-                    .ok_or("add rust: --init <path> required")?
-                    .to_string(),
-                argv: flags(args, "--arg").iter().map(|s| s.to_string()).collect(),
-            }],
+            archive: flag(args, "--archive")
+                .ok_or("add rust: --archive <boot.cpio> required")?
+                .to_string(),
+            archive_crc32: None,
             state: Vec::new(),
         },
     };
@@ -271,7 +252,7 @@ fn cmd_set(cfg: &mut BootConfig, args: &[String]) -> Result<String, String> {
     let id = args.first().ok_or("set <id> field value: id required")?;
     let field = args
         .get(1)
-        .ok_or("set <id> title|path|cmdline value: field required")?;
+        .ok_or("set <id> title|path|cmdline|archive value: field required")?;
     let value = args.get(2).ok_or("set <id> field value: value required")?;
     let p = payload_mut(cfg, id)?;
     match field.as_str() {
@@ -288,50 +269,22 @@ fn cmd_set(cfg: &mut BootConfig, args: &[String]) -> Result<String, String> {
             }
             p.kernel_cmdline = value.clone();
         }
-        other => return Err(format!("set: unknown field '{other}' (title|path|cmdline)")),
+        "archive" => {
+            if p.kind != PayloadKind::RustL4 {
+                return Err("set archive: only rust-l4 payloads have archive".into());
+            }
+            // CRC от старого файла больше не соответствует — сбрасываем
+            // (пропатчит mkarchive.py при следующей сборке образа).
+            p.archive = value.clone();
+            p.archive_crc32 = None;
+        }
+        other => {
+            return Err(format!(
+                "set: unknown field '{other}' (title|path|cmdline|archive)"
+            ));
+        }
     }
     Ok(format!("set {id} {field} = {value}"))
-}
-
-fn cmd_arg(cfg: &mut BootConfig, args: &[String]) -> Result<String, String> {
-    let id = args
-        .first()
-        .ok_or("arg <id> add|rm|clear [values]: id required")?;
-    let op = args.get(1).ok_or("arg <id> add|rm|clear: op required")?;
-    let values = &args[2..];
-    let p = payload_mut(cfg, id)?;
-    if p.kind != PayloadKind::RustL4 {
-        return Err(format!("arg: payload '{id}' has no servers (efi payload)"));
-    }
-    let srv = p
-        .servers
-        .first_mut()
-        .ok_or_else(|| format!("payload '{id}' has no server"))?;
-    match op.as_str() {
-        "add" => {
-            if values.is_empty() {
-                return Err("arg add: at least one value required".into());
-            }
-            for v in values {
-                srv.argv.push(v.clone());
-            }
-            Ok(format!("argv += {} value(s)", values.len()))
-        }
-        "rm" => {
-            let before = srv.argv.len();
-            srv.argv.retain(|a| !values.iter().any(|v| v == a));
-            let removed = before - srv.argv.len();
-            if removed == 0 {
-                return Err("arg rm: no matching values".into());
-            }
-            Ok(format!("argv -= {removed} value(s)"))
-        }
-        "clear" => {
-            srv.argv.clear();
-            Ok("argv cleared".into())
-        }
-        other => Err(format!("arg: unknown op '{other}' (add|rm|clear)")),
-    }
 }
 
 fn cmd_state(cfg: &mut BootConfig, args: &[String]) -> Result<String, String> {
@@ -404,13 +357,9 @@ fn show(cfg: &BootConfig) -> String {
                 if !p.kernel_cmdline.is_empty() {
                     let _ = writeln!(out, "        cmdline: {}", p.kernel_cmdline);
                 }
-                for s in &p.servers {
-                    let args = if s.argv.is_empty() {
-                        String::new()
-                    } else {
-                        format!("  [{}]", s.argv.join(", "))
-                    };
-                    let _ = writeln!(out, "        server:  {} ({}){args}", s.name, s.path);
+                let _ = writeln!(out, "        archive: {}", p.archive);
+                if let Some(crc) = p.archive_crc32 {
+                    let _ = writeln!(out, "        crc32:   0x{crc:08x}");
                 }
                 for (k, v) in &p.state {
                     let _ = writeln!(out, "        state:   {k}={v}");
@@ -456,7 +405,7 @@ mod tests {
         assert!(out.contains("1 payload(s)"), "{out}");
         assert!(out.contains("rust-l4"), "{out}");
         assert!(out.contains("<= default"), "{out}");
-        assert!(out.contains("init (init.elf)"), "{out}");
+        assert!(out.contains("archive: boot.cpio"), "{out}");
         // Повторный init без --force отказывает.
         assert!(run_err(&[&p, "init"]).contains("exists"));
         let _ = std::fs::remove_file(&p);
@@ -487,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn add_rust_with_args_and_cmdline() {
+    fn add_rust_with_archive_and_cmdline() {
         let p = tmpcfg();
         run_ok(&[&p, "init"]);
         run_ok(&[
@@ -495,21 +444,14 @@ mod tests {
             "add",
             "rust",
             "test",
-            "--init",
-            "test.elf",
-            "--arg",
-            "stage=one",
-            "--arg",
-            "log=full",
+            "--archive",
+            "test.cpio",
             "--cmdline",
             "arch=x86_64 console=com1",
         ]);
         let cfg = load(&p).unwrap();
         let t = cfg.payload("test").unwrap();
-        assert_eq!(
-            t.servers[0].argv,
-            vec!["stage=one".to_string(), "log=full".to_string()]
-        );
+        assert_eq!(t.archive, "test.cpio");
         assert_eq!(t.kernel_cmdline, "arch=x86_64 console=com1");
         let _ = std::fs::remove_file(&p);
     }
@@ -548,16 +490,19 @@ mod tests {
     }
 
     #[test]
-    fn arg_and_state_ops() {
+    fn arg_command_is_gone() {
         let p = tmpcfg();
         run_ok(&[&p, "init"]);
-        run_ok(&[&p, "arg", "rust-l4", "add", "stage=boot-chain", "log=full"]);
-        run_ok(&[&p, "arg", "rust-l4", "rm", "log=full"]);
-        let cfg = load(&p).unwrap();
-        assert_eq!(
-            cfg.payloads[0].servers[0].argv,
-            vec!["stage=boot-chain".to_string()]
-        );
+        // argv init с v3 — каталог RLBA (mkarchive.py), не XML.
+        let err = run_err(&[&p, "arg", "rust-l4", "add", "stage=boot-chain"]);
+        assert!(err.contains("RLBA catalog"), "{err}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn state_ops() {
+        let p = tmpcfg();
+        run_ok(&[&p, "init"]);
         run_ok(&[&p, "state", "rust-l4", "set", "console", "com1"]);
         run_ok(&[&p, "state", "rust-l4", "set", "test_mode", "qemu"]);
         run_ok(&[&p, "state", "rust-l4", "set", "console", "com2"]); // upsert

@@ -1,13 +1,17 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- boot_cfg.xml v2: конфигурация загрузчика rust-l4 (читает UEFI-заглушка).
-     Схема v2 = список пейлоадов + меню выбора:
+<!-- boot_cfg.xml v3: конфигурация загрузчика rust-l4 (читает UEFI-заглушка).
+     Схема v3 = список пейлоадов + меню выбора + boot-архив:
        timeout  — секунды на меню (>0 = отсчёт; 0 = сразу default;
                   -1 = ждать вечно);
        default  — id пейлоада по умолчанию (нет → первый);
        payload type="rust-l4" — своя цепочка: ядро вшито в заглушку,
                   cmdline — командная строка ЯДРА (BootInfo.cmdline),
-                  серверы грузятся в порядке перечисления, [0] — init,
-                  boot_state транзитом уходит init стартовым IPC;
+                  archive — единый boot-архив RLBA (cpio + flat-бутстрап
+                  в заголовке + каталог + CRC32): модуль [0] BootInfo;
+                  archive_crc32 — контрольная сумма файла (заглушка
+                  сверяет при чтении; патчит build_image.sh после
+                  mkarchive.py — значение в репо проходное),
+                  boot_state транзитом уходит бутстрапу стартовым IPC;
        payload type="efi" — chainload стороннего EFI-образа (Windows
                   bootmgfw/grub/...) по path от корня тома.
      meltdown=allow нужен под QEMU/TCG (эмулятор не сообщает RDCL_NO
@@ -16,13 +20,8 @@
      Редактирование: cargo run -p cfgtool -- boot/boot_cfg.xml show. -->
 <bootloader timeout="2" default="rust-l4">
   <payload id="rust-l4" type="rust-l4" title="rust-l4 (own kernel)"
-           cmdline="arch=x86_64 console=com1 meltdown=allow">
-    <servers>
-      <server name="init" path="init.elf">
-        <arg>stage=boot-chain</arg>
-        <arg>log=full</arg>
-      </server>
-    </servers>
+           cmdline="arch=x86_64 console=com1 meltdown=allow"
+           archive="boot.cpio" archive_crc32="0xa80369af">
     <boot_state>
       <var name="console" value="com1"/>
       <var name="test_mode" value="qemu"/>

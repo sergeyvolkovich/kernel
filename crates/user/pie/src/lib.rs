@@ -235,7 +235,7 @@ impl Plan {
                 in_seg: vaddr - vstart,
                 file_off: offset,
                 filesz,
-                // W^X-перевод (тот же протокол, что у elfload ядра).
+                // W^X-перевод (единый протокол платформы: W+X-сегмент теряет X).
                 flags: if p_flags & 0x2 != 0 {
                     0b011 // RW
                 } else if p_flags & 0x1 != 0 {

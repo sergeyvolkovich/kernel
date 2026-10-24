@@ -871,21 +871,17 @@ impl<MmapWraper: MMAPInterface, AP: ArcPool<Data = LLFree<'static>>> UFacade<Mma
     /// Полное окно региона, содержащего `vaddr`:
     /// (виртуальная база, база физики, страниц). Для flexpage-переносов
     /// (`MemRouter::transfer`): окно может начинаться внутри региона.
+    ///
+    /// Поиск — тот же, что у [`Self::snapshot_by_vaddr`]: наибольшая база
+    /// ≤ vaddr (записи не пересекаются по построению). v3 (багрепресс
+    /// boot-протокола): прежняя реализация звала `move_prev` ТОЛЬКО когда
+    /// `lower_bound` ничего не нашёл — для адреса СЕРЕДИНЕ региона бралась
+    /// следующая запись и проверка вхождения проваливалась (NotFound).
+    /// Первый реальный пользователь середины региона — TASK_SPAWN_IMAGE:
+    /// дескриптор спавна в .bss родителя (read_task_bytes).
     pub fn region_window(&self, vaddr: VirtualADDR) -> Option<(VirtualADDR, PhysADDR, usize)> {
-        // Спуск по дереву: наибольшая база <= vaddr — единственный кандидат.
-        let mut cursor = self.records_by_vaddr.lower_bound(Bound::Included(&vaddr));
-        let mut record = cursor.get();
-        if record.is_none() {
-            cursor.move_prev();
-            record = cursor.get();
-        }
-        let record = record?;
-        let size = record.p_addr.pages_count * FRAME_SIZE;
-        if record.v_addr.0 <= vaddr.0 && vaddr.0 - record.v_addr.0 < size {
-            Some((record.v_addr, record.p_addr.p, record.p_addr.pages_count))
-        } else {
-            None
-        }
+        let s = self.snapshot_by_vaddr(vaddr)?;
+        Some((s.v_addr, s.p_addr, s.p_pages_count))
     }
 
     /// Change access flags of already-mapped pages in place (v0.17,
@@ -909,9 +905,8 @@ impl<MmapWraper: MMAPInterface, AP: ArcPool<Data = LLFree<'static>>> UFacade<Mma
         }
         // Границы: окно обязано лежать в ОДНОМ регионе (записи не
         // хранят флаги — истина прав в PTE; проверка только границ).
-        let (v_base, _p_base, region_pages) = self
-            .region_window(vaddr)
-            .ok_or(MemErrorCode::NotFound)?;
+        let (v_base, _p_base, region_pages) =
+            self.region_window(vaddr).ok_or(MemErrorCode::NotFound)?;
         let off_pages = (vaddr.0 - v_base.0) / FRAME_SIZE;
         if off_pages.saturating_add(pages) > region_pages {
             return Err(MemErrorCode::InvalidArgument(
@@ -1325,10 +1320,7 @@ pub(crate) mod tests {
             pages: usize,
             _mmap: MMAPMemoryFlags,
         ) -> Result<(), MemErrorCode> {
-            self.log.push(Op::Protect {
-                v: v_base,
-                pages,
-            });
+            self.log.push(Op::Protect { v: v_base, pages });
             Ok(())
         }
 
@@ -2487,9 +2479,7 @@ pub(crate) mod tests {
         .unwrap();
 
         // Регион на 4 страницы (RW).
-        facade
-            .extend_memory_wiev(4, MMAPMemoryFlags::RW)
-            .unwrap();
+        facade.extend_memory_wiev(4, MMAPMemoryFlags::RW).unwrap();
         let (v_base, _p, pages) = facade.region_window(VirtualADDR(BASE)).unwrap();
         assert_eq!(pages, 4);
 
@@ -2507,11 +2497,7 @@ pub(crate) mod tests {
 
         // 2. Подокно с внутренней страницы — легально (как flexpage).
         facade
-            .protect_region(
-                VirtualADDR(v_base.0 + 2 * 4096),
-                2,
-                MMAPMemoryFlags::RX,
-            )
+            .protect_region(VirtualADDR(v_base.0 + 2 * 4096), 2, MMAPMemoryFlags::RX)
             .unwrap();
 
         // 3. Выход за границу региона — InvalidArgument, до бекенда
@@ -2541,7 +2527,11 @@ pub(crate) mod tests {
         //    флагов ядра едина с extend).
         let before = facade.mmap_interface.log.len();
         assert!(matches!(
-            facade.protect_region(v_base, 1, MMAPMemoryFlags::RW.union(MMAPMemoryFlags::EXECUTABLE)),
+            facade.protect_region(
+                v_base,
+                1,
+                MMAPMemoryFlags::RW.union(MMAPMemoryFlags::EXECUTABLE)
+            ),
             Err(MemErrorCode::InvalidArgument(
                 "WRITABLE and EXECUTABLE together violate W^X"
             ))

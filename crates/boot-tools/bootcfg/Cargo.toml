@@ -1,0 +1,8 @@
+[package]
+name = "bootcfg"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+serde.workspace = true
+quick-xml.workspace = true

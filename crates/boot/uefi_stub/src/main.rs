@@ -5,20 +5,25 @@
 //
 // Последовательность:
 //   1. watchdog off; отладка — свой mini-UART COM1 (единый канал с ядром);
-//   2. ESP рядом с kernel.efi: SimpleFileSystem -> boot_cfg.xml (bootcfg v2:
+//   2. ESP рядом с kernel.efi: SimpleFileSystem -> boot_cfg.xml (bootcfg v3:
 //      СПИСОК пейлоадов + таймаут меню);
 //   3. выбор пейлоада: единственный/timeout=0 — сразу default; иначе
 //      ГРАФИЧЕСКОЕ меню (GOP; дублируется в serial) с обратным отсчётом;
-//   4a. payload type="rust-l4" (своя цепочка):
-//       серверы конфигурации: чтение образов, argv-хвост в блоб модуля;
+//   4a. payload type="rust-l4" (своя цепочка): чтение ЕДИНОГО boot-архива
+//       RLBA (атрибут archive; модуль [0] BootInfo v3) + сверка CRC32
+//       с атрибутом archive_crc32 (битость ловится ДО ExitBootServices);
 //       ядро из ВСТРОЕННОГО образа (custom MemoryType — виден в карте как
-//       Kernel); модули + BootInfo-страница; RSDP из configuration tables
-//       (ACPI2); ExitBootServices -> финальная карта -> RDI = &BootInfo
-//       (физика) -> прыжок на вход ядра (смещение 0);
+//       Kernel); BootInfo-страница; RSDP из configuration tables (ACPI2);
+//       ExitBootServices -> финальная карта -> RDI = &BootInfo (физика)
+//       -> прыжок на вход ядра (смещение 0);
 //   4b. payload type="efi" (chainload Windows/grub/...): LoadImage по
 //       полному device path (том ESP + файл) + StartImage; возврат из
 //       образа — назад в меню (без отсчёта — явный выбор);
 //   цикл 4a/4b — пока не уйдём в ядро.
+//
+// Заглушка НЕ знает форматов: ни cpio, ни ELF, ни flat — это политика
+// ядра (заголовок RLBA) и юзерспейса (каталог/спавн). Её дело — I/O,
+// размещение памяти и протокол BootInfo (v3).
 //
 // После EBS — ноль аллокаций (RAII-владение забыто намеренно: память
 // всё равно достаётся ядру).
@@ -213,23 +218,7 @@ fn parse_elf(elf: &[u8]) -> Option<(u64, u64, Vec<(u64, u64, u64, u64)>)> {
     Some((e_entry, image_len.div_ceil(PAGE), segs))
 }
 
-// ───────────────────── argv-хвост (протокол startup::elfload) ─────────────────────
-
-const ARGV_TAIL_MAGIC: u32 = u32::from_le_bytes(*b"ARGV");
-
-fn append_argv_tail(blob: &mut Vec<u8>, argv: &[&str]) {
-    let start = blob.len();
-    for a in argv {
-        blob.extend_from_slice(a.as_bytes());
-        blob.push(0);
-    }
-    let str_bytes = blob.len() - start;
-    blob.extend_from_slice(&ARGV_TAIL_MAGIC.to_le_bytes());
-    blob.extend_from_slice(&(str_bytes as u32).to_le_bytes());
-    blob.extend_from_slice(&(argv.len() as u32).to_le_bytes());
-}
-
-// ───────────────────── Entry ─────────────────────
+// ───────────────────── Entry ─────────────────────────────
 
 #[uefi::entry]
 fn main() -> uefi::Status {
@@ -328,8 +317,8 @@ fn main() -> uefi::Status {
 
 // ───────────────────── Цепочка rust-l4 (payload type="rust-l4") ─────────────────────
 
-/// Собственная цепочка: встроенное ядро + серверы пейлоада + BootInfo
-/// v2 + ExitBootServices + прыжок. Возврат — ТОЛЬКО по фатальной
+/// Собственная цепочка: встроенное ядро + boot-архив RLBA + BootInfo
+/// v3 + ExitBootServices + прыжок. Возврат — ТОЛЬКО по фатальной
 /// ошибке (успешный путь уходит в ядро и не возвращается).
 fn boot_rust_l4(payload: &Payload, mut fs: FileSystem, cfg_text: String) -> uefi::Status {
     // Дамп карты памяти (диагностика размещения ядра; всё до 4 GiB).
@@ -406,57 +395,72 @@ fn boot_rust_l4(payload: &Payload, mut fs: FileSystem, cfg_text: String) -> uefi
         big_pages
     ));
 
-    // 4. Серверы: образ + argv-хвост (модули протокола).
-    let mut modules: Vec<(u64, u64, [u8; 32])> = Vec::new(); // (phys, len, name)
-    for srv in &payload.servers {
-        let path: CString16 = match CString16::try_from(srv.path.as_str()) {
-            Ok(p) => p,
-            Err(_) => {
-                log("[stub] FATAL: non-utf16 path (too long?)");
-                return uefi::Status::INVALID_PARAMETER;
-            }
-        };
-        // SAFETY: CString16 — нуль-терминированный UCS-2 буфер.
-        let cpath: &uefi::CStr16 = unsafe { uefi::CStr16::from_ptr(path.as_ptr()) };
-        let mut blob = match fs.read(cpath) {
-            Ok(b) => b,
-            Err(_) => {
-                log("[stub] FATAL: cannot read server image");
-                return uefi::Status::NOT_FOUND;
-            }
-        };
-        // argv-хвост: только <arg> сервера. Имя программы НЕ дублируем:
-        // elfload prepend'ит имя модуля (argv[0] по конвенции L4/Unix) —
-        // баг v0.5.2: srv.name в хвосте давал двойной «init» в argv.
-        let mut argv: Vec<&str> = Vec::new();
-        for a in &srv.argv {
-            argv.push(a.as_str());
+    // 4. Boot-архив RLBA (атрибут archive): ЕДИНЫЙ файл пейлоада.
+    //    Заглушка не разбирает формат — только читает байты, сверяет
+    //    CRC32 (если конфиг донёс контрольную) и размещает как модуль
+    //    [0] BootInfo v3. Геометрию RLBA проверит ядро (boot_archive),
+    //    содержимое — бутстрап в юзерспейсе.
+    let path: CString16 = match CString16::try_from(payload.archive.as_str()) {
+        Ok(p) => p,
+        Err(_) => {
+            log("[stub] FATAL: non-utf16 archive path (too long?)");
+            return uefi::Status::INVALID_PARAMETER;
         }
-        append_argv_tail(&mut blob, &argv);
-
-        // Размещение модуля.
-        let pages = (blob.len() as u64).div_ceil(PAGE);
-        let ptr = match uefi::boot::allocate_pages(
-            uefi::boot::AllocateType::AnyPages,
-            MT_MODULES,
-            pages as usize,
-        ) {
-            Ok(p) => p,
-            Err(_) => {
-                log("[stub] FATAL: module allocation failed");
-                return uefi::Status::OUT_OF_RESOURCES;
-            }
-        };
-        unsafe {
-            ptr.as_ptr()
-                .copy_from_nonoverlapping(blob.as_ptr(), blob.len());
+    };
+    // SAFETY: CString16 — нуль-терминированный UCS-2 буфер.
+    let cpath: &uefi::CStr16 = unsafe { uefi::CStr16::from_ptr(path.as_ptr()) };
+    let blob = match fs.read(cpath) {
+        Ok(b) => b,
+        Err(_) => {
+            log("[stub] FATAL: cannot read boot archive");
+            return uefi::Status::NOT_FOUND;
         }
-        let mut name = [0u8; 32];
-        let nb = srv.name.len().min(31);
-        name[..nb].copy_from_slice(&srv.name.as_bytes()[..nb]);
-        modules.push((ptr.as_ptr() as u64, blob.len() as u64, name));
+    };
+    if blob.len() < core::mem::size_of::<boot_archive::RlbaHeader>() {
+        log("[stub] FATAL: boot archive too small (no RLBA header)");
+        return uefi::Status::LOAD_ERROR;
     }
-    log("[stub] servers loaded");
+    // Целостность (битость диска/FAT): CRC32 всего файла против конфига.
+    // Подписи в v3 нет — защита от случайной порчи, не от атак.
+    if let Some(want) = payload.archive_crc32 {
+        let got = boot_archive::Crc32::of(&blob);
+        if got != want {
+            log(&alloc::format!(
+                "[stub] FATAL: archive CRC32 mismatch: got {:#010x}, want {:#010x}",
+                got,
+                want
+            ));
+            return uefi::Status::VOLUME_CORRUPTED;
+        }
+        log("[stub] archive CRC32 ok");
+    }
+    let pages = (blob.len() as u64).div_ceil(PAGE);
+    let aptr = match uefi::boot::allocate_pages(
+        uefi::boot::AllocateType::AnyPages,
+        MT_MODULES,
+        pages as usize,
+    ) {
+        Ok(p) => p,
+        Err(_) => {
+            log("[stub] FATAL: archive allocation failed");
+            return uefi::Status::OUT_OF_RESOURCES;
+        }
+    };
+    unsafe {
+        aptr.as_ptr()
+            .copy_from_nonoverlapping(blob.as_ptr(), blob.len());
+    }
+    let module_base = aptr.as_ptr() as u64;
+    // Имя модуля — имя файла архива (диагностика; 31 байт ASCIIZ).
+    let mut module_name = [0u8; 32];
+    let nb = payload.archive.len().min(31);
+    module_name[..nb].copy_from_slice(&payload.archive.as_bytes()[..nb]);
+    log(&alloc::format!(
+        "[stub] boot archive loaded: {} ({} bytes, {} pages)",
+        payload.archive,
+        blob.len(),
+        pages
+    ));
 
     // 5. BootInfo-страница.
     // Баг v0.5.2 (корень порчи test_mode): выделяли РОВНО 1 страницу,
@@ -481,17 +485,12 @@ fn boot_rust_l4(payload: &Payload, mut fs: FileSystem, cfg_text: String) -> uefi
         let bi = &mut *bi;
         *bi = BootInfo::EMPTY;
 
-        bi.module_count = modules.len().min(boot_info::MAX_MODULES as usize) as u32;
-        for (i, (phys, len, name)) in modules.iter().enumerate() {
-            if i >= boot_info::MAX_MODULES {
-                break;
-            }
-            bi.modules[i] = ModuleInfo {
-                base: *phys,
-                len: *len,
-                name: *name,
-            };
-        }
+        bi.module_count = 1; // v3: модуль [0] — boot-архив RLBA
+        bi.modules[0] = ModuleInfo {
+            base: module_base,
+            len: blob.len() as u64,
+            name: module_name,
+        };
         bi.firmware = FirmwareTables {
             rsdp: find_rsdp(),
             dtb: 0,
@@ -534,7 +533,7 @@ fn boot_rust_l4(payload: &Payload, mut fs: FileSystem, cfg_text: String) -> uefi
             }
         }
     }
-    log("[stub] boot_info v2 ready");
+    log("[stub] boot_info v3 ready");
 
     // 6. Забыть RAII-владение (после EBS дропы звать boot services не
     //    могут; память достаётся ядру).

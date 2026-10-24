@@ -33,11 +33,14 @@ v0.14: в ядре НЕТ устройств — как в seL4. Перечис�
 
 ```
 OVMF -> BOOTX64.EFI (uefi_stub + встроенный kernel.bin)
-     -> boot_cfg.xml v2 (пейлоады; timeout/default)
+     -> boot_cfg.xml v3 (пейлоады; timeout/default; archive + CRC32)
      -> меню выбора (GOP + serial, отсчёт до default)
-     -> [rust-l4]: серверы, ExitBootServices, head.S, kinit,
-        startup::kinit -> elfload: сервер [0] (init) мапится, стартует
-        -> планировщик: init — root-сервер (спавнит домены, IommuAdmin)
+     -> [rust-l4]: ЕДИНЫЙ boot-архив RLBA (boot.cpio) в память
+        (CRC32 сверяется ДО ExitBootServices), ExitBootServices,
+        head.S, kinit -> flatload: FLAT-бутстрап (ELF в ядре НЕТ)
+        + архив RO на ARCHIVE_BASE -> бутстрап верифицирует каталог
+        -> TASK_SPAWN_IMAGE: init (root-сервер: спавнит домены,
+        IommuAdmin) — и паркуется пейджером (модель seL4 root task)
      -> [efi]: LoadImage (device path: том + файл) + StartImage
         (bootmgfw/grub/...; возврат — назад в меню)
 ```
@@ -71,8 +74,8 @@ OVMF -> BOOTX64.EFI (uefi_stub + встроенный kernel.bin)
 | **Сырые ресурсы + IRQ** | Устройств в ядре НЕТ (v0.14): перечисление ACPI/AML/PCI и драйверы — юзерспейс (acpid); ядро медитирует диапазоны за IoResource-cap: `MMIO_MAP` (физика), `IOP_IN/OUT` (порты, исполнение в ядре, IOPL=0), `IRQ_ATTACH` по Irq-cap (IOAPIC: линия — L4-signal без переключения контекста); `CAP_MINT_RANGE` (v0.15) — сужение поддиапазонов при деривации |
 | **Изоляция крейтов (v0.15)** | HAL-контракты — отдельный крейт `kernel-hal` без зависимостей на workspace: ядро/бекенд видят контракты, контрактный слой не видит никого (граница проверяется cargo); `cargo build -p kernel-hal` — автономный гейт |
 | **IOMMU** | Intel VT-d (DMAR/DRHD, QI-инвалидации) и AMD-Vi (IVRS/IVHD, командный буфер): DMA-ремаппинг, IRQ-ремаппинг (IRTE/IntTab), мульти-IOMMU, 2 МиБ-листья |
-| **Загрузка** | UEFI-заглушка: boot_cfg.xml v2 (пейлоады rust-l4/efi-chainload), графическое меню выбора (GOP+serial), динамическое размещение ядра, argv-протокол, SIPI-bring-up AP |
-| **Юзерспейс** | `userlib` (C-ABI `_start` + `l4_*` для C и Rust), эталонные серверы: `init` (Rust) и `capp` (C) |
+| **Загрузка** | UEFI-заглушка: boot_cfg.xml v3 (пейлоады rust-l4/efi-chainload), графическое меню выбора (GOP+serial), динамическое размещение ядра, ЕДИНЫЙ boot-архив RLBA (cpio+каталог+CRC32, сборка scripts/mkarchive.py), целостность на трёх уровнях (заглушка/ядро/бутстрап), SIPI-bring-up AP |
+| **Юзерспейс** | `userlib` (C-ABI `_start` + `l4_*` для C и Rust), flat-бутстрап (root task, верификация архива + спавн init), эталонные серверы: `init` (Rust) и `capp` (C) |
 
 ## Архитектура в двух словах
 
@@ -83,7 +86,7 @@ boot_cfg.xml   uefi_stub          пользователи (init, rogue, capp...
      |   ESP    |  <- syscall ABI (rax/rdi/rsi/rdx/r10/r8/r9)
      v          v        ^
 startup (kinit) --------->|     arch-НЕЗАВИСИМАЯ политика запуска
-  | Platform / KernelGlue |     (пулы, GCTL, elfload, диспетчеризация)
+  | Platform / KernelGlue |     (пулы, GCTL, flatload, диспетчеризация)
   v                       |
 kernel (pkg_generic_interface)   менеджеры: задачи, capability, память,
   |  GCTL, HAL-трейты            IPC, SHM, устройства, syscall-таблица
@@ -96,8 +99,10 @@ arch + x86_64 (крейты)            механика ISA: per-CPU (GS), COM1
 
 - **`startup`** — единственная владелица ПОРЯДКА инициализации: два
   физических пула LLFree (ядро/пользователь), куча, slab, сборка `GCTL`,
-  ELF-загрузка init, стартовое IPC, запуск диспетчеризации. Ни одного
-  машинного адреса в коде.
+  flat-загрузка бутстрапа из заголовка RLBA + маппинг архива RO,
+  стартовое IPC и запуск диспетчеризации. ELF-загрузчик ДЕМОНТИРОВАН
+  в v3 (xmas-elf удалён): разбор cpio/ELF и спавн init — политика
+  юзерспейса-бутстрапа. Ни одного машинного адреса в коде.
 - **`kernel` (GCTL)** — корневой фасад менеджеров; подсистемы связаны
   параметрами, не полями. HAL — набор трейтов (`MMAP`/`KMAP`/`ASID`/
   `Dma`/`Iommu`/`Irq`/`Cpu`): ядро не знает, на чём исполняется.
@@ -147,33 +152,43 @@ crates/
                            perf-счётчики (IPC/cap), память, VT-d (vtd.rs),
                            AMD-Vi (amd.rs), IOMMU-агрегатор
   boot/                    загрузочная цепочка (форматы + прошивка):
-    boot_info/             ABI-страница BootInfo (заглушка -> ядро):
-                           память, модули, RSDP
-    bootcfg/               boot_cfg.xml v2 (пейлоады/меню): mini-XML
-                           разбор + сериализация + модель меню (+ тесты)
+    boot_info/             ABI-страница BootInfo v3 (заглушка -> ядро):
+                           память, модуль [0]=архив, RSDP
+    boot_archive/          формат RLBA (v3): заголовок+CRC32, FLAT-образ
+                           бутстрапа (FLX1), каталог поверх cpio(newc)
+                           (+8 тестов и cross-check с mkarchive.py)
+    bootcfg/               boot_cfg.xml v3 (пейлоады/меню/archive+CRC):
+                           mini-XML разбор + сериализация (+ тесты)
     uefi_stub/             BOOTX64.EFI: меню (GOP), rust-l4-цепочка
-                           (модули, BootInfo, EBS), chainload EFI-образов
+                           (один файл архива, CRC32 до EBS, BootInfo v3),
+                           chainload EFI-образов
   misc/                   host-инструменты (std):
     cfgtool/               редактор boot_cfg.xml (init/show/add/remove/
-                           arg/state/timeout/default; валидация + атомарная
+                           set/state/timeout/default; валидация + атомарная
                            запись; общий крейт bootcfg)
   startup/                 kinit: композиционный корень (arch-независимая
                            политика запуска над трейтом Platform, реализация
-                           — platform/backend), elfload, пулы
+                           — platform/backend), flatload (RLBA+FLAT+
+                           маппинг архива), пулы
   user/                    юзерспейс:
     userlib/               C-ABI: _start + l4_* (статическая библиотека,
                            заголовок l4.h)
-    init/                  первый сервер (v0.20, boot-chain smoke):
-                           стартовое IPC, ping-pong двух потоков через
-                           гейты, TASK_EXIT
+    bootstrap/             ПЕРВАЯ задача v3 (flat @0x40000000): верификация
+                           каталога RLBA, спавн init (pie+TASK_SPAWN_IMAGE),
+                           передача грантов root-сервера, парковка пейджером
+    init/                  init-сервер (v3, @0x60000000, boot-chain smoke):
+                           стартовое IPC, ping-pong потоков через гейты,
+                           TASK_EXIT
     rogue/                 дочерний образ песочницы (static-PIE, ET_DYN+RELA)
     pie/                   юзерспейс-парсер PIE-образов: PT_LOAD W^X,
                            R_X86_64_RELATIVE
-scripts/        build_image.sh (полная цепочка: kernel -> init -> заглушка ->
-                ESP), build.sh (то же + отладочные артефакты),
+scripts/        build_image.sh (полная цепочка: kernel -> bootstrap -> init ->
+                mkarchive.py -> заглушка -> ESP), build.sh (то же + отладочные
+                артефакты), smoke.sh (сборка+QEMU до маркера «boot chain OK»),
+                mkarchive.py (сборка RLBA: ELF→FLAT + newc + каталог + CRC32),
                 run_qemu.sh (OVMF+q35), fetch_qemu.sh (user-space префикс
                 QEMU/OVMF/mtools), esp_mbr.py
-boot/           эталонный boot_cfg.xml
+boot/           эталонный boot_cfg.xml + собранный boot.cpio
 ```
 
 ## Требования

@@ -19,10 +19,12 @@ members = [
     "crates/platform/arch_x86",
     "crates/platform/backend",
     "crates/boot/boot_info",
+    "crates/boot/boot_archive",
     "crates/boot/bootcfg",
     "crates/boot/uefi_stub",
     "crates/startup",
     "crates/user/userlib",
+    "crates/user/bootstrap",
     "crates/user/init",
     "crates/user/rogue",
     "crates/user/pie",
@@ -45,6 +47,7 @@ default-members = [
     "crates/core/sched_lb",
     "crates/hal/kernel-hal",
     "crates/boot/boot_info",
+    "crates/boot/boot_archive",
     "crates/boot/bootcfg",
     "crates/platform/arch_x86",
     "crates/user/pie",
@@ -60,6 +63,7 @@ edition = "2024"
 pkg_generic_interface = { path = "crates/core/kernel" }
 kernel_hal = { path = "crates/hal/kernel-hal", package = "kernel-hal" }
 boot_info = { path = "crates/boot/boot_info" }
+boot_archive = { path = "crates/boot/boot_archive" }
 bootcfg = { path = "crates/boot/bootcfg" }
 eevdf = { path = "crates/core/eevdf" }
 sched_lb = { path = "crates/core/sched_lb" }
